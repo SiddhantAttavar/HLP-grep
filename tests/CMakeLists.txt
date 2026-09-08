@@ -1,4 +1,10 @@
-add_executable(test_hlp_grep test_hlp_grep.cpp)
+add_executable(solve solve.cpp)
+target_link_libraries(solve PRIVATE hlp_grep::hlp_grep)
+target_include_directories(solve PRIVATE ${CMAKE_SOURCE_DIR}/src/debug)
+
+add_executable(test_hlp_grep test.cpp)
 target_link_libraries(test_hlp_grep PRIVATE hlp_grep::hlp_grep)
 target_include_directories(test_hlp_grep PRIVATE ${CMAKE_SOURCE_DIR}/src/debug)
-add_test(NAME hlp_grep COMMAND test_hlp_grep)
+
+add_test(NAME hlp_grep_manual COMMAND test_hlp_grep NaiveSolver ${CMAKE_CURRENT_SOURCE_DIR}/testcases/manual)
+add_test(NAME hlp_grep_generated COMMAND test_hlp_grep NaiveSolver ${CMAKE_CURRENT_SOURCE_DIR}/testcases/generated)

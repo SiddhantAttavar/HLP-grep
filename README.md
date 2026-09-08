@@ -26,7 +26,7 @@ target_link_libraries(your_target PRIVATE hlp_grep::hlp_grep)
 #include <hlp_grep/hlp_grep.hpp>
 
 // construct a concrete Solver implementation over the dictionary
-BruteSolver solver({"ACGT", "ACGA", "TTTT"});
+NaiveSolver solver({"ACGT", "ACGA", "TTTT"});
 for (const Result &r : solver.query("ACGT", 1))
 	// r.id = index in the dictionary, r.dist = edit distance
 	;
