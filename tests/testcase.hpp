@@ -9,13 +9,10 @@
 
 #include <hlp_grep/hlp_grep.hpp>
 
-#include <naive_dp.hpp>
-
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -124,19 +121,6 @@ inline Testcase parse_testcase(const fs::path &file) {
 		}
 	}
 	return tc;
-}
-
-/**
- * @brief Constructs a solver by class name over the given testcase.
- *
- * @param name Name of the Solver implementation (e.g. "NaiveSolver").
- */
-inline std::unique_ptr<Solver> make_solver(const std::string &name,
-                                           const Testcase &tc) {
-	if (name == "NaiveSolver")
-		return std::make_unique<NaiveSolver>(tc.dict, tc.cost);
-	std::cerr << "unknown solver: " << name << '\n';
-	std::exit(1);
 }
 
 /** Collects testcase files from CLI args: each arg is either a file or a folder. */

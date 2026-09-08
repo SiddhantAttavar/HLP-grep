@@ -1,15 +1,15 @@
 /**
  * @file test.cpp
- * @brief Parses testcase files and validates the given solver against the
+ * @brief Parses testcase files and validates the library Solver against the
  *        corresponding solution files (`.sol`).
  *
  * For each testcase file `<name>.txt`, the solution file `<name>.sol` must
  * exist (generate it with the `solve` executable). The results reported by
- * the solver for every query are compared against the expected matches from
- * the solution file: match count, matched dictionary ids, and their edit
- * distances.
+ * the library Solver for every query are compared against the expected
+ * matches from the solution file: match count, matched dictionary ids, and
+ * their edit distances.
  *
- * Usage: test_hlp_grep <solver-name> <testcase-file-or-dir>...
+ * Usage: test_hlp_grep <testcase-file-or-dir>...
  */
 
 #include <hlp_grep/hlp_grep.hpp>
@@ -97,8 +97,10 @@ std::vector<Expected> parse_solution(const fs::path &file, std::size_t n_queries
 	return expected;
 }
 
-void test_testcase(Solver &solver, const fs::path &file, const Testcase &tc,
+void test_testcase(const fs::path &file, const Testcase &tc,
                    const std::vector<Expected> &expected) {
+	const Solver solver(tc.dict, tc.cost);
+
 	for (std::size_t q = 0; q < tc.queries.size(); ++q) {
 		const auto &[k, query] = tc.queries[q];
 		const auto results = solver.query(query, k);
@@ -128,14 +130,12 @@ void test_testcase(Solver &solver, const fs::path &file, const Testcase &tc,
 } // namespace
 
 int main(int argc, char **argv) {
-	if (argc < 3) {
-		std::cerr << "usage: " << argv[0]
-		          << " <solver-name> <testcase-file-or-dir>...\n";
+	if (argc < 2) {
+		std::cerr << "usage: " << argv[0] << " <testcase-file-or-dir>...\n";
 		return 1;
 	}
 
-	const std::string solver_name = argv[1];
-	const auto files = collect_files(argc, argv, 2);
+	const auto files = collect_files(argc, argv);
 	if (files.empty()) {
 		std::cout << "no testcase files found, nothing to do\n";
 		return 0;
@@ -145,8 +145,7 @@ int main(int argc, char **argv) {
 		const Testcase tc = parse_testcase(file);
 		const auto expected =
 		    parse_solution(solution_path(file), tc.queries.size());
-		const auto solver = make_solver(solver_name, tc);
-		test_testcase(*solver, file, tc, expected);
+		test_testcase(file, tc, expected);
 	}
 
 	std::cout << files.size() << " testcase file(s) passed\n";

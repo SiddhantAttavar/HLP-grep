@@ -51,4 +51,9 @@ For each testcase file `{testcase_name}.txt`, solutions may be stored in `{testc
 2. $l$ space separated integers $a_1, a_2, \cdots a_l$ ($1 \le a_1 \le a_2 \cdots a_l \le |dict|$) representing the $1$-based index of strings $edit\_dist(query, dict_j) \le k$
 3. $l$ space separated integers representing the edit distances of the strings given in the previous line
 
-Solution files are generated from testcases with the `solve` executable (`build/tests/solve <solver-name> <testcase-file-or-dir>...`) and are validated against with the `test_hlp_grep` executable (`build/tests/test_hlp_grep <solver-name> <testcase-file-or-dir>...`). Both accept a mix of testcase files and folders containing `*.txt` files. Currently supported solvers: `NaiveSolver`.
+Solution files are generated from testcases with the `solve` executable
+(`build/tests/solve <testcase-file-or-dir>...`), which uses its built-in
+`NaiveSolver` reference implementation. They are validated with the
+`test_hlp_grep` executable (`build/tests/test_hlp_grep
+<testcase-file-or-dir>...`), which runs the library `Solver`. Both accept a
+mix of testcase files and folders containing `*.txt` files.

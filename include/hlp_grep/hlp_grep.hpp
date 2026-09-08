@@ -9,6 +9,8 @@
  * k of the query string.
  */
 #pragma once
+#include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,9 +51,6 @@ struct CostModel {
 	/**
 	 * @brief Returns the cost of matching two characters.
 	 *
-	 * Looks the characters up in the substitution matrix provided at
-	 * construction time.
-	 *
 	 * @param a First character.
 	 * @param b Second character.
 	 * @return The cost of matching @p a with @p b (0 if they match).
@@ -61,7 +60,7 @@ struct CostModel {
 	}
 
 private:
-	std::string alphabet_;                ///< Alphabet, defining matrix order.
+	std::string alphabet_;                 ///< Alphabet, defining matrix order.
 	std::vector<std::vector<int>> matrix_; ///< Substitution cost matrix.
 	std::size_t index_[256] = {};          ///< char -> alphabet index.
 
@@ -86,17 +85,20 @@ struct Result {
 };
 
 /**
- * @brief Index and query engine for edit distance search over a sequence dictionary.
+ * @brief Edit distance search engine over a sequence dictionary using
+ *        heavy-light decomposition on pangenome paths.
  *
- * Usage: construct a concrete Solver implementation with the dictionary, then
- * call query() to retrieve all dictionary sequences within a given edit
- * distance threshold of a query string.
+ * Indexes the dictionary sequences (represented as paths in a pangenome) and
+ * answers edit distance search queries.
+ *
+ * Usage: construct the solver with the dictionary, then call query() to
+ * retrieve all dictionary sequences within a given edit distance threshold
+ * of a query string.
  */
 class Solver {
 public:
 	/**
-	 * @brief Constructs the solver over the given dictionary with the given
-	 *        edit cost model.
+	 * @brief Constructs the solver over the given sequence dictionary.
 	 *
 	 * @param dict Dictionary of DNA sequences to search. The position of each
 	 *             sequence in this vector defines the `id` reported in Result.
@@ -104,9 +106,7 @@ public:
 	 *             Defaults to the unit-cost model (`CostModel{}`).
 	 */
 	explicit Solver(std::vector<std::string> dict, CostModel cost = {})
-	    : dict(std::move(dict)), cost(cost) {}
-
-	virtual ~Solver() = default;
+	    : dict_(std::move(dict)), cost_(cost) {}
 
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the query.
@@ -118,9 +118,11 @@ public:
 	 *         edit distance to the query. Results are sorted by `id` in
 	 *         ascending order.
 	 */
-	virtual std::vector<Result> query(const std::string &query, int k) = 0;
+	std::vector<Result> query(const std::string &query, int k) const {
+		throw std::logic_error("Solver::query() not implemented yet");
+	}
 
-protected:
-	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
-	CostModel cost; ///< Cost model used for the edit distance computations.
+private:
+	std::vector<std::string> dict_; ///< Dictionary of DNA sequences to search.
+	CostModel cost_;                ///< Cost model used for the edit distance computations.
 };
