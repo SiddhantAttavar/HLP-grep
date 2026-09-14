@@ -10,6 +10,7 @@
  */
 #pragma once
 #include <hlp_grep/cost_model.hpp>
+#include <hlp_grep/poa_graph.hpp>
 #include <hlp_grep/result.hpp>
 
 #include <string>
@@ -39,7 +40,13 @@ public:
 	 *             Defaults to the unit-cost model (`CostModel{}`).
 	 */
 	explicit Solver(std::vector<std::string> dict, CostModel cost = {})
-	    : dict_(std::move(dict)), cost_(cost) {}
+	    : dict(std::move(dict)), cost(cost),
+	      graph(dict, cost) {
+		compressed_paths.reserve(dict.size());
+		for (std::size_t i = 0; i < dict.size(); ++i) {
+			compressed_paths.push_back(graph.compressed_path(i));
+		}
+	}
 
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the query.
@@ -56,6 +63,9 @@ public:
 	}
 
 private:
-	std::vector<std::string> dict_; ///< Dictionary of DNA sequences to search.
-	CostModel cost_;                ///< Cost model used for the edit distance computations.
+	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
+	CostModel cost;                ///< Cost model used for the edit distance computations.
+	POAGraph graph;                ///< Pangenome (POA) graph built from the dictionary.
+	/// Compressed (heavy-chain / light-step) representation of each dict path.
+	std::vector<POAGraph::CompressedPath> compressed_paths;
 };

@@ -30,12 +30,14 @@ struct CostModel {
 	 */
 	CostModel(int ins = 1, int del = 1, std::string alphabet = "AGCT",
 	          std::vector<std::vector<int>> matrix = {})
-	    : ins(ins), del(del), alphabet_(std::move(alphabet)),
-	      matrix_(std::move(matrix)) {
-		if (matrix_.empty())
-			matrix_ = unit_matrix(alphabet_.size());
-		for (std::size_t i = 0; i < alphabet_.size(); ++i)
-			index_[static_cast<unsigned char>(alphabet_[i])] = i;
+	    : ins(ins), del(del) {
+		this->alphabet = std::move(alphabet);
+		if (matrix.empty())
+			this->matrix = unit_matrix(this->alphabet.size());
+		else
+			this->matrix = std::move(matrix);
+		for (std::size_t i = 0; i < this->alphabet.size(); ++i)
+			index[static_cast<unsigned char>(this->alphabet[i])] = i;
 	}
 
 	int ins; ///< Cost of inserting a character.
@@ -49,13 +51,13 @@ struct CostModel {
 	 * @return The cost of matching @p a with @p b (0 if they match).
 	 */
 	int match(char a, char b) const {
-		return matrix_[index_of(a)][index_of(b)];
+		return matrix[index_of(a)][index_of(b)];
 	}
 
 private:
-	std::string alphabet_;                 ///< Alphabet, defining matrix order.
-	std::vector<std::vector<int>> matrix_; ///< Substitution cost matrix.
-	std::size_t index_[256] = {};          ///< char -> alphabet index.
+	std::string alphabet;                 ///< Alphabet, defining matrix order.
+	std::vector<std::vector<int>> matrix; ///< Substitution cost matrix.
+	std::size_t index[256] = {};          ///< char -> alphabet index.
 
 	static std::vector<std::vector<int>> unit_matrix(std::size_t sigma) {
 		std::vector<std::vector<int>> m(sigma, std::vector<int>(sigma, 1));
@@ -65,6 +67,6 @@ private:
 	}
 
 	std::size_t index_of(char c) const {
-		return index_[static_cast<unsigned char>(c)];
+		return index[static_cast<unsigned char>(c)];
 	}
 };
