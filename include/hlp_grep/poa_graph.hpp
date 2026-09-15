@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +56,19 @@ public:
 	};
 
 	/**
+	 * @brief Per-edge metadata stored in the graph: neighbor node, its
+	 *        heavy/light classification (finalized by mark_heavy_edges()),
+	 *        and its unique edge id (shared by the out-edge and in-edge
+	 *        records of the same edge). Visiting frequencies are temporary
+	 *        values and are not stored in the struct.
+	 */
+	struct Edge {
+		EdgeType type = EdgeType::LIGHT; ///< Heavy or light edge.
+		node_id neighbor = 0;            ///< Other end of the edge.
+		std::size_t edge_id = 0;         ///< Unique id assigned at creation.
+	};
+
+	/**
 	 * @brief A node of the graph: its base character and the range of
 	 *        offsets at which it occurs among the sequence paths passing
 	 *        through it (j_min / j_max in notes/idea.md). Offsets use
@@ -64,7 +78,22 @@ public:
 		char base = 0;            ///< Base character represented by this node.
 		std::size_t pos_min = 0;  ///< Minimum path offset through this node.
 		std::size_t pos_max = 0;  ///< Maximum path offset through this node.
+		/// Destination node of the heaviest outgoing edge, or empty if the
+		/// node has no outgoing edges. Set by mark_heavy_edges() at the end
+		/// of build; valid only while the node's out-edge list is not
+		/// modified.
+		std::optional<node_id> heavy_neighbour;
 	};
+
+	/**
+	 * @brief Outgoing edges of a node.
+	 *
+	 * @param u Node id.
+	 * @return The list of edges leaving @p u (empty for a sink node).
+	 */
+	const std::vector<Edge> &outgoing_edges(node_id u) const {
+		return out_edges[u];
+	}
 
 	/**
 	 * @brief Builds the POA graph from the given dictionary.
@@ -99,6 +128,25 @@ public:
 	}
 
 	/**
+	 * @brief The cost model this graph was built with (used internally for
+	 *        the sequence-to-graph alignments).
+	 */
+	const CostModel &cost_model() const {
+		return cost;
+	}
+
+	/**
+	 * @brief Read-only access to a node's full data: base character,
+	 *        position range, and its heavy outgoing Edge pointer (null if
+	 *        the node has no outgoing edges).
+	 *
+	 * @param u Node id.
+	 */
+	const Node &node(node_id u) const {
+		return nodes[u];
+	}
+
+	/**
 	 * @brief Number of dictionary sequences inserted into the graph.
 	 */
 	std::size_t num_sequences() const {
@@ -108,7 +156,7 @@ public:
 	/**
 	 * @brief Returns the graph path of a dictionary sequence.
 	 *
-	 * Consecutive nodes are connected by edges of positive weight. Node ids
+	 * Consecutive nodes are connected by graph edges. Node ids
 	 * need not be monotonic along a path.
 	 *
 	 * @param seq Index of the sequence in the dictionary as passed to the
@@ -119,12 +167,18 @@ public:
 	}
 
 	/**
-	 * @brief Visiting frequency of edge (u, v), or 0 if the edge is absent.
+	 * @brief Temporary visiting frequency of edge (u, v): the number of
+	 *        stored sequence paths traversing it, or 0 if the edge is
+	 *        never traversed. Weights are not stored in the edges; this
+	 *        counts on demand and costs O(total path length) per call.
 	 */
 	std::size_t edge_weight(node_id u, node_id v) const {
-		if (const Edge *e = find_edge(out_edges[u], v))
-			return e->weight;
-		return 0;
+		std::size_t weight = 0;
+		for (const auto &path : paths)
+			for (std::size_t i = 1; i < path.size(); ++i)
+				if (path[i - 1] == u && path[i] == v)
+					++weight;
+		return weight;
 	}
 
 	/**
@@ -231,23 +285,14 @@ private:
 	/// Virtual start node; edges from it are implicit and cost nothing.
 	static constexpr node_id kStart = static_cast<node_id>(-1);
 
-	/**
-	 * @brief Per-edge metadata stored in the graph: neighbor node, its
-	 *        visiting frequency (number of alignment traversals), and its
-	 *        heavy/light classification (finalized by mark_heavy_edges()).
-	 */
-	struct Edge {
-		EdgeType type = EdgeType::LIGHT; ///< Heavy or light edge.
-		node_id neighbor = 0;            ///< Other end of the edge.
-		std::size_t weight = 0;          ///< Number of path traversals of this edge.
-	};
-
 	/// Per node: base character and position range.
 	std::vector<Node> nodes;
 	/// Outgoing edges per node.
 	std::vector<std::vector<Edge>> out_edges;
 	/// Incoming edges per node.
 	std::vector<std::vector<Edge>> in_edges;
+	/// Id assigned to the next created edge.
+	std::size_t next_edge_id = 0;
 	/// Per dictionary sequence: node ids visited by that sequence.
 	std::vector<std::vector<node_id>> paths;
 	/// Node ids in topological order of the DAG.
@@ -310,19 +355,19 @@ private:
 	}
 
 	/**
-	 * @brief Increments the visiting frequency of edge (u, v), creating it
-	 *        if missing. Edges from the virtual start node are implicit and
-	 *        therefore not stored.
+	 * @brief Creates edge (u, v) with a fresh unique edge id if missing.
+	 *        Both the out-edge and in-edge records share the id. Edges
+	 *        from the virtual start node are implicit and therefore not
+	 *        stored. Visiting frequencies are temporary values and are
+	 *        computed on demand, not incremented here.
 	 */
 	void add_edge(node_id u, node_id v) {
 		if (u == kStart)
 			return;
-		if (Edge *e = find_edge(out_edges[u], v)) {
-			e->weight++;
-			find_edge(in_edges[v], u)->weight++;
-		} else {
-			out_edges[u].push_back({EdgeType::LIGHT, v, 1});
-			in_edges[v].push_back({EdgeType::LIGHT, u, 1});
+		if (!find_edge(out_edges[u], v)) {
+			const std::size_t id = next_edge_id++;
+			out_edges[u].push_back({EdgeType::LIGHT, v, id});
+			in_edges[v].push_back({EdgeType::LIGHT, u, id});
 		}
 	}
 
@@ -518,9 +563,9 @@ private:
 	/**
 	 * @brief Merges a sequence's alignment into the graph.
 	 *
-	 * Exact-match consumption reuses nodes and increments edge weights;
+	 * Exact-match consumption reuses nodes and reuses existing edges;
 	 * substitutions and insertions create new nodes. Deletions are skipped
-	 * and do not touch weights. Appends the resulting path to paths and
+	 * and do not touch edges. Appends the resulting path to paths and
 	 * refreshes the topological order.
 	 */
 	void add_alignment(const std::vector<AlignmentOp> &ops) {
@@ -553,36 +598,37 @@ private:
 	}
 
 	/**
-	 * @brief Refreshes all edge weights from the stored sequence paths and
-	 *        classifies each node's outgoing edges.
+	 * @brief Classifies each node's outgoing edges from temporary visiting
+	 *        frequencies.
 	 *
-	 * For every node with outgoing edges, the edge with the highest visiting
-	 * frequency becomes HEAVY (exactly one per node); ties are broken by the
-	 * largest destination node id. All other outgoing edges stay LIGHT.
+	 * Per-edge traversal counts are recomputed from the stored sequence
+	 * paths (temporary values, not stored in the edges). For every node
+	 * with outgoing edges, the edge with the highest count becomes HEAVY
+	 * (exactly one per node); ties are broken by the largest destination
+	 * node id. All other outgoing edges stay LIGHT.
 	 */
 	void mark_heavy_edges() {
-		// Weights are recomputed from paths so they reflect the dictionary
-		// exactly, independently of how they were accumulated during merges.
-		for (auto &edges : out_edges)
-			for (Edge &e : edges)
-				e.weight = 0;
-		for (const auto &path : paths) {
-			for (std::size_t i = 1; i < path.size(); ++i) {
-				find_edge(out_edges[path[i - 1]], path[i])->weight++;
-				find_edge(in_edges[path[i]], path[i - 1])->weight++;
-			}
-		}
+		std::vector<std::size_t> weight(next_edge_id, 0);
+		for (const auto &path : paths)
+			for (std::size_t i = 1; i < path.size(); ++i)
+				weight[find_edge(out_edges[path[i - 1]], path[i])
+				           ->edge_id]++;
 
-		for (auto &edges : out_edges) {
+		for (std::size_t u = 0; u < out_edges.size(); ++u) {
+			auto &edges = out_edges[u];
 			Edge *heavy = nullptr;
 			for (Edge &e : edges) {
 				e.type = EdgeType::LIGHT;
-				if (!heavy || e.weight > heavy->weight ||
-				    (e.weight == heavy->weight && e.neighbor > heavy->neighbor))
+				if (!heavy || weight[e.edge_id] > weight[heavy->edge_id] ||
+				    (weight[e.edge_id] == weight[heavy->edge_id] &&
+				     e.neighbor > heavy->neighbor))
 					heavy = &e;
 			}
 			if (heavy)
 				heavy->type = EdgeType::HEAVY;
+			nodes[u].heavy_neighbour =
+			    heavy ? std::optional<node_id>(heavy->neighbor)
+			          : std::nullopt;
 		}
 	}
 
