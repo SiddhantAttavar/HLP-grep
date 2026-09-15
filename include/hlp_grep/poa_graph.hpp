@@ -53,22 +53,9 @@ public:
 		/// HEAVY: number of heavy edges advanced along the chain.
 		/// LIGHT: destination node of the single light edge.
 		union {
-			node_id length;
+			int length;
 			node_id next;
 		};
-	};
-
-	/**
-	 * @brief Per-edge metadata stored in the graph: neighbor node, its
-	 *        heavy/light classification (finalized by mark_heavy_edges()),
-	 *        and its unique edge id (shared by the out-edge and in-edge
-	 *        records of the same edge). Visiting frequencies are temporary
-	 *        values and are not stored in the struct.
-	 */
-	struct Edge {
-		EdgeType type = EdgeType::LIGHT; ///< Heavy or light edge.
-		node_id neighbor = 0;            ///< Other end of the edge.
-		std::size_t edge_id = 0;         ///< Unique id assigned at creation.
 	};
 
 	/**
@@ -87,16 +74,6 @@ public:
 		/// modified.
 		std::optional<node_id> heavy_neighbour;
 	};
-
-	/**
-	 * @brief Outgoing edges of a node.
-	 *
-	 * @param u Node id.
-	 * @return The list of edges leaving @p u (empty for a sink node).
-	 */
-	const std::vector<Edge> &outgoing_edges(node_id u) const {
-		return out_edges[u];
-	}
 
 	/**
 	 * @brief Builds the POA graph from the given dictionary.
@@ -242,7 +219,7 @@ public:
 			CompressedEdge step;
 			if (edge_type(p[i - 1], p[i]) == EdgeType::HEAVY) {
 				step.type = EdgeType::HEAVY;
-				node_id len = 1;
+				int len = 1;
 				++i;
 				while (i < p.size() &&
 				       edge_type(p[i - 1], p[i]) == EdgeType::HEAVY) {
@@ -277,6 +254,19 @@ private:
 	struct Alignment {
 		int cost = 0;                 ///< Minimum alignment cost.
 		std::vector<AlignmentOp> ops; ///< Alignment steps, in sequence order.
+	};
+
+	/**
+	 * @brief Per-edge metadata stored in the graph: neighbor node, its
+	 *        heavy/light classification (finalized by mark_heavy_edges()),
+	 *        and its unique edge id (shared by the out-edge and in-edge
+	 *        records of the same edge). Visiting frequencies are temporary
+	 *        values and are not stored in the struct.
+	 */
+	struct Edge {
+		EdgeType type = EdgeType::LIGHT; ///< Heavy or light edge.
+		node_id neighbor = 0;            ///< Other end of the edge.
+		std::size_t edge_id = 0;         ///< Unique id assigned at creation.
 	};
 
 	/// Virtual start node; edges from it are implicit and cost nothing.
@@ -473,10 +463,10 @@ private:
 				};
 				auto consider_con = [&](node_id prow) {
 					const int c =
-					    dp[prow * C + i - 1] + cost.match(nodes[u].base, s[i - 1]);
+					    dp[prow * C + i - 1] + cost.consume(nodes[u].base, s[i - 1]);
 					int pri = 2;
 					if (nodes[u].base == s[i - 1] &&
-					    cost.match(nodes[u].base, s[i - 1]) == 0)
+					    cost.consume(nodes[u].base, s[i - 1]) == 0)
 						pri = 3;
 					if (c < best || (c == best && bpri < pri)) {
 						best = c;

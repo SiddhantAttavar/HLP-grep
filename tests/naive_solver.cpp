@@ -44,7 +44,7 @@ int edit_distance(const std::string &a, const std::string &b,
 		curr[0] = static_cast<int>(i) * cost.del;
 		for (std::size_t j = 1; j <= b.size(); ++j)
 			curr[j] = std::min({prev[j] + cost.del, curr[j - 1] + cost.ins,
-			                    prev[j - 1] + cost.match(a[i - 1], b[j - 1])});
+			                    prev[j - 1] + cost.consume(a[i - 1], b[j - 1])});
 		std::swap(prev, curr);
 	}
 	return prev[b.size()];

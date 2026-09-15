@@ -46,13 +46,14 @@ struct CostModel {
 	int del; ///< Cost of deleting a character.
 
 	/**
-	 * @brief Returns the cost of matching two characters.
+	 * @brief Returns the cost of consuming @p b with @p a: the substitution
+	 *        cost between the two characters.
 	 *
-	 * @param a First character.
-	 * @param b Second character.
-	 * @return The cost of matching @p a with @p b (0 if they match).
+	 * @param a Graph character being consumed.
+	 * @param b Character consumed against it.
+	 * @return The cost of matching @p a with @p b (0 if they are equal).
 	 */
-	int match(char a, char b) const {
+	int consume(char a, char b) const {
 		return matrix[index_of(a)][index_of(b)];
 	}
 

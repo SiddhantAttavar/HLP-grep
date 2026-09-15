@@ -87,7 +87,7 @@ constructor. On disk, testcase solution files store the same ids as
 costs: `ins` and `del` default to 1, and the substitution matrix
 defaults to the unit model over the DNA alphabet `AGCT` (0 on the
 diagonal, 1 elsewhere). The matrix is looked up as
-`CostModel::match(alphabet[i], alphabet[j])`; characters absent from
+`CostModel::consume(alphabet[i], alphabet[j])`; characters absent from
 the alphabet fall back to index 0.
 
 ```cpp

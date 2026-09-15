@@ -79,7 +79,7 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 			          g.edge_type(cur, g.heavy_edge(cur)) ==
 			                  POAGraph::EdgeType::LIGHT,
 			      name + ": adjacent heavy steps on the same chain missed");
-			for (std::size_t h = 0; h < st.length; ++h) {
+			for (int h = 0; h < st.length; ++h) {
 				check(g.edge_type(cur, g.heavy_edge(cur)) ==
 				              POAGraph::EdgeType::HEAVY,
 				      name + ": heavy step traverses a non-heavy edge");

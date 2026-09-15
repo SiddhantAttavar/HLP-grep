@@ -117,7 +117,7 @@ public:
 	 * @throws std::invalid_argument if cost.size() does not match the
 	 *         start node's window.
 	 */
-	node_id jump(node_id u, std::size_t l, std::vector<int> &cost) const {
+	node_id jump(node_id u, int l, std::vector<int> &cost) const {
 		if (u >= up.size())
 			throw std::out_of_range("BinaryLifter::jump: invalid node id");
 		node_id v = u;
@@ -177,7 +177,7 @@ private:
 	 *   mat(a, b) = min( mat(a, b - 1) + ins,
 	 *                    del + ins * (b - a),
 	 *                    match + ins * (b - a - 1) )
-	 * where match is the running min of match(base(v), query[j]) over
+	 * where the consume term is the running min of consume(base(v), query[j]) over
 	 * j in [a, b - 1]. Cells with b < a cannot be realized by any
 	 * transition; they take the bound k + 1, large enough to exceed any
 	 * within-threshold cost while remaining small enough that repeated
@@ -198,7 +198,7 @@ private:
 				if (span > 0)
 					best_match = std::min(
 					    best_match,
-					    cost_model.match(base_v, query[b - 1]));
+					    cost_model.consume(base_v, query[b - 1]));
 				int cur;
 				if (span > 0) {
 					cur = std::min(

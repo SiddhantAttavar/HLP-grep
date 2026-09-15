@@ -134,7 +134,7 @@ private:
 			int cur = cost.del + cost.ins * static_cast<int>(i);
 			if (i > 0) {
 				best_match = std::min(
-				    best_match, cost.match(graph.base(start), query[i - 1]));
+				    best_match, cost.consume(graph.base(start), query[i - 1]));
 				cur = std::min(cur,
 				               best_match +
 				                   cost.ins * (static_cast<int>(i) - 1));
