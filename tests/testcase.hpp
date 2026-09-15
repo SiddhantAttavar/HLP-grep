@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+using namespace hlp_grep;
+
 namespace fs = std::filesystem;
 
 /**

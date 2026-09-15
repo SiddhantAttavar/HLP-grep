@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+namespace hlp_grep {
+
 /**
  * @brief Cost model for edit distance computations.
  *
@@ -70,3 +72,5 @@ private:
 		return index[static_cast<unsigned char>(c)];
 	}
 };
+
+} // namespace hlp_grep

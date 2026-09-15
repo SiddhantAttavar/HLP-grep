@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+namespace hlp_grep {
+
 /**
  * @brief Binary lifting table over the heavy chains of a POAGraph.
  *
@@ -252,3 +254,5 @@ private:
 	/// with a non-empty sub-chain.
 	std::vector<std::vector<DistMatrix>> up_mat;
 };
+
+} // namespace hlp_grep

@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+namespace hlp_grep {
+
 /**
  * @brief Edit distance search engine over a sequence dictionary using
  *        heavy-light decomposition on pangenome paths.
@@ -148,3 +150,5 @@ private:
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
 };
+
+} // namespace hlp_grep

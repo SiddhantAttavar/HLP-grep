@@ -22,6 +22,9 @@
 #include <sstream>
 #include <vector>
 
+
+using namespace hlp_grep;
+
 namespace {
 
 /** Expected results for a single query, as read from a solution file. */

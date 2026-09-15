@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 
+namespace hlp_grep {
+
 /**
  * @brief A POA (partial order alignment) graph of a sequence dictionary.
  *
@@ -653,3 +655,5 @@ private:
 			}
 	}
 };
+
+} // namespace hlp_grep

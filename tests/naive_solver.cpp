@@ -22,6 +22,9 @@
 #include <utility>
 #include <vector>
 
+
+using namespace hlp_grep;
+
 namespace {
 
 /**

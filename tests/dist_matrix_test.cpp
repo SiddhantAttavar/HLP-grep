@@ -14,6 +14,9 @@
 #include <stdexcept>
 #include <vector>
 
+
+using namespace hlp_grep;
+
 namespace {
 
 /** Exits with an error message on failure, like the testcase helpers. */

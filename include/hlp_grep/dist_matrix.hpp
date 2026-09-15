@@ -15,6 +15,8 @@
 #include <stdexcept>
 #include <vector>
 
+namespace hlp_grep {
+
 /**
  * @brief A rectangular matrix over the (min, +) semiring.
  *
@@ -137,3 +139,5 @@ private:
 	std::size_t cols;      ///< Number of columns.
 	std::vector<int> data; ///< Flat row-major storage.
 };
+
+} // namespace hlp_grep
