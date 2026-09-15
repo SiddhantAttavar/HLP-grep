@@ -1,12 +1,12 @@
 /**
  * @file hlp_grep.hpp
  * @brief Edit distance search queries on a DNA sequence dictionary using
- *        heavy-light decomposition on pangenome paths.
+ *        heavy-light decomposition on POA graph paths.
  *
  * HLP-grep indexes a dictionary of DNA sequences (represented as paths in a
- * pangenome) and answers edit distance search queries: given a query string
- * and a threshold k, it finds all dictionary sequences within edit distance
- * k of the query string.
+ * partial order alignment (POA) graph) and answers edit distance search
+ * queries: given a query string and a threshold k, it finds all dictionary
+ * sequences within edit distance k of the query string.
  */
 #pragma once
 #include <hlp_grep/binary_lifter.hpp>
@@ -24,9 +24,9 @@ namespace hlp_grep {
 
 /**
  * @brief Edit distance search engine over a sequence dictionary using
- *        heavy-light decomposition on pangenome paths.
+ *        heavy-light decomposition on POA graph paths.
  *
- * Indexes the dictionary sequences (represented as paths in a pangenome) and
+ * Indexes the dictionary sequences (represented as paths in a POA graph) and
  * answers edit distance search queries.
  *
  * Usage: construct the solver with the dictionary, then call query() to
@@ -146,7 +146,7 @@ private:
 
 	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
 	CostModel cost;                ///< Cost model used for the edit distance computations.
-	POAGraph graph;                ///< Pangenome (POA) graph built from the dictionary.
+	POAGraph graph;                ///< POA graph built from the dictionary.
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
 };

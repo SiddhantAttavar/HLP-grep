@@ -3,10 +3,9 @@
  * @brief Validates the POAGraph sequence-to-graph alignment.
  *
  * Checks the structural invariants of the POA graph built from a dictionary:
- * every sequence path spells back its dictionary sequence, node ids along
- * each path are strictly increasing (topological order), and known small
- * dictionaries produce the exact expected graph shape (node count, bases,
- * and shared path prefixes).
+ * every sequence path spells back its dictionary sequence over connected
+ * graph edges, and known small dictionaries produce the exact expected graph
+ * shape (node count, bases, and shared path prefixes).
  */
 
 #include <hlp_grep/poa_graph.hpp>
@@ -294,7 +293,7 @@ int main() {
 	}
 
 	// Position ranges: per node, min/max 0-based offsets across every path
-	// that passes through it (j_min/j_max in notes/idea.md).
+	// that passes through it (j_min/j_max).
 	{
 		const std::vector<std::string> dict = {"ACGT", "ACGA", "AC"};
 		const POAGraph g(dict);

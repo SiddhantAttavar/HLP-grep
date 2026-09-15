@@ -9,8 +9,9 @@ cmake --build build
 ctest --test-dir build
 ```
 
-The build also produces two test executables, `build/tests/solve` and
-`build/tests/test_hlp_grep` (see [Testing](#testing)).
+The build also produces the test executables under `build/tests/`
+(`solve`, `test_hlp_grep`, plus `POAGraph` and `DistMatrix` unit tests;
+see [Testing](#testing)).
 
 ## Install
 
@@ -103,9 +104,6 @@ const std::vector<std::vector<int>> purine_pyrimidine{
     {1, 1, 4, 0},
 };
 hlp_grep::CostModel transitions(1, 1, "AGCT", purine_pyrimidine);
-
-hlp_grep::Solver solver(dict, transitions);
-```
 
 hlp_grep::Solver solver(dict, transitions);
 ```

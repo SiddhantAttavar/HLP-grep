@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(hlp_grep
 	VERSION 0.1.0
-	DESCRIPTION "Edit distance search queries on DNA sequence dictionary using heavy-light decomposition on pangenome paths"
+	DESCRIPTION "Edit distance search queries on DNA sequence dictionary using heavy-light decomposition on partial order alignment (POA) graph paths"
 	LANGUAGES CXX
 )
 

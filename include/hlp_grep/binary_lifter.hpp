@@ -5,7 +5,7 @@
  * Precomputes, for every graph node and every power of two, the node reached
  * by walking that many heavy edges. Alongside the node table, per-level
  * chain distances ed(u, 2^t, a, b) are precomputed as min-plus products of
- * level (t - 1) blocks (notes/idea.md:82). The chain tables depend on the
+ * level (t - 1) blocks. The chain tables depend on the
  * query string and threshold k, so both are supplied at construction time
  * and fixed for the lifetime of the object. Jump queries advance a
  * caller-provided DP row across the jumped chain with min-plus products.
@@ -90,20 +90,22 @@ public:
 	}
 
 	/**
-	 * @brief Jumps l heavy steps from u (u^l in notes/idea.md; l == 0 is
+	 * @brief Jumps l heavy steps from u (u^l; l == 0 is
 	 *        the identity) and advances the caller's DP row across the
 	 *        jumped chain.
 	 *
 	 * @p cost must hold one entry per allowed query position of the
-	 * start node — its clamped pos_range window [j_min - k, j_max + k]
+	 * start node — its clamped pos_range window [j_min - k, j_max + k + 1]
 	 * over [0, |query|]. It is advanced with DistMatrix::min_plus_apply
 	 * over the precomputed power-of-two chain blocks from the most
 	 * significant bit of l down, so the blocks apply in path order.
 	 * Afterwards @p cost holds one entry per allowed position of the
 	 * reached node. In effect, after the call
 	 *   cost(b) = min_a cost_in(a) + ed(u, l, a, b)
-	 * for the chain [u, u^1, ..., u^l]. Entries stay within the block
-	 * cost bound k + 1, so repeated applications cannot overflow.
+	 * for the chain [u, u^1, ..., u^l]. Cells no transition realizes
+	 * carry the bound k + 1, large enough to dominate any cost a match
+	 * within k can reach and small enough for repeated min-plus sums
+	 * without integer overflow.
 	 *
 	 * @param u    Node to start from.
 	 * @param l    Number of heavy steps to walk.
@@ -142,7 +144,7 @@ public:
 	 *        advanced row.
 	 *
 	 * Rows are the allowed query positions at u, columns those at v, i.e.
-	 * the pos_range windows [j_min - k, j_max + k] clamped to
+	 * the pos_range windows [j_min - k, j_max + k + 1] clamped to
 	 * [0, |query|] (half-open). In effect, after the call
 	 *   out(b) = min_a cost(a) + ed(u, 1, a, b)
 	 * for the one-edge chain landing on v.
@@ -165,10 +167,10 @@ private:
 	/**
 	 * @brief The DistMatrix of the single edge (u, v): ed(u, 1, a, b)
 	 *        between the one-edge chain landing on v and the query
-	 *        interval [a, b] (notes/idea.md).
+	 *        interval [a, b].
 	 *
 	 * Rows are the allowed query positions at u, columns those at v, i.e.
-	 * the pos_range windows [j_min - k, j_max + k] clamped to
+	 * the pos_range windows [j_min - k, j_max + k + 1] clamped to
 	 * [0, |query|] (half-open). Entry (a, b) is the min cost to go from
 	 * DP state (u, a) to (v, b) across the edge, built left to right
 	 * along b with the recurrence
@@ -177,9 +179,10 @@ private:
 	 *                    match + ins * (b - a - 1) )
 	 * where match is the running min of match(base(v), query[j]) over
 	 * j in [a, b - 1]. Cells with b < a cannot be realized by any
-	 * transition; they take the bound k + 1, an over-estimate of every
-	 * cost a query matched within k can reach, so they never undercut
-	 * real transitions in a min-plus composition.
+	 * transition; they take the bound k + 1, large enough to exceed any
+	 * within-threshold cost while remaining small enough that repeated
+	 * min-plus sums cannot overflow, so they never undercut real
+	 * transitions in a min-plus composition.
 	 */
 	DistMatrix edge_matrix(node_id u, node_id v) const {
 		const auto [lo_u, hi_u] = window(u);

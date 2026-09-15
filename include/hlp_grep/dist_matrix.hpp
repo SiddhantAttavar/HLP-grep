@@ -4,7 +4,7 @@
  *
  * DistMatrix stores a rectangular matrix of integer costs and provides the
  * min-plus matrix and matrix-vector products used to compose edit-distance
- * transition tables along heavy chains (notes/idea.md). No infinity
+ * transition tables along heavy chains. No infinity
  * sentinel is built in; callers represent unreachable states with their own
  * large values and must keep them small enough that sums do not overflow.
  */

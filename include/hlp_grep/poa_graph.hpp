@@ -3,7 +3,7 @@
  * @brief Partial order alignment (POA) graph built from a dictionary of DNA
  *        sequences.
  *
- * Constructs a pangenome-style graph incrementally: each dictionary sequence
+ * Constructs a POA graph incrementally: each dictionary sequence
  * is aligned to the current graph (min-cost alignment under CostModel) and its
  * alignment is merged into the graph. Every dictionary sequence is stored as
  * an explicit path of node ids, as required by heavy-light path compression.
@@ -24,9 +24,10 @@ namespace hlp_grep {
 /**
  * @brief A POA (partial order alignment) graph of a sequence dictionary.
  *
- * Nodes represent aligned bases, edges carry visiting frequencies, and each
- * dictionary sequence is represented as a path through the graph. The DAG is
- * kept in a topological order maintained by the graph.
+ * Nodes represent aligned bases, edges are classified heavy/light by
+ * visiting frequencies, and each dictionary sequence is represented
+ * as a path through the graph. The DAG is kept in a topological order
+ * maintained by the graph.
  */
 class POAGraph {
 public:
@@ -35,12 +36,12 @@ public:
 
 	/**
 	 * @brief Heavy/light classification used by the heavy-light
-	 *        decomposition of sequence paths (notes/idea.md).
+	 *        decomposition of sequence paths.
 	 */
 	enum class EdgeType : unsigned char { HEAVY, LIGHT };
 
 	/**
-	 * @brief A step along a compressed sequence path (notes/idea.md).
+	 * @brief A step along a compressed sequence path.
 	 *
 	 * Either a HEAVY chain advancing `length` heavy edges (all from the same
 	 * chain), or a single LIGHT edge landing on node `next`. The two variants
@@ -73,7 +74,7 @@ public:
 	/**
 	 * @brief A node of the graph: its base character and the range of
 	 *        offsets at which it occurs among the sequence paths passing
-	 *        through it (j_min / j_max in notes/idea.md). Offsets use
+	 *        through it (j_min / j_max). Offsets use
 	 *        kStart as a "never on a path" sentinel.
 	 */
 	struct Node {
@@ -139,7 +140,7 @@ public:
 
 	/**
 	 * @brief Read-only access to a node's full data: base character,
-	 *        position range, and its heavy outgoing Edge pointer (null if
+	 *        position range, and its heavy outgoing neighbour (empty if
 	 *        the node has no outgoing edges).
 	 *
 	 * @param u Node id.
@@ -207,11 +208,12 @@ public:
 	/**
 	 * @brief Position range of a node: (min, max) 0-based offsets of the node
 	 *        among the sequence paths passing through it, i.e. the
-	 *        j_min/j_max pair used by notes/idea.md to bound query
-	 *        precomputation windows to [j_min - k, j_max + k].
+	 *        j_min/j_max pair used to bound query
+	 *        precomputation windows to [j_min - k, j_max + k + 1] clamped
+	 *        to [0, |query|].
 	 *
 	 * The offset of a node in a path is its 0-based index along that path.
-	 * Both values equal kNone (SIZE_MAX) for nodes on no stored path (an
+	 * Both values equal SIZE_MAX for nodes on no stored path (an
 	 * empty dictionary sequence).
 	 */
 	std::pair<std::size_t, std::size_t> pos_range(node_id u) const {
@@ -219,15 +221,8 @@ public:
 	}
 
 	/**
-	 * @brief Compressed representation of a sequence path (notes/idea.md):
-	 *        consecutive heavy edges of the path merge into single HEAVY
-	 *        steps (`length` = number of heavy edges advanced); every light
-	 *        edge becomes a LIGHT step (`next` = the node it lands on, so
-	 *        the walk does not depend on unique heavy-chain successors).
-	 *
-	/**
-	 * @brief Compressed representation of a sequence path (notes/idea.md):
-	 *        consecutive heavy edges of the path merge into single HEAVY
+	 * @brief Compressed representation of a sequence path: consecutive
+	 *        heavy edges of the path merge into single HEAVY
 	 *        steps (`length` = number of heavy edges advanced); every light
 	 *        edge becomes a LIGHT step (`next` = the node it lands on, so
 	 *        the walk does not depend on unique heavy-chain successors).
@@ -637,7 +632,7 @@ private:
 	/**
 	 * @brief Computes Node::pos_min / Node::pos_max: for every node, the
 	 *        minimum and maximum offset at which the node occurs among the
-	 *        stored sequence paths (j_min / j_max in notes/idea.md).
+	 *        stored sequence paths (j_min / j_max).
 	 *        Offsets are 0-based positions along each path.
 	 */
 	void compute_pos_ranges() {
