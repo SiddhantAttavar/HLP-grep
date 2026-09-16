@@ -83,17 +83,50 @@ constructor. On disk, testcase solution files store the same ids as
 
 ### Cost models
 
-`CostModel(ins, del, alphabet, matrix)` defines the edit operation
-costs: `ins` and `del` default to 1, and the substitution matrix
-defaults to the unit model over the DNA alphabet `AGCT` (0 on the
-diagonal, 1 elsewhere). The matrix is looked up as
-`CostModel::consume(alphabet[i], alphabet[j])`; characters absent from
-the alphabet fall back to index 0.
+`CostModel` is an abstract interface with virtual `clone()`, `ins(char)`,
+`del(char)`, `consume(g, b)` and `is_monge()`; `UnitCostModel` and
+`MatrixCostModel` derive from it. `Solver` is the single owner: it stores
+a cloned `std::unique_ptr<CostModel>` (the only unique_ptr in the
+codebase) and deep-clones in its copy constructor, so models passed to
+`Solver` (including temporaries) need no lifetime guarantees. `POAGraph`,
+`BinaryLifter` and `NaiveSolver` still hold `CostModel&` references:
+construct the model as a named object and keep it alive for as long as
+the owner is used (`DEFAULT_COST_MODEL` is a permanent unit-cost object
+used as the default argument when no explicit model is supplied).
+
+`UnitCostModel(ins, del, match, mismatch)` has no matrix: consuming equal
+characters costs `match` (default 0), any distinct pair costs `mismatch`
+(default 1), and `ins`/`del` default to 1.
+
+`MatrixCostModel(alphabet, matrix, ins_costs, del_costs)` uses
+an explicit substitution matrix, looked up as
+`consume(alphabet[i], alphabet[j])`; characters absent from the alphabet
+fall back to index 0. The optional `ins_costs`/`del_costs` vectors set
+character-specific insertion/deletion costs (alphabet order; empty means
+cost 1 for every character), queried as `ins(char)` /
+`del(char)`.
+
+`MatrixCostModel::make_monge()` replaces every cost (per-character
+substitution, insertion, deletion) with the cheapest walk in the scoring
+digraph over the alphabet plus a gap node, so no two-step edit chain can
+beat a direct edit. A negative-cost cycle throws
+`std::invalid_argument`. With the closure applied,
+`MatrixCostModel::is_monge()` therefore returns true; without the
+closure it still returns true whenever no negative-cost cycle exists
+(see the `is_monge()` paragraph below).
+
+`is_monge()` reports whether the model yields Monge single-edge chain
+blocks (and, by min-plus composition, Monge composed chain tables) the
+cheap way, with no DP tables: `UnitCostModel` checks its four costs in
+O(1) (nonnegative match/mismatch/insertion/deletion), and
+`MatrixCostModel` only rejects models whose scoring digraph contains a
+negative-cost cycle, detected by an O(|alphabet|^3) Floyd-Warshall
+closure (also reused by `make_monge()`).
 
 ```cpp
 // Heavier noise operations: alignments prefer matching bases and
 // thresholds stay strict (ins = 2, del = 3, unit substitutions).
-hlp_grep::CostModel strict(2, 3, "AGCT", {});
+hlp_grep::UnitCostModel strict(2, 3);
 
 // Minimal-cost transitions only between purines (A<->G) and
 // pyrimidines (C<->T); rows/columns follow the alphabet "AGCT".
@@ -103,7 +136,7 @@ const std::vector<std::vector<int>> purine_pyrimidine{
     {1, 1, 0, 4},
     {1, 1, 4, 0},
 };
-hlp_grep::CostModel transitions(1, 1, "AGCT", purine_pyrimidine);
+hlp_grep::MatrixCostModel transitions("AGCT", purine_pyrimidine);
 
 hlp_grep::Solver solver(dict, transitions);
 ```

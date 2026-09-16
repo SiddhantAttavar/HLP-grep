@@ -5,8 +5,9 @@ Each testcase is a single text file containing a single dictionary of strings fo
 ## Structure
 1. **Alphabet**: A single string containing the characters in the alphabet $\Sigma$.
 2. **Cost model**: 
-   1. The first line contains two integers: the cost of insertion and deletion respectively.
-   2. The next $|\Sigma|$ lines containing $|\Sigma|$ integers each. The $j^{th}$ integer in the $i^{th}$ line is the cost of match/mismatch between $\Sigma_i$ and $\Sigma_j$. This matrix must be symmetric, and all elements along the diagonal must be $0$.
+   1. The first line contains $|\Sigma|$ insertion costs, in alphabet order.
+   2. The second line contains $|\Sigma|$ deletion costs, in alphabet order.
+   3. The next $|\Sigma|$ lines containing $|\Sigma|$ integers each. The $j^{th}$ integer in the $i^{th}$ line is the cost of match/mismatch between $\Sigma_i$ and $\Sigma_j$. This matrix must be symmetric, and all elements along the diagonal must be $0$.
 3. **Dictionary header**: A single line containing the number of strings $n$ in the dictionary.
 4. **Dictionary sequences**: one string per line $dict_i$.
 5. **Query header**: A single integer $q$ giving the number of queries.
@@ -16,7 +17,8 @@ Each testcase is a single text file containing a single dictionary of strings fo
 
 ```text
 AGCT
-1 1
+1 1 1 1
+1 1 1 1
 0 1 1 1
 1 0 1 1
 1 1 0 1
