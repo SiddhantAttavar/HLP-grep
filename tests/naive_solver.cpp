@@ -37,14 +37,17 @@ namespace {
 int edit_distance(const std::string &a, const std::string &b,
                   const CostModel &cost) {
 	std::vector<int> prev(b.size() + 1), curr(b.size() + 1);
-	for (std::size_t j = 0; j <= b.size(); ++j)
-		prev[j] = static_cast<int>(j) * cost.ins;
+	prev[0] = 0;
+	for (std::size_t j = 1; j <= b.size(); ++j)
+		prev[j] = prev[j - 1] + cost.ins(b[j - 1]);
 
 	for (std::size_t i = 1; i <= a.size(); ++i) {
-		curr[0] = static_cast<int>(i) * cost.del;
+		curr[0] = prev[0] + cost.del(a[i - 1]);
 		for (std::size_t j = 1; j <= b.size(); ++j)
-			curr[j] = std::min({prev[j] + cost.del, curr[j - 1] + cost.ins,
-			                    prev[j - 1] + cost.consume(a[i - 1], b[j - 1])});
+			curr[j] = std::min(
+			    {prev[j] + cost.del(a[i - 1]),
+			     curr[j - 1] + cost.ins(b[j - 1]),
+			     prev[j - 1] + cost.consume(a[i - 1], b[j - 1])});
 		std::swap(prev, curr);
 	}
 	return prev[b.size()];
@@ -64,11 +67,13 @@ public:
 	 *
 	 * @param dict Dictionary of DNA sequences to search. The position of each
 	 *             sequence in this vector defines the `id` reported in Result.
-	 * @param cost Cost model defining the costs of the basic edit operations.
-	 *             Defaults to the unit-cost model (`CostModel{}`).
+	 * @param cost Cost model defining the costs of the basic edit operations;
+	 *             defaults to the unit-cost model. The referenced model must
+	 *             outlive the solver.
 	 */
-	explicit NaiveSolver(std::vector<std::string> dict, CostModel cost = {})
-	    : dict_(std::move(dict)), cost_(cost) {}
+	explicit NaiveSolver(std::vector<std::string> dict,
+	                     const CostModel &cost = DEFAULT_COST_MODEL)
+	    : dict(std::move(dict)), cost(cost) {}
 
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the query.
@@ -82,8 +87,8 @@ public:
 	 */
 	std::vector<Result> query(const std::string &query, int k) const {
 		std::vector<Result> results;
-		for (std::size_t i = 0; i < dict_.size(); ++i) {
-			const int dist = edit_distance(query, dict_[i], cost_);
+		for (std::size_t i = 0; i < dict.size(); ++i) {
+			const int dist = edit_distance(query, dict[i], cost);
 			if (dist <= k)
 				results.push_back({i, dist});
 		}
@@ -91,12 +96,14 @@ public:
 	}
 
 private:
-	std::vector<std::string> dict_; ///< Dictionary of DNA sequences to search.
-	CostModel cost_;                ///< Cost model used for the edit distance computations.
+	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
+	/// Cost model used for the edit distance computations; must outlive
+	/// the solver.
+	const CostModel &cost;
 };
 
 void solve_testcase(const fs::path &file, const Testcase &tc) {
-	const NaiveSolver solver(tc.dict, tc.cost);
+	const NaiveSolver solver(tc.dict, *tc.cost);
 
 	const fs::path out_path = solution_path(file);
 	std::ofstream out(out_path);

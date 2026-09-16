@@ -62,7 +62,7 @@ public:
 	 * @brief A node of the graph: its base character and the range of
 	 *        offsets at which it occurs among the sequence paths passing
 	 *        through it (j_min / j_max). Offsets use
-	 *        kStart as a "never on a path" sentinel.
+	 *        START as a "never on a path" sentinel.
 	 */
 	struct Node {
 		char base = 0;            ///< Base character represented by this node.
@@ -83,10 +83,11 @@ public:
 	 *
 	 * @param dict Dictionary of DNA sequences to index.
 	 * @param cost Cost model used for the sequence-to-graph alignments.
-	 *             Defaults to the unit-cost model (`CostModel{}`).
+	 *             Defaults to the unit-cost model. The referenced model
+	 *             must outlive the graph.
 	 */
 	explicit POAGraph(const std::vector<std::string> &dict,
-	                  const CostModel &cost = {})
+	                  const CostModel &cost = DEFAULT_COST_MODEL)
 	    : cost(cost) {
 		build(dict);
 	}
@@ -108,7 +109,7 @@ public:
 	}
 
 	/**
-	 * @brief The cost model this graph was built with (used internally for
+	 * @brief Returns the cost model this graph was built with (used internally for
 	 *        the sequence-to-graph alignments).
 	 */
 	const CostModel &cost_model() const {
@@ -172,14 +173,14 @@ public:
 	}
 
 	/**
-	 * @brief The single heavy outgoing edge of a node, or kStart if the node
+	 * @brief The single heavy outgoing edge of a node, or START if the node
 	 *        has no outgoing edges.
 	 */
 	node_id heavy_edge(node_id u) const {
 		for (const Edge &e : out_edges[u])
 			if (e.type == EdgeType::HEAVY)
 				return e.neighbor;
-		return kStart;
+		return START;
 	}
 
 	/**
@@ -270,7 +271,7 @@ private:
 	};
 
 	/// Virtual start node; edges from it are implicit and cost nothing.
-	static constexpr node_id kStart = static_cast<node_id>(-1);
+	static constexpr node_id START = static_cast<node_id>(-1);
 
 	/// Per node: base character and position range.
 	std::vector<Node> nodes;
@@ -285,7 +286,7 @@ private:
 	/// Node ids in topological order of the DAG.
 	std::vector<node_id> topo;
 
-	CostModel cost;
+	const CostModel &cost; ///< Cost model of the graph alignments; must outlive the graph.
 
 	// -- construction ---------------------------------------------------------
 
@@ -294,7 +295,7 @@ private:
 		if (dict.empty())
 			return;
 
-		node_id prev = kStart;
+		node_id prev = START;
 		std::vector<node_id> seed;
 		seed.reserve(dict[0].size());
 		for (const char c : dict[0]) {
@@ -319,7 +320,7 @@ private:
 	/** Creates a new node with base @p c at the end of the graph. */
 	node_id append_node(char c) {
 		const node_id u = nodes.size();
-		nodes.push_back({c, kStart, kStart});
+		nodes.push_back({c, START, START});
 		out_edges.emplace_back();
 		in_edges.emplace_back();
 		return u;
@@ -349,7 +350,7 @@ private:
 	 *        computed on demand, not incremented here.
 	 */
 	void add_edge(node_id u, node_id v) {
-		if (u == kStart)
+		if (u == START)
 			return;
 		if (!find_edge(out_edges[u], v)) {
 			const std::size_t id = next_edge_id++;
@@ -401,40 +402,42 @@ private:
 	Alignment align_to_graph(const std::string &s) {
 		const std::size_t V = nodes.size();
 		const std::size_t m = s.size();
-		constexpr int kInf = std::numeric_limits<int>::max() / 2;
+		constexpr int INF = std::numeric_limits<int>::max() / 2;
 		const std::size_t R = V + 1; // DP rows; last row = virtual start.
 		const std::size_t C = m + 1; // DP columns.
 		const node_id vr = static_cast<node_id>(V);
-		const node_id kInsCode =
+		const node_id INS_CODE =
 		    static_cast<unsigned char>(AlignmentOp::Type::INSERT) + 1;
-		const node_id kDelCode =
+		const node_id DEL_CODE =
 		    static_cast<unsigned char>(AlignmentOp::Type::DELETE) + 1;
-		const node_id kConCode =
+		const node_id CON_CODE =
 		    static_cast<unsigned char>(AlignmentOp::Type::CONSUME) + 1;
 
-		std::vector<int> dp(R * C, kInf);
+		std::vector<int> dp(R * C, INF);
 		std::vector<unsigned char> op(R * C, 0);
-		std::vector<node_id> from(R * C, kStart);
+		std::vector<node_id> from(R * C, START);
 		std::vector<node_id> row_of(V, 0); // node id -> topological row.
 		for (std::size_t p = 0; p < V; ++p)
 			row_of[topo[p]] = p;
 
-		// Start row: dp[vr][j] = j * ins (insert-only prefix).
+		// Start row: dp[vr][j] = sum of insertion costs over s[0..j).
 		dp[vr * C] = 0;
 		for (std::size_t j = 1; j <= m; ++j) {
 			const std::size_t k = vr * C + j;
-			dp[k] = dp[k - 1] + cost.ins;
-			op[k] = kInsCode;
+			dp[k] = dp[k - 1] + cost.ins(s[j - 1]);
+			op[k] = INS_CODE;
 			from[k] = vr;
 		}
 		// dp[u][0]: delete graph bases between the start and node u.
 		for (std::size_t p = 0; p < V; ++p) {
-			int d = kInf;
+			int d = INF;
 			if (in_edges[topo[p]].empty()) {
-				d = cost.del;
+				d = cost.del(nodes[topo[p]].base);
 			} else {
 				for (const Edge &e : in_edges[topo[p]]) {
-					const int c = dp[row_of[e.neighbor] * C] + cost.del;
+					const int c =
+					    dp[row_of[e.neighbor] * C] +
+					    cost.del(nodes[topo[p]].base);
 					if (c < d)
 						d = c;
 				}
@@ -447,16 +450,16 @@ private:
 			const node_id u = topo[p];
 			for (std::size_t i = 1; i <= m; ++i) {
 				const std::size_t k = p * C + i;
-				int best = dp[k - 1] + cost.ins; // insert s[i-1] at u
-				unsigned char bop = kInsCode;
+				int best = dp[k - 1] + cost.ins(s[i - 1]); // insert s[i-1] at u
+				unsigned char bop = INS_CODE;
 				node_id bfrom = p;
 				int bpri = 0;
 
 				auto consider_del = [&](node_id prow) {
-					const int c = dp[prow * C + i] + cost.del;
+					const int c = dp[prow * C + i] + cost.del(nodes[u].base);
 					if (c < best || (c == best && bpri < 1)) {
 						best = c;
-						bop = kDelCode;
+						bop = DEL_CODE;
 						bfrom = prow;
 						bpri = 1;
 					}
@@ -470,7 +473,7 @@ private:
 						pri = 3;
 					if (c < best || (c == best && bpri < pri)) {
 						best = c;
-						bop = kConCode;
+						bop = CON_CODE;
 						bfrom = prow;
 						bpri = pri;
 					}
@@ -525,10 +528,10 @@ private:
 		std::size_t r = br;
 		for (std::size_t i = m; i > 0;) {
 			const std::size_t k = r * C + i;
-			const node_id row2node = (r == vr) ? kStart : topo[r];
+			const node_id row2node = (r == vr) ? START : topo[r];
 			switch (op[k]) {
 			case 1:
-				ops.push_back({AlignmentOp::Type::INSERT, kStart, s[i - 1]});
+				ops.push_back({AlignmentOp::Type::INSERT, START, s[i - 1]});
 				--i;
 				break;
 			case 2:
@@ -558,7 +561,7 @@ private:
 	void add_alignment(const std::vector<AlignmentOp> &ops) {
 		std::vector<node_id> path;
 		path.reserve(ops.size());
-		node_id prev = kStart;
+		node_id prev = START;
 		for (const AlignmentOp &a : ops) {
 			switch (a.type) {
 			case AlignmentOp::Type::DELETE:
@@ -627,15 +630,15 @@ private:
 	 */
 	void compute_pos_ranges() {
 		for (Node &n : nodes) {
-			n.pos_min = kStart;
-			n.pos_max = kStart;
+			n.pos_min = START;
+			n.pos_max = START;
 		}
 		for (const auto &path : paths)
 			for (std::size_t j = 0; j < path.size(); ++j) {
 				Node &n = nodes[path[j]];
-				if (n.pos_min == kStart || j < n.pos_min)
+				if (n.pos_min == START || j < n.pos_min)
 					n.pos_min = j;
-				if (n.pos_max == kStart || j > n.pos_max)
+				if (n.pos_max == START || j > n.pos_max)
 					n.pos_max = j;
 			}
 	}

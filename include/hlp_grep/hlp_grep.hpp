@@ -16,6 +16,7 @@
 #include <hlp_grep/result.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,16 +41,32 @@ public:
 	 *
 	 * @param dict Dictionary of DNA sequences to search. The position of each
 	 *             sequence in this vector defines the `id` reported in Result.
-	 * @param cost Cost model defining the costs of the basic edit operations.
-	 *             Defaults to the unit-cost model (`CostModel{}`).
+	 * @param cost Cost model defining the costs of the basic edit operations;
+	 *             defaults to the unit-cost model. The solver clones the
+	 *             model, so it owns its own copy and there is no lifetime
+	 *             requirement on @p cost (temporaries are fine).
 	 */
-	explicit Solver(std::vector<std::string> dict, CostModel cost = {})
-	    : dict(std::move(dict)), cost(cost),
-	      graph(this->dict, cost) {
-		for (std::size_t i = 0; i < this->dict.size(); ++i) {
-			compressed_paths.push_back(graph.compressed_path(i));
-		}
+	explicit Solver(std::vector<std::string> dict,
+	                const CostModel &cost = DEFAULT_COST_MODEL)
+	    : dict(std::move(dict)), cost(cost.clone()),
+	      graph(this->dict, *this->cost) {
+		build_compressed_paths();
 	}
+
+	/**
+	 * @brief Copy constructor.
+	 *
+	 * The cost member is a unique_ptr holding a polymorphic model, so the
+	 * compiler-generated copy machinery cannot be used; the model is
+	 * deep-cloned and the graph is rebuilt against the cloned model.
+	 */
+	Solver(const Solver &other)
+	    : dict(other.dict), cost(other.cost->clone()),
+	      graph(this->dict, *this->cost) {
+		build_compressed_paths();
+	}
+
+	Solver &operator=(const Solver &other) = delete;
 
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the
@@ -129,26 +146,49 @@ private:
 
 		std::vector<int> row;
 		row.reserve(hi - lo);
-		int best_match = k + 1;
-		for (long i = lo; i < hi; ++i) {
-			int cur = cost.del + cost.ins * static_cast<int>(i);
+		// Running prefix data over the whole query; windows only decide
+		// which entries get recorded. The seed is INF (no consume seen
+		// yet); entries stay true transition costs and saturate at INF.
+		long best_alt =
+		    DistMatrix::INF; // min over j <= i of (consume_j - ins_j)
+		long sum_ins = 0;    // sum of insertion costs over query[0..i)
+		for (long i = 0; i < hi; ++i) {
 			if (i > 0) {
-				best_match = std::min(
-				    best_match, cost.consume(graph.base(start), query[i - 1]));
-				cur = std::min(cur,
-				               best_match +
-				                   cost.ins * (static_cast<int>(i) - 1));
+				sum_ins += cost->ins(query[i - 1]);
+				best_alt = std::min(
+				    best_alt,
+				    static_cast<long>(
+				        cost->consume(graph.base(start),
+				                      query[i - 1])) -
+				        static_cast<long>(cost->ins(query[i - 1])));
 			}
-			row.push_back(cur);
+			long cur = static_cast<long>(cost->del(graph.base(start))) +
+			           sum_ins;
+			if (i > 0)
+				cur = std::min(cur, best_alt + sum_ins);
+			if (cur > DistMatrix::INF)
+				cur = DistMatrix::INF;
+			if (i >= lo)
+				row.push_back(static_cast<int>(cur));
 		}
 		return row;
 	}
 
 	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
-	CostModel cost;                ///< Cost model used for the edit distance computations.
+	/// Owned clone of the cost model; polymorphic storage (Solver is the
+	/// only unique_ptr user) so it needs the manual deep-copy ctor above.
+	std::unique_ptr<CostModel> cost;
 	POAGraph graph;                ///< POA graph built from the dictionary.
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
+
+	/** Builds the compressed representation of every dictionary path. */
+	void build_compressed_paths() {
+		compressed_paths.clear();
+		compressed_paths.reserve(dict.size());
+		for (std::size_t i = 0; i < dict.size(); ++i)
+			compressed_paths.push_back(graph.compressed_path(i));
+	}
 };
 
 } // namespace hlp_grep

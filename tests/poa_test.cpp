@@ -109,9 +109,9 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 	                                "'");
 }
 
-const std::vector<POAGraph::node_id> kPath0123 = {0, 1, 2, 3};
-const std::vector<POAGraph::node_id> kPath0124 = {0, 1, 2, 4};
-const std::vector<POAGraph::node_id> kPath013 = {0, 1, 3};
+const std::vector<POAGraph::node_id> PATH_0123 = {0, 1, 2, 3};
+const std::vector<POAGraph::node_id> PATH_0124 = {0, 1, 2, 4};
+const std::vector<POAGraph::node_id> PATH_013 = {0, 1, 3};
 
 } // namespace
 
@@ -122,8 +122,8 @@ int main() {
 		const POAGraph g(dict);
 		check(g.num_nodes() == 5, "substitution: expected 5 nodes");
 		check(g.base(4) == 'A', "substitution: last node must be 'A'");
-		check(g.path(0) == kPath0123, "substitution: path0");
-		check(g.path(1) == kPath0124, "substitution: path1");
+		check(g.path(0) == PATH_0123, "substitution: path0");
+		check(g.path(1) == PATH_0124, "substitution: path1");
 		check_paths(g, dict, "substitution");
 		std::cout << "PASS substitution\n";
 	}
@@ -143,7 +143,7 @@ int main() {
 		const std::vector<std::string> dict = {"ACGT", "ACT"};
 		const POAGraph g(dict);
 		check(g.num_nodes() == 4, "deletion: expected 4 nodes");
-		check(g.path(1) == kPath013, "deletion: expected path [0,1,3]");
+		check(g.path(1) == PATH_013, "deletion: expected path [0,1,3]");
 		check_paths(g, dict, "deletion");
 		std::cout << "PASS deletion\n";
 	}
@@ -153,7 +153,7 @@ int main() {
 		const std::vector<std::string> dict = {"AC", "ACGT"};
 		const POAGraph g(dict);
 		check(g.num_nodes() == 4, "insertion: expected 4 nodes");
-		check(g.path(1) == kPath0123, "insertion: expected path [0,1,2,3]");
+		check(g.path(1) == PATH_0123, "insertion: expected path [0,1,2,3]");
 		check(g.path(0) == std::vector<POAGraph::node_id>{0, 1},
 		      "insertion: path0 expected [0,1]");
 		check_paths(g, dict, "insertion");
@@ -163,9 +163,10 @@ int main() {
 	// Weighted insertion/deletion costs still produce the same graph shape.
 	{
 		const std::vector<std::string> dict = {"ACGT", "ACGA"};
-		const POAGraph g(dict, CostModel(2, 3));
+		const UnitCostModel weighted(2, 3); // reference must outlive graph
+		const POAGraph g(dict, weighted);
 		check(g.num_nodes() == 5, "weighted: expected 5 nodes");
-		check(g.path(1) == kPath0124, "weighted: path1 expected [0,1,2,4]");
+		check(g.path(1) == PATH_0124, "weighted: path1 expected [0,1,2,4]");
 		check_paths(g, dict, "weighted");
 		std::cout << "PASS weighted\n";
 	}
@@ -300,16 +301,16 @@ int main() {
 		check_paths(g, dict, "pos-range");
 
 		// Recompute expected ranges directly from the paths.
-		const std::size_t kNone = static_cast<std::size_t>(-1);
+		const std::size_t NONE = static_cast<std::size_t>(-1);
 		std::vector<std::pair<std::size_t, std::size_t>> expected(
-		    g.num_nodes(), {kNone, kNone});
+		    g.num_nodes(), {NONE, NONE});
 		for (std::size_t s = 0; s < dict.size(); ++s)
 			for (std::size_t j = 0; j < g.path(s).size(); ++j) {
 				const auto u = g.path(s)[j];
 				auto &er = expected[u];
-				if (er.first == kNone || j < er.first)
+				if (er.first == NONE || j < er.first)
 					er.first = j;
-				if (er.second == kNone || j > er.second)
+				if (er.second == NONE || j > er.second)
 					er.second = j;
 			}
 		for (std::size_t u = 0; u < g.num_nodes(); ++u) {

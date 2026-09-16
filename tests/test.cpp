@@ -102,7 +102,7 @@ std::vector<Expected> parse_solution(const fs::path &file, std::size_t n_queries
 
 void test_testcase(const fs::path &file, const Testcase &tc,
                    const std::vector<Expected> &expected) {
-	const Solver solver(tc.dict, tc.cost);
+	const Solver solver(tc.dict, *tc.cost);
 
 	for (std::size_t q = 0; q < tc.queries.size(); ++q) {
 		const auto &[k, query] = tc.queries[q];
