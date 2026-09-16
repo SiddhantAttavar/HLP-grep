@@ -59,8 +59,8 @@ public:
 	 */
 	explicit BinaryLifter(const POAGraph &graph, const std::string &query,
 	                      int k)
-	    : graph(graph), query(query), k(k) {
-		cost_model = graph.cost_model();
+	    : graph(graph), query(query), k(k),
+	      cost_model(graph.cost_model()) {
 		const std::size_t n = graph.num_nodes();
 		max_level = 0;
 		while ((std::size_t{1} << max_level) <= n)
@@ -86,7 +86,8 @@ public:
 			for (std::size_t u = 0; u < n; ++u)
 				if (up[u][t].has_value())
 					up_mat[u][t] = DistMatrix::min_plus_product(
-					    up_mat[u][t - 1], up_mat[*up[u][t - 1]][t - 1]);
+					    up_mat[u][t - 1], up_mat[*up[u][t - 1]][t - 1],
+					    cost_model.is_monge());
 	}
 
 	/**
@@ -103,9 +104,8 @@ public:
 	 * reached node. In effect, after the call
 	 *   cost(b) = min_a cost_in(a) + ed(u, l, a, b)
 	 * for the chain [u, u^1, ..., u^l]. Cells no transition realizes
-	 * carry the bound k + 1, large enough to dominate any cost a match
-	 * within k can reach and small enough for repeated min-plus sums
-	 * without integer overflow.
+	 * carry DistMatrix::INF, which dominates any real cost while keeping
+	 * every entry within the saturating product's overflow-free range.
 	 *
 	 * @param u    Node to start from.
 	 * @param l    Number of heavy steps to walk.
@@ -179,34 +179,56 @@ private:
 	 *                    match + ins * (b - a - 1) )
 	 * where the consume term is the running min of consume(base(v), query[j]) over
 	 * j in [a, b - 1]. Cells with b < a cannot be realized by any
-	 * transition; they take the bound k + 1, large enough to exceed any
-	 * within-threshold cost while remaining small enough that repeated
-	 * min-plus sums cannot overflow, so they never undercut real
-	 * transitions in a min-plus composition.
+	 * transition; they take DistMatrix::INF, which keeps the stored
+	 * table Monge: every inequality corner involving an INF cell holds
+	 * trivially, so the realized Monge structure (guaranteed by
+	 * CostModel::is_monge) extends to the whole table.
 	 */
 	DistMatrix edge_matrix(node_id u, node_id v) const {
 		const auto [lo_u, hi_u] = window(u);
 		const auto [lo_v, hi_v] = window(v);
 		const char base_v = graph.node(v).base;
 		DistMatrix mat(static_cast<std::size_t>(hi_u - lo_u),
-		               static_cast<std::size_t>(hi_v - lo_v), k + 1);
+		               static_cast<std::size_t>(hi_v - lo_v),
+		               DistMatrix::INF);
+		const int del_v = cost_model.del(base_v);
 		for (long a = lo_u; a < hi_u; ++a) {
-			int best_match = k + 1;
-			int prev = k + 1;
+			// Prefix data already accumulated for the source window: the
+			// cells realize transitions over query[a..b), so the insertion
+			// sums and consume candidates must start at position a even
+			// when the destination window begins at lo_v > a.
+			long best_alt =
+			    DistMatrix::INF; // min over j of (consume_j - ins_j)
+			long sum_ins = 0;    // sum of insertion costs over query[a..b)
+			for (long j = a; j < std::max(lo_v, a); ++j) {
+				const int ins_j = cost_model.ins(query[j]);
+				sum_ins += ins_j;
+				best_alt = std::min(
+				    best_alt,
+				    static_cast<long>(
+				        cost_model.consume(base_v, query[j])) -
+				        static_cast<long>(ins_j));
+			}
+			int prev = DistMatrix::INF;
 			for (long b = std::max(lo_v, a); b < hi_v; ++b) {
 				const int span = static_cast<int>(b - a);
-				if (span > 0)
-					best_match = std::min(
-					    best_match,
-					    cost_model.consume(base_v, query[b - 1]));
 				int cur;
 				if (span > 0) {
+					const int ins_b = cost_model.ins(query[b - 1]);
+					sum_ins += ins_b;
+					best_alt = std::min(
+					    best_alt,
+					    static_cast<long>(
+					        cost_model.consume(base_v, query[b - 1])) -
+					        static_cast<long>(ins_b));
 					cur = std::min(
-					    cost_model.del + cost_model.ins * span,
-					    std::min(best_match + cost_model.ins * (span - 1),
-					             prev + cost_model.ins));
+					    static_cast<int>(del_v + sum_ins),
+					    std::min(static_cast<int>(best_alt + sum_ins),
+					             prev + ins_b));
+					if (cur > DistMatrix::INF)
+						cur = DistMatrix::INF;
 				} else {
-					cur = cost_model.del;
+					cur = del_v; // delete base_v, insert nothing
 				}
 				mat(static_cast<std::size_t>(a - lo_u),
 				    static_cast<std::size_t>(b - lo_v)) = cur;
@@ -243,9 +265,10 @@ private:
 	/// Query string the chain tables were built for.
 	std::string query;
 	/// Cost model snapshotted from the graph at construction.
-	CostModel cost_model;
+	/// Cost model referenced from the graph; must outlive the lifter.
+	const CostModel &cost_model;
 	/// Edit distance threshold the chain tables were built with; cells
-	/// no transition realizes take k + 1 as their bound.
+	/// no transition realizes take DistMatrix::INF as their bound.
 	int k = -1;
 	/// Number of table levels: floor(log2(num_nodes)) + 1 (0 for an empty
 	/// graph).

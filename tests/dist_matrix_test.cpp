@@ -88,6 +88,64 @@ void test_product() {
 	            "large values");
 }
 
+void test_monge_product() {
+	// Both factors Monge: a(i, c) = i + c, b(c, j) = |c - j|.
+	// Hand-computed 2x3 (x) 3x3 with b(c, j) = |c - j|:
+	// b rows are "012", "101", "210".
+	const DistMatrix a = make(2, 3, {"021", "310"});
+	const DistMatrix b = make(3, 3, {"012", "101", "210"});
+	const DistMatrix want = make(2, 3, {"011", "210"});
+	check_equal(DistMatrix::min_plus_product(a, b, true), want,
+	            "monge product");
+	// Rectangular Monge factors must match the cubic path exactly.
+	DistMatrix ra(3, 4);
+	for (std::size_t i = 0; i < 3; ++i)
+		for (std::size_t c = 0; c < 4; ++c)
+			ra(i, c) = static_cast<int>(i + c);
+	DistMatrix rb(4, 5);
+	for (std::size_t c = 0; c < 4; ++c)
+		for (std::size_t j = 0; j < 5; ++j)
+			rb(c, j) =
+			    static_cast<int>(c > j ? c - j : j - c);
+	check_equal(DistMatrix::min_plus_product(ra, rb, true),
+	            DistMatrix::min_plus_product(ra, rb, false),
+	            "monge product matches cubic");
+
+	// Zero outer dimensions take the early return on the monge path too.
+	const DistMatrix ea(0, 2);
+	const DistMatrix eb(2, 3);
+	const DistMatrix egot = DistMatrix::min_plus_product(ea, eb, true);
+	check(egot.num_rows() == 0 && egot.num_cols() == 3,
+	      "monge empty: zero-row product shape wrong");
+}
+
+void test_monge_inf_fills() {
+	// Lifter-style tables: realized span costs with INF below the
+	// staircase (the exact FRFF corner that k+1 fills broke).
+	// A(5x6): row i has span costs from column i, INF before.
+	DistMatrix a(5, 6, DistMatrix::INF);
+	for (std::size_t i = 0; i < 5; ++i)
+		for (std::size_t k = i; k < 6; ++k)
+			a(i, k) = static_cast<int>(k - i);
+	// B(6x7): same shape; note B(1,1) = 1 < old k+1-style fills.
+	DistMatrix b(6, 7, DistMatrix::INF);
+	for (std::size_t k = 0; k < 6; ++k)
+		for (std::size_t j = k; j < 7; ++j)
+			b(k, j) = static_cast<int>(j - k);
+	const DistMatrix cubic = DistMatrix::min_plus_product(a, b, false);
+	const DistMatrix fast = DistMatrix::min_plus_product(a, b, true);
+	check_equal(fast, cubic, "monge INF fills match cubic");
+	// Hand checks: out(0,0) = a(0,0)+b(0,0) = 0; out(0,6) = 0+6 = 6;
+	// column 0 of b has only b(0,0) = 0 realized while a(1,0) is INF,
+	// so out(1,0) saturates to INF instead of missing the minimum.
+	check(fast(0, 0) == 0, "monge INF fills: entry (0,0) wrong");
+	check(fast(0, 6) == 6, "monge INF fills: entry (0,6) wrong");
+	check(fast(1, 0) == DistMatrix::INF,
+	      "monge INF fills: entry (1,0) wrong");
+	check(fast(4, 0) == DistMatrix::INF,
+	      "monge INF fills: saturation wrong");
+}
+
 void test_apply() {
 	const DistMatrix m = make(2, 3, {"092", "831"});
 	const std::vector<int> vec = {1, 2};
@@ -155,6 +213,8 @@ void test_empty() {
 
 int main() {
 	test_product();
+	test_monge_product();
+	test_monge_inf_fills();
 	test_apply();
 	test_errors();
 	test_empty();
