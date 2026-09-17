@@ -46,6 +46,77 @@ ACG
 The `testcases` folder contains 3 subfolders:
 1. `manual`: Short manually-created testcases intended for debugging
 2. `generated`: Larger testscases generated using `testcase_gen.py`
+3. `datasets`: Real-world highly similar DNA datasets (see below)
+
+## Real-world datasets
+
+`datasets/` holds downloaded sources and derived testcases for threshold
+search over highly similar dictionaries — the regime where POA heavy chains
+are shared. Only scripts and docs are tracked; `raw/`, `derived/` and
+`logs/` contents are git-ignored (see root `.gitignore`):
+
+```text
+tests/testcases/datasets/
+  raw/      downloaded sources (per-dataset subdirs)
+  derived/  generated .txt testcases + .sol solutions + MANIFEST.md
+  logs/     test_datasets.sh run logs
+tests/scripts/
+  download_datasets.py    fetch sources (curated by default)
+  generate_dataset_tests.py  FASTA -> testcase .txt files
+  test_datasets.sh        generate + solve + validate end to end
+```
+
+### Download
+
+Curated subsets (KBs, seconds) are the default; full collections need
+`--full`, the largest additionally need `--yes`:
+
+```bash
+python3 tests/scripts/download_datasets.py --dry-run
+python3 tests/scripts/download_datasets.py
+python3 tests/scripts/download_datasets.py --dataset hla
+python3 tests/scripts/download_datasets.py --full --dataset hla --yes
+```
+
+| Dataset | Curated subset | Full (`--full`) | Source / licence |
+|---|---|---|---|
+| `hla` | `DMA/DPA2/DPB2/DQA2/DQB2_nuc.fasta` (~170 KB real alleles) | `A/B/C/DRB1/DQB1/DPB1/DQA1/DPA1_nuc.fasta` (~40 MB) | IPD-IMGT/HLA, GitHub `ANHIG/IMGTHLA` (`Latest`), cite Robinson et al.; free for academic use |
+| `mhc` | Two 10 kb windows of finished haplotype APD (`OK649231`) | Six finished haplotypes `OK649231-OK649236` (~30 MB) | GenBank (INSDC, open) |
+| `sarscov2` | Wuhan-Hu-1 `NC_045512.2` (29.9 kb) | Theseus `covid_19_complete.fasta` (2732 genomes, manual, Zenodo `18482097`) | GenBank (open); Theseus per original licences |
+| `mtdna` | rCRS `NC_012920.1` (16.6 kb) | MITOMAP / GenBank bulk (manual, 65k+ sequences) | GenBank (open); MITOMAP cite Brandon et al. |
+| `markers`/`theseus` | Bring your own FASTA via `--from-fasta` | Same | 16S/COX1 GenBank loci; Theseus Zenodo sets (MTB/HIV/monkeypox) |
+
+### Generate
+
+```bash
+python3 tests/scripts/generate_dataset_tests.py --list
+python3 tests/scripts/generate_dataset_tests.py --dataset synthetic
+python3 tests/scripts/generate_dataset_tests.py --dataset hla --seed 7
+python3 tests/scripts/generate_dataset_tests.py --dataset markers \
+  --from-fasta path/to/16s.fasta --dict-size 10 --ks 0,1,3
+```
+
+Per-dataset profiles (window, dict size, thresholds) live in
+`PROFILES` in `generate_dataset_tests.py`. Conventions: one testcase per
+HLA locus file (alleles are the dictionary); long molecules
+(MHC/SARS-CoV-2/mtDNA) are tiled into windows or expanded into mutant
+cohorts so the `O(n·q·L²)` naive solver finishes in seconds; queries mix
+exact (`k=0`), held-out and synthetic-mutant sequences. Records with
+non-`ACGT` bases are dropped and reported.
+
+### Test
+
+```bash
+tests/scripts/test_datasets.sh            # quick: generate + solve + validate
+tests/scripts/test_datasets.sh --full --validate  # larger profiles
+build/tests/solve tests/testcases/datasets/derived/hla
+build/tests/test_hlp_grep tests/testcases/datasets/derived/hla
+```
+
+Why these sets: alleles of one HLA gene differ by 1–tens of edits
+(maximal chain sharing); MHC haplotype windows stress long chains;
+SARS-CoV-2/mtDNA give 16–30 kb near-identical cohorts; `synthetic`
+isolates sharing vs length vs `k`; `uniform` is the low-sharing control.
 
 ## *Optional*: testcase solution
 For each testcase file `{testcase_name}.txt`, solutions may be stored in `{testcase_name}.sol`. The solution file contains 3 lines for each query

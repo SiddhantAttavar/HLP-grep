@@ -57,6 +57,8 @@ compile_commands.json
 *.log
 *.bak
 *.swp
+__pycache__/
+*.pyc
 
 # vcpkg
 vcpkg_installed/
@@ -67,3 +69,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Real-world dataset content (downloaded raw sources, generated testcases,
+# logs). Scripts and docs stay tracked; only .gitkeep files are kept.
+tests/testcases/datasets/raw/*
+!tests/testcases/datasets/raw/.gitkeep
+tests/testcases/datasets/derived/*
+!tests/testcases/datasets/derived/.gitkeep
+tests/testcases/datasets/logs/*
+!tests/testcases/datasets/logs/.gitkeep
