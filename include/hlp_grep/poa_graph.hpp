@@ -21,6 +21,11 @@
 
 namespace hlp_grep {
 
+/// Default base half-width for the adaptive build band `w = b + f * L`.
+inline constexpr int DEFAULT_BAND_BASE = 10;
+/// Default slope for the adaptive build band `w = b + f * L`.
+inline constexpr double DEFAULT_BAND_SLOPE = 0.01;
+
 /**
  * @brief A POA (partial order alignment) graph of a sequence dictionary.
  *
@@ -81,14 +86,26 @@ public:
 	 * each subsequent sequence is aligned to the current graph and merged.
 	 * After the last sequence the heavy/light edge classification is finalized.
 	 *
+	 * The sequence-to-graph alignments use an adaptive abPOA-style band:
+	 * per graph node only query columns in
+	 * `[pos_min - w, pos_max + w]` (clamped to `[0, |s|]`) are computed,
+	 * where `w = band_base + band_slope * |s|` and `pos_min/pos_max` are
+	 * the incremental offsets of previously inserted paths. Narrow bands
+	 * are heuristic: divergent sequences reuse less graph structure but
+	 * their stored paths still spell the dictionary exactly.
+	 *
 	 * @param dict Dictionary of DNA sequences to index.
 	 * @param cost Cost model used for the sequence-to-graph alignments.
 	 *             Defaults to the unit-cost model. The referenced model
 	 *             must outlive the graph.
+	 * @param band_base Base half-width `b` of the adaptive build band.
+	 * @param band_slope Slope `f` of the adaptive build band.
 	 */
 	explicit POAGraph(const std::vector<std::string> &dict,
-	                  const CostModel &cost = DEFAULT_COST_MODEL)
-	    : cost(cost) {
+	                  const CostModel &cost = DEFAULT_COST_MODEL,
+	                  int band_base = DEFAULT_BAND_BASE,
+	                  double band_slope = DEFAULT_BAND_SLOPE)
+	    : cost(cost), band_base(band_base), band_slope(band_slope) {
 		build(dict);
 	}
 
@@ -287,6 +304,10 @@ private:
 	std::vector<node_id> topo;
 
 	const CostModel &cost; ///< Cost model of the graph alignments; must outlive the graph.
+	/// Base half-width `b` of the adaptive build band `w = b + f * L`.
+	int band_base = DEFAULT_BAND_BASE;
+	/// Slope `f` of the adaptive build band `w = b + f * L`.
+	double band_slope = DEFAULT_BAND_SLOPE;
 
 	// -- construction ---------------------------------------------------------
 
@@ -305,6 +326,7 @@ private:
 			prev = u;
 		}
 		paths.push_back(std::move(seed));
+		update_pos_ranges(paths.back());
 		rebuild_topo();
 
 		for (std::size_t id = 1; id < dict.size(); ++id) {
@@ -324,6 +346,54 @@ private:
 		out_edges.emplace_back();
 		in_edges.emplace_back();
 		return u;
+	}
+
+	/**
+	 * @brief Extends Node::pos_min / Node::pos_max with one stored path.
+	 *
+	 * For every offset `j` of @p path, node `path[j]` gets
+	 * `pos_min = min(pos_min, j)` and `pos_max = max(pos_max, j)`.
+	 * Nodes skipped by the new path keep their previous ranges.
+	 */
+	void update_pos_ranges(const std::vector<node_id> &path) {
+		for (std::size_t j = 0; j < path.size(); ++j) {
+			Node &n = nodes[path[j]];
+			if (n.pos_min == START || j < n.pos_min)
+				n.pos_min = j;
+			if (n.pos_max == START || j > n.pos_max)
+				n.pos_max = j;
+		}
+	}
+
+	/**
+	 * @brief Adaptive build band half-width for a sequence of length @p len:
+	 *        `w = band_base + band_slope * len`, clamped to `>= 0`.
+	 */
+	long band_width(std::size_t len) const {
+		const long w = static_cast<long>(band_base) +
+		               static_cast<long>(band_slope * static_cast<double>(len));
+		return w < 0 ? 0 : w;
+	}
+
+	/**
+	 * @brief Inclusive band `[lo, hi]` of query columns computed for node @p u.
+	 *
+	 * `[pos_min - w, pos_max + w]` clamped to `[0, m]`. Nodes on no stored
+	 * path yet (sentinel ranges) cover the full row. Empty when the node
+	 * range lies entirely outside the clamped interval; callers skip those
+	 * rows (their cells stay INF).
+	 */
+	std::pair<long, long> band_bounds(node_id u, long m, long w) const {
+		const Node &n = nodes[u];
+		if (n.pos_min == START || n.pos_max == START)
+			return {0, m};
+		long lo = static_cast<long>(n.pos_min) - w;
+		long hi = static_cast<long>(n.pos_max) + w;
+		if (lo < 0)
+			lo = 0;
+		if (hi > m)
+			hi = m;
+		return {lo, hi};
 	}
 
 	/** Finds an existing edge in an adjacency list, or returns null. */
@@ -388,12 +458,17 @@ private:
 	}
 
 	/**
-	 * @brief Aligns a sequence to the current graph.
+	 * @brief Aligns a sequence to the current graph under the adaptive band.
 	 *
-	 * Minimum-cost global alignment of @p s against the DAG: DP over
+	 * Minimum-cost global alignment of @p s against the DAG restricted to
+	 * the per-node bands `[pos_min - w, pos_max + w]` clamped to `[0, |s|]`,
+	 * where `w = band_base + band_slope * |s|` and the ranges are the
+	 * incremental offsets of previously inserted paths. DP over
 	 * (topological position, prefix length) with a virtual start row, using
 	 * insertion/deletion/substitution costs from cost. Cost ties prefer
-	 * exact consumes, then deletions, then insertions.
+	 * exact consumes, then deletions, then insertions. Out-of-band cells
+	 * stay INF; the band is heuristic, so divergent sequences simply reuse
+	 * less graph structure.
 	 *
 	 * @param s Sequence to align.
 	 * @return Alignment record: cost and alignment steps, to be merged with
@@ -402,6 +477,7 @@ private:
 	Alignment align_to_graph(const std::string &s) {
 		const std::size_t V = nodes.size();
 		const std::size_t m = s.size();
+		const long ml = static_cast<long>(m);
 		constexpr int INF = std::numeric_limits<int>::max() / 2;
 		const std::size_t R = V + 1; // DP rows; last row = virtual start.
 		const std::size_t C = m + 1; // DP columns.
@@ -420,6 +496,18 @@ private:
 		for (std::size_t p = 0; p < V; ++p)
 			row_of[topo[p]] = p;
 
+		// Inclusive per-row bands over columns 0..m; the virtual start row
+		// is unbanded. Rows whose band is empty keep INF everywhere.
+		const long w = band_width(m);
+		std::vector<long> lo(R, 1), hi(R, 0);
+		lo[vr] = 0;
+		hi[vr] = ml;
+		for (std::size_t p = 0; p < V; ++p) {
+			const auto [blo, bhi] = band_bounds(topo[p], ml, w);
+			lo[p] = blo;
+			hi[p] = bhi;
+		}
+
 		// Start row: dp[vr][j] = sum of insertion costs over s[0..j).
 		dp[vr * C] = 0;
 		for (std::size_t j = 1; j <= m; ++j) {
@@ -430,32 +518,52 @@ private:
 		}
 		// dp[u][0]: delete graph bases between the start and node u.
 		for (std::size_t p = 0; p < V; ++p) {
+			if (lo[p] > 0 || hi[p] < 0)
+				continue; // column 0 out of band
 			int d = INF;
 			if (in_edges[topo[p]].empty()) {
 				d = cost.del(nodes[topo[p]].base);
 			} else {
 				for (const Edge &e : in_edges[topo[p]]) {
+					const node_id prow = row_of[e.neighbor];
+					if (lo[prow] > 0 || hi[prow] < 0)
+						continue; // predecessor has no column 0
 					const int c =
-					    dp[row_of[e.neighbor] * C] +
+					    dp[prow * C] +
 					    cost.del(nodes[topo[p]].base);
 					if (c < d)
 						d = c;
 				}
 			}
+			if (d > INF)
+				d = INF;
 			dp[p * C] = d;
 		}
 
-		// Main DP over (topological row, prefix length).
+		// Main banded DP over (topological row, prefix length): only columns
+		// i in [lo[p], hi[p]] are computed; transitions from out-of-band
+		// cells are skipped (they hold INF).
 		for (std::size_t p = 0; p < V; ++p) {
 			const node_id u = topo[p];
-			for (std::size_t i = 1; i <= m; ++i) {
+			const long i_lo = std::max(lo[p], 1L);
+			for (long il = i_lo; il <= hi[p]; ++il) {
+				const std::size_t i = static_cast<std::size_t>(il);
 				const std::size_t k = p * C + i;
-				int best = dp[k - 1] + cost.ins(s[i - 1]); // insert s[i-1] at u
-				unsigned char bop = INS_CODE;
-				node_id bfrom = p;
-				int bpri = 0;
+				int best = INF;
+				unsigned char bop = 0;
+				node_id bfrom = START;
+				int bpri = -1;
+
+				if (il - 1 >= lo[p]) {
+					best = dp[k - 1] + cost.ins(s[i - 1]); // insert s[i-1] at u
+					bop = INS_CODE;
+					bfrom = p;
+					bpri = 0;
+				}
 
 				auto consider_del = [&](node_id prow) {
+					if (prow != vr && (il < lo[prow] || il > hi[prow]))
+						return;
 					const int c = dp[prow * C + i] + cost.del(nodes[u].base);
 					if (c < best || (c == best && bpri < 1)) {
 						best = c;
@@ -465,6 +573,8 @@ private:
 					}
 				};
 				auto consider_con = [&](node_id prow) {
+					if (prow != vr && (il - 1 < lo[prow] || il - 1 > hi[prow]))
+						return;
 					const int c =
 					    dp[prow * C + i - 1] + cost.consume(nodes[u].base, s[i - 1]);
 					int pri = 2;
@@ -488,19 +598,26 @@ private:
 						consider_con(row_of[e.neighbor]);
 					}
 				}
+				if (best > INF)
+					best = INF;
 				dp[k] = best;
 				op[k] = bop;
 				from[k] = bfrom;
 			}
 		}
 
-		// Answer: min over all end nodes (graph may end anywhere). Cost ties
-		// prefer the same ordering as inside a cell, so equal-cost paths reuse
-		// existing graph structure instead of spawning new nodes.
+		// Answer: min over all end nodes holding column m (graph may end
+		// anywhere). Cost ties prefer the same ordering as inside a cell,
+		// so equal-cost paths reuse existing graph structure instead of
+		// spawning new nodes. Rows without column m are skipped; when no
+		// row reaches m (band drift on divergent sequences) the sequence
+		// is inserted as fresh nodes.
 		std::size_t br = vr;
 		int bc = dp[vr * C + m];
 		int bpri = -1;
 		for (std::size_t p = 0; p < V; ++p) {
+			if (ml < lo[p] || ml > hi[p])
+				continue;
 			const int c = dp[p * C + m];
 			const node_id u = topo[p];
 			int pri = 0;
@@ -509,7 +626,7 @@ private:
 				pri = 1;
 				break;
 			case 3:
-				pri = nodes[u].base == s[m - 1] ? 3 : 2;
+				pri = (m > 0 && nodes[u].base == s[m - 1]) ? 3 : 2;
 				break;
 			default:
 				break;
@@ -521,7 +638,19 @@ private:
 			}
 		}
 
+		// Degenerate band miss: no end node reaches column m.
+		if (bc >= INF) {
+			Alignment al;
+			al.cost = bc;
+			al.ops.reserve(m);
+			for (std::size_t j = 0; j < m; ++j)
+				al.ops.push_back({AlignmentOp::Type::INSERT, START, s[j]});
+			return al;
+		}
+
 		// Traceback parents to the empty-prefix column (rows, not node ids).
+		// op == 0 marks an uncomputed cell on a heuristic path: insert the
+		// query character instead of following a bogus parent.
 		Alignment al;
 		al.cost = bc;
 		std::vector<AlignmentOp> ops;
@@ -538,9 +667,13 @@ private:
 				ops.push_back({AlignmentOp::Type::DELETE, row2node, '\0'});
 				r = from[k];
 				break;
-			default:
+			case 3:
 				ops.push_back({AlignmentOp::Type::CONSUME, row2node, s[i - 1]});
 				r = from[k];
+				--i;
+				break;
+			default:
+				ops.push_back({AlignmentOp::Type::INSERT, START, s[i - 1]});
 				--i;
 				break;
 			}
@@ -584,6 +717,7 @@ private:
 			}
 		}
 		paths.push_back(std::move(path));
+		update_pos_ranges(paths.back());
 		rebuild_topo();
 	}
 

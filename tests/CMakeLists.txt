@@ -10,7 +10,11 @@ target_link_libraries(poa_test PRIVATE hlp_grep::hlp_grep)
 add_executable(dist_matrix_test dist_matrix_test.cpp)
 target_link_libraries(dist_matrix_test PRIVATE hlp_grep::hlp_grep)
 
+add_executable(bench_poa bench_poa.cpp)
+target_link_libraries(bench_poa PRIVATE hlp_grep::hlp_grep)
+
 add_test(NAME hlp_grep_manual COMMAND test_hlp_grep ${CMAKE_CURRENT_SOURCE_DIR}/testcases/manual)
 add_test(NAME hlp_grep_generated COMMAND test_hlp_grep ${CMAKE_CURRENT_SOURCE_DIR}/testcases/generated)
 add_test(NAME hlp_grep_poa COMMAND poa_test)
 add_test(NAME hlp_grep_dist_matrix COMMAND dist_matrix_test)
+add_test(NAME hlp_grep_bench COMMAND bench_poa --reps 1 ${CMAKE_CURRENT_SOURCE_DIR}/testcases/manual)
