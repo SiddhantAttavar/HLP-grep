@@ -480,7 +480,6 @@ private:
 		const long ml = static_cast<long>(m);
 		constexpr int INF = std::numeric_limits<int>::max() / 2;
 		const std::size_t R = V + 1; // DP rows; last row = virtual start.
-		const std::size_t C = m + 1; // DP columns.
 		const node_id vr = static_cast<node_id>(V);
 		const node_id INS_CODE =
 		    static_cast<unsigned char>(AlignmentOp::Type::INSERT) + 1;
@@ -489,15 +488,12 @@ private:
 		const node_id CON_CODE =
 		    static_cast<unsigned char>(AlignmentOp::Type::CONSUME) + 1;
 
-		std::vector<int> dp(R * C, INF);
-		std::vector<unsigned char> op(R * C, 0);
-		std::vector<node_id> from(R * C, START);
 		std::vector<node_id> row_of(V, 0); // node id -> topological row.
 		for (std::size_t p = 0; p < V; ++p)
 			row_of[topo[p]] = p;
 
 		// Inclusive per-row bands over columns 0..m; the virtual start row
-		// is unbanded. Rows whose band is empty keep INF everywhere.
+		// is unbanded. Rows whose band is empty store nothing.
 		const long w = band_width(m);
 		std::vector<long> lo(R, 1), hi(R, 0);
 		lo[vr] = 0;
@@ -508,10 +504,25 @@ private:
 			hi[p] = bhi;
 		}
 
+		// Banded row-local storage: row p holds columns [lo[p], hi[p]] back
+		// to back at row_off[p]; cell (p, i) is at row_off[p] + (i - lo[p]).
+		// Total cells are O(V * w) instead of O(V * m). Every access below
+		// is guarded by the same band-membership checks as the compute.
+		std::vector<std::size_t> row_off(R + 1, 0);
+		for (std::size_t p = 0; p < R; ++p)
+			row_off[p + 1] =
+			    row_off[p] +
+			    (hi[p] >= lo[p]
+			         ? static_cast<std::size_t>(hi[p] - lo[p] + 1)
+			         : 0);
+		std::vector<int> dp(row_off[R], INF);
+		std::vector<unsigned char> op(row_off[R], 0);
+		std::vector<node_id> from(row_off[R], START);
+
 		// Start row: dp[vr][j] = sum of insertion costs over s[0..j).
-		dp[vr * C] = 0;
+		dp[row_off[vr]] = 0;
 		for (std::size_t j = 1; j <= m; ++j) {
-			const std::size_t k = vr * C + j;
+			const std::size_t k = row_off[vr] + j;
 			dp[k] = dp[k - 1] + cost.ins(s[j - 1]);
 			op[k] = INS_CODE;
 			from[k] = vr;
@@ -529,7 +540,7 @@ private:
 					if (lo[prow] > 0 || hi[prow] < 0)
 						continue; // predecessor has no column 0
 					const int c =
-					    dp[prow * C] +
+					    dp[row_off[prow]] +
 					    cost.del(nodes[topo[p]].base);
 					if (c < d)
 						d = c;
@@ -537,7 +548,7 @@ private:
 			}
 			if (d > INF)
 				d = INF;
-			dp[p * C] = d;
+			dp[row_off[p]] = d;
 		}
 
 		// Main banded DP over (topological row, prefix length): only columns
@@ -548,7 +559,8 @@ private:
 			const long i_lo = std::max(lo[p], 1L);
 			for (long il = i_lo; il <= hi[p]; ++il) {
 				const std::size_t i = static_cast<std::size_t>(il);
-				const std::size_t k = p * C + i;
+				const std::size_t k =
+				    row_off[p] + static_cast<std::size_t>(il - lo[p]);
 				int best = INF;
 				unsigned char bop = 0;
 				node_id bfrom = START;
@@ -564,7 +576,10 @@ private:
 				auto consider_del = [&](node_id prow) {
 					if (prow != vr && (il < lo[prow] || il > hi[prow]))
 						return;
-					const int c = dp[prow * C + i] + cost.del(nodes[u].base);
+					const int c =
+					    dp[row_off[prow] +
+					       static_cast<std::size_t>(il - lo[prow])] +
+					    cost.del(nodes[u].base);
 					if (c < best || (c == best && bpri < 1)) {
 						best = c;
 						bop = DEL_CODE;
@@ -576,7 +591,9 @@ private:
 					if (prow != vr && (il - 1 < lo[prow] || il - 1 > hi[prow]))
 						return;
 					const int c =
-					    dp[prow * C + i - 1] + cost.consume(nodes[u].base, s[i - 1]);
+					    dp[row_off[prow] +
+					       static_cast<std::size_t>(il - 1 - lo[prow])] +
+					    cost.consume(nodes[u].base, s[i - 1]);
 					int pri = 2;
 					if (nodes[u].base == s[i - 1] &&
 					    cost.consume(nodes[u].base, s[i - 1]) == 0)
@@ -613,15 +630,17 @@ private:
 		// row reaches m (band drift on divergent sequences) the sequence
 		// is inserted as fresh nodes.
 		std::size_t br = vr;
-		int bc = dp[vr * C + m];
+		int bc = dp[row_off[vr] + m];
 		int bpri = -1;
 		for (std::size_t p = 0; p < V; ++p) {
 			if (ml < lo[p] || ml > hi[p])
 				continue;
-			const int c = dp[p * C + m];
+			const std::size_t km =
+			    row_off[p] + static_cast<std::size_t>(ml - lo[p]);
+			const int c = dp[km];
 			const node_id u = topo[p];
 			int pri = 0;
-			switch (op[p * C + m]) {
+			switch (op[km]) {
 			case 2:
 				pri = 1;
 				break;
@@ -656,7 +675,8 @@ private:
 		std::vector<AlignmentOp> ops;
 		std::size_t r = br;
 		for (std::size_t i = m; i > 0;) {
-			const std::size_t k = r * C + i;
+			const std::size_t k =
+			    row_off[r] + (i - static_cast<std::size_t>(lo[r]));
 			const node_id row2node = (r == vr) ? START : topo[r];
 			switch (op[k]) {
 			case 1:
