@@ -45,18 +45,11 @@ public:
 	 *             defaults to the unit-cost model. The solver clones the
 	 *             model, so it owns its own copy and there is no lifetime
 	 *             requirement on @p cost (temporaries are fine).
-	 * @param band_base Base half-width `b` of the adaptive POA build band
-	 *                  `w = b + f * L` (abPOA default 10).
-	 * @param band_slope Slope `f` of the adaptive POA build band
-	 *                   (abPOA default 0.01).
 	 */
 	explicit Solver(std::vector<std::string> dict,
-	                const CostModel &cost = DEFAULT_COST_MODEL,
-	                int band_base = DEFAULT_BAND_BASE,
-	                double band_slope = DEFAULT_BAND_SLOPE)
-	    : dict(std::move(dict)), cost(cost.clone()), band_base(band_base),
-	      band_slope(band_slope), graph(this->dict, *this->cost, band_base,
-	                                    band_slope) {
+	                const CostModel &cost = DEFAULT_COST_MODEL)
+	    : dict(std::move(dict)), cost(cost.clone()), graph(this->dict,
+	                                                        *this->cost) {
 		build_compressed_paths();
 	}
 
@@ -178,11 +171,6 @@ private:
 	/// Owned clone of the cost model; polymorphic storage (Solver is the
 	/// only unique_ptr user) so it needs the manual deep-copy ctor above.
 	std::unique_ptr<CostModel> cost;
-	/// Base half-width `b` of the adaptive POA build band; forwarded to
-	/// the graph (see POAGraph).
-	int band_base = DEFAULT_BAND_BASE;
-	/// Slope `f` of the adaptive POA build band; forwarded to the graph.
-	double band_slope = DEFAULT_BAND_SLOPE;
 	POAGraph graph;                ///< POA graph built from the dictionary.
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;

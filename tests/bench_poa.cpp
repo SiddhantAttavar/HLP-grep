@@ -4,7 +4,7 @@
  *        default band configuration.
  *
  * For each testcase file, a Solver and a POAGraph are built with the
- * default band (`b = 10, f = 0.01`) and the following is reported:
+ * dynamic doubling band (see POAGraph) and the following is reported:
  * minimum construction time over `--reps` runs, node/edge counts,
  * compression (`|V| / total length`), and mean/max `j_max - j_min`
  * spread. Using a single config keeps repeated graph construction from
@@ -43,13 +43,6 @@ void check(bool ok, const std::string &msg) {
 	}
 }
 
-/** One build band configuration under test. */
-struct BandConfig {
-	std::string name; ///< Label used in the report.
-	int base;         ///< Band base half-width `b`.
-	double slope;     ///< Band slope `f`.
-};
-
 /** Measured construction time and quality for one config on one file. */
 struct Report {
 	double build_s = 0;      ///< Minimum Solver construction time over reps.
@@ -62,12 +55,12 @@ struct Report {
 };
 
 /** Builds a Solver and times it; returns the fastest of @p reps runs. */
-Report time_solver(const Testcase &tc, const BandConfig &cfg, int reps) {
+Report time_solver(const Testcase &tc, int reps) {
 	Report rep;
 	double best = std::numeric_limits<double>::infinity();
 	for (int r = 0; r < reps; ++r) {
 		const auto t0 = std::chrono::steady_clock::now();
-		Solver solver(tc.dict, *tc.cost, cfg.base, cfg.slope);
+		Solver solver(tc.dict, *tc.cost);
 		const auto t1 = std::chrono::steady_clock::now();
 		best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
 	}
@@ -76,9 +69,8 @@ Report time_solver(const Testcase &tc, const BandConfig &cfg, int reps) {
 }
 
 /** Fills graph quality metrics and enforces the path-spelling invariant. */
-void measure_graph(const Testcase &tc, const BandConfig &cfg, const fs::path &file,
-                   Report &rep) {
-	const POAGraph graph(tc.dict, *tc.cost, cfg.base, cfg.slope);
+void measure_graph(const Testcase &tc, const fs::path &file, Report &rep) {
+	const POAGraph graph(tc.dict, *tc.cost);
 	rep.nodes = graph.num_nodes();
 	std::unordered_set<std::uint64_t> edges;
 	double spread_sum = 0;
@@ -111,8 +103,8 @@ void measure_graph(const Testcase &tc, const BandConfig &cfg, const fs::path &fi
 }
 
 /** Serializes all query results for the run's single band config. */
-std::string fingerprint_queries(const Testcase &tc, const BandConfig &cfg) {
-	const Solver solver(tc.dict, *tc.cost, cfg.base, cfg.slope);
+std::string fingerprint_queries(const Testcase &tc) {
+	const Solver solver(tc.dict, *tc.cost);
 	std::string finger;
 	for (const auto &[k, query] : tc.queries) {
 		const auto results = solver.query(query, k);
@@ -124,21 +116,20 @@ std::string fingerprint_queries(const Testcase &tc, const BandConfig &cfg) {
 	return finger;
 }
 
-void bench_testcase(const fs::path &file, const BandConfig &cfg,
-                    int max_seqs, int reps) {
+void bench_testcase(const fs::path &file, int max_seqs, int reps) {
 	Testcase tc = parse_testcase(file);
 	if (max_seqs > 0 && static_cast<std::size_t>(max_seqs) < tc.dict.size())
 		tc.dict.resize(static_cast<std::size_t>(max_seqs));
 
-	Report rep = time_solver(tc, cfg, reps);
-	measure_graph(tc, cfg, file, rep);
-	rep.fingerprint = fingerprint_queries(tc, cfg);
+	Report rep = time_solver(tc, reps);
+	measure_graph(tc, file, rep);
+	rep.fingerprint = fingerprint_queries(tc);
 
 	const double compr =
 	    rep.total_len > 0 ? static_cast<double>(rep.nodes) /
 	                            static_cast<double>(rep.total_len)
 	                      : 0.0;
-	std::cout << "BENCH " << file << " config=" << cfg.name
+	std::cout << "BENCH " << file << " config=dynamic"
 	          << " build_s=" << rep.build_s << " V=" << rep.nodes
 	          << " E=" << rep.edges << " compr=" << compr
 	          << " spread=" << rep.spread_mean << "/" << rep.spread_max
@@ -165,16 +156,14 @@ int main(int argc, char **argv) {
 	}
 	check(reps > 0, "--reps must be positive");
 
-	// Default band: the production configuration (b = 10, f = 0.01).
-	const BandConfig cfg{"default", DEFAULT_BAND_BASE, DEFAULT_BAND_SLOPE};
-
+	// Dynamic band: the production configuration (no tuning knobs).
 	const auto files = collect_files(argc, argv, first);
 	if (files.empty()) {
 		std::cout << "no testcase files found, nothing to do\n";
 		return 0;
 	}
 	for (const auto &file : files)
-		bench_testcase(file, cfg, max_seqs, reps);
+		bench_testcase(file, max_seqs, reps);
 
 	std::cout << files.size() << " testcase file(s) benchmarked\n";
 	return 0;

@@ -21,11 +21,6 @@
 
 namespace hlp_grep {
 
-/// Default base half-width for the adaptive build band `w = b + f * L`.
-inline constexpr int DEFAULT_BAND_BASE = 10;
-/// Default slope for the adaptive build band `w = b + f * L`.
-inline constexpr double DEFAULT_BAND_SLOPE = 0.01;
-
 /**
  * @brief A POA (partial order alignment) graph of a sequence dictionary.
  *
@@ -86,26 +81,21 @@ public:
 	 * each subsequent sequence is aligned to the current graph and merged.
 	 * After the last sequence the heavy/light edge classification is finalized.
 	 *
-	 * The sequence-to-graph alignments use an adaptive abPOA-style band:
-	 * per graph node only query columns in
-	 * `[pos_min - w, pos_max + w]` (clamped to `[0, |s|]`) are computed,
-	 * where `w = band_base + band_slope * |s|` and `pos_min/pos_max` are
-	 * the incremental offsets of previously inserted paths. Narrow bands
-	 * are heuristic: divergent sequences reuse less graph structure but
-	 * their stored paths still spell the dictionary exactly.
+	 * The sequence-to-graph alignments use a dynamic doubling band: starting
+	 * from `w = 1`, a sequence is re-aligned with doubled `w` until the
+	 * alignment succeeds strictly inside the band at an edit distance
+	 * `<= w` (see align_to_graph()). Per node the band spans a fixed total
+	 * width `2w` centered on the node's position range (see band_bounds()).
+	 * Successful alignments halve `w` for the next sequence.
 	 *
 	 * @param dict Dictionary of DNA sequences to index.
 	 * @param cost Cost model used for the sequence-to-graph alignments.
 	 *             Defaults to the unit-cost model. The referenced model
 	 *             must outlive the graph.
-	 * @param band_base Base half-width `b` of the adaptive build band.
-	 * @param band_slope Slope `f` of the adaptive build band.
 	 */
 	explicit POAGraph(const std::vector<std::string> &dict,
-	                  const CostModel &cost = DEFAULT_COST_MODEL,
-	                  int band_base = DEFAULT_BAND_BASE,
-	                  double band_slope = DEFAULT_BAND_SLOPE)
-	    : cost(cost), band_base(band_base), band_slope(band_slope) {
+	                  const CostModel &cost = DEFAULT_COST_MODEL)
+	    : cost(cost) {
 		build(dict);
 	}
 
@@ -249,6 +239,15 @@ private:
 	};
 
 	/**
+	 * @brief Outcome of one banded sequence-to-graph alignment attempt.
+	 */
+	struct AlignOutcome {
+		bool found = false;  ///< Some alignment endpoint reached column |s|.
+		bool strict = false; ///< Traceback stayed strictly inside the band.
+		Alignment al;        ///< Alignment found (valid when found).
+	};
+
+	/**
 	 * @brief Per-edge metadata stored in the graph: neighbor node, its
 	 *        heavy/light classification (finalized by mark_heavy_edges()),
 	 *        and its unique edge id (shared by the out-edge and in-edge
@@ -278,10 +277,10 @@ private:
 	std::vector<node_id> topo;
 
 	const CostModel &cost; ///< Cost model of the graph alignments; must outlive the graph.
-	/// Base half-width `b` of the adaptive build band `w = b + f * L`.
-	int band_base = DEFAULT_BAND_BASE;
-	/// Slope `f` of the adaptive build band `w = b + f * L`.
-	double band_slope = DEFAULT_BAND_SLOPE;
+	/// Band half-width carried between consecutive sequence alignments.
+	/// Doubled while a sequence fails to align strictly inside the band,
+	/// halved (min 1) after a success; starts at 1.
+	long band_w = 1;
 
 	// -- construction ---------------------------------------------------------
 
@@ -304,9 +303,29 @@ private:
 		rebuild_topo();
 
 		for (std::size_t id = 1; id < dict.size(); ++id) {
-			const Alignment al = align_to_graph(dict[id]);
-			add_alignment(al.ops);
-			rebuild_topo();
+			// Dynamic band: double until the alignment cost fits the band,
+			// i.e. the found alignment reaches column |s| strictly inside
+			// the band at an edit distance <= w (a band narrower than the
+			// sequence's divergence cannot express the alignment, so the
+			// cost signal says when the width suffices). The width cap |s|
+			// makes every row band cover [0, |s|] (band_bounds clamps), so
+			// retries terminate; at the cap any outcome is accepted as-is.
+			const long cap =
+			    std::max<long>(static_cast<long>(dict[id].size()), 1);
+			AlignOutcome out;
+			while (true) {
+				out = align_to_graph(dict[id], band_w);
+				const bool proper =
+				    out.found && out.strict && out.al.cost <= band_w;
+				if (band_w >= cap || proper)
+					break;
+				band_w = std::min(2 * band_w, cap);
+			}
+			if (out.found)
+				add_alignment(out.al.ops);
+			else
+				add_alignment(fresh_alignment(dict[id]).ops);
+			band_w = std::max(band_w / 2, 1L);
 		}
 
 		mark_heavy_edges();
@@ -340,29 +359,29 @@ private:
 	}
 
 	/**
-	 * @brief Adaptive build band half-width for a sequence of length @p len:
-	 *        `w = band_base + band_slope * len`, clamped to `>= 0`.
-	 */
-	long band_width(std::size_t len) const {
-		const long w = static_cast<long>(band_base) +
-		               static_cast<long>(band_slope * static_cast<double>(len));
-		return w < 0 ? 0 : w;
-	}
-
-	/**
 	 * @brief Inclusive band `[lo, hi]` of query columns computed for node @p u.
 	 *
-	 * `[pos_min - w, pos_max + w]` clamped to `[0, m]`. Nodes on no stored
-	 * path yet (sentinel ranges) cover the full row. Empty when the node
-	 * range lies entirely outside the clamped interval; callers skip those
-	 * rows (their cells stay INF).
+	 * The per-node band half-width is `w' = w - (pos_max - pos_min) / 2`
+	 * (clamped to `>= 0`), so the band spans a fixed total width `2w`
+	 * centered on the node's position range instead of growing with its
+	 * spread: `[center - w, center + w]`. Wide ranges therefore stop
+	 * widening — a node can only be reused near its center once its
+	 * spread reaches `2w`. Nodes on no stored path yet (sentinel ranges)
+	 * cover the full row. The result is clamped to `[0, m]`; empty when
+	 * the node range lies entirely outside the clamped interval, and
+	 * callers skip those rows (their cells stay INF).
 	 */
 	std::pair<long, long> band_bounds(node_id u, long m, long w) const {
 		const Node &n = nodes[u];
 		if (n.pos_min == START || n.pos_max == START)
 			return {0, m};
-		long lo = static_cast<long>(n.pos_min) - w;
-		long hi = static_cast<long>(n.pos_max) + w;
+		const long spread = static_cast<long>(n.pos_max) -
+		                    static_cast<long>(n.pos_min);
+		long w2 = w - spread / 2;
+		if (w2 < 0)
+			w2 = 0;
+		long lo = static_cast<long>(n.pos_min) - w2;
+		long hi = static_cast<long>(n.pos_max) + w2;
 		if (lo < 0)
 			lo = 0;
 		if (hi > m)
@@ -432,23 +451,32 @@ private:
 	}
 
 	/**
-	 * @brief Aligns a sequence to the current graph under the adaptive band.
+	 * @brief Aligns a sequence to the current graph under band half-width
+	 *        @p w.
 	 *
 	 * Minimum-cost global alignment of @p s against the DAG restricted to
-	 * the per-node bands `[pos_min - w, pos_max + w]` clamped to `[0, |s|]`,
-	 * where `w = band_base + band_slope * |s|` and the ranges are the
-	 * incremental offsets of previously inserted paths. DP over
+	 * the per-node bands `[center - w, center + w]` clamped to `[0, |s|]`,
+	 * where the centers are the midpoints of the incremental position
+	 * ranges of previously inserted paths (see band_bounds()). DP over
 	 * (topological position, prefix length) with a virtual start row, using
 	 * insertion/deletion/substitution costs from cost. Cost ties prefer
 	 * exact consumes, then deletions, then insertions. Out-of-band cells
 	 * stay INF; the band is heuristic, so divergent sequences simply reuse
 	 * less graph structure.
 	 *
+	 * The attempt is strict when an endpoint reaches column |s| and the
+	 * traceback never uses a truncated band-edge cell (`lo`/`hi` of a row
+	 * that does not cover the full `[0, |s|]` range): a path hugging the
+	 * band edge suggests the true optimum lies outside, so the caller
+	 * retries with doubled @p w.
+	 *
 	 * @param s Sequence to align.
-	 * @return Alignment record: cost and alignment steps, to be merged with
+	 * @param w Band half-width.
+	 * @return Outcome: endpoint reached, traceback strictness, and the
+	 *         alignment record (valid when found), to be merged with
 	 *         add_alignment().
 	 */
-	Alignment align_to_graph(const std::string &s) {
+	AlignOutcome align_to_graph(const std::string &s, long w) {
 		const std::size_t V = nodes.size();
 		const std::size_t m = s.size();
 		const long ml = static_cast<long>(m);
@@ -468,7 +496,6 @@ private:
 
 		// Inclusive per-row bands over columns 0..m; the virtual start row
 		// is unbanded. Rows whose band is empty store nothing.
-		const long w = band_width(m);
 		std::vector<long> lo(R, 1), hi(R, 0);
 		lo[vr] = 0;
 		hi[vr] = ml;
@@ -633,22 +660,40 @@ private:
 
 		// Degenerate band miss: no end node reaches column m.
 		if (bc >= INF) {
-			Alignment al;
-			al.cost = bc;
-			al.ops.reserve(m);
-			for (std::size_t j = 0; j < m; ++j)
-				al.ops.push_back({AlignmentOp::Type::INSERT, START, s[j]});
-			return al;
+			AlignOutcome out;
+			out.found = false;
+			out.strict = false;
+			out.al.cost = bc;
+			return out;
 		}
 
 		// Traceback parents to the empty-prefix column (rows, not node ids).
 		// op == 0 marks an uncomputed cell on a heuristic path: insert the
-		// query character instead of following a bogus parent.
-		Alignment al;
-		al.cost = bc;
+		// query character instead of following a bogus parent, and report
+		// the attempt as non-strict so the caller widens the band. A cell
+		// sitting on the band edge of a row that does not span the full
+		// [0, m] range also marks the attempt non-strict: its incoming
+		// transitions were clipped, so the true optimum may lie outside.
+		AlignOutcome out;
+		out.found = true;
+		out.strict = true;
+		out.al.cost = bc;
 		std::vector<AlignmentOp> ops;
 		std::size_t r = br;
 		for (std::size_t i = m; i > 0;) {
+			const long col = static_cast<long>(i);
+			if (col < lo[r] || col > hi[r]) {
+				// Out-of-band cell (reachable only through the op == 0
+				// patch below): the row's storage cannot be indexed.
+				// Insert instead and widen.
+				out.strict = false;
+				ops.push_back({AlignmentOp::Type::INSERT, START, s[i - 1]});
+				--i;
+				continue;
+			}
+			if ((col == lo[r] && lo[r] > 0) ||
+			    (col == hi[r] && hi[r] < ml))
+				out.strict = false;
 			const std::size_t k =
 			    row_off[r] + (i - static_cast<std::size_t>(lo[r]));
 			const node_id row2node = (r == vr) ? START : topo[r];
@@ -667,13 +712,26 @@ private:
 				--i;
 				break;
 			default:
+				out.strict = false;
 				ops.push_back({AlignmentOp::Type::INSERT, START, s[i - 1]});
 				--i;
 				break;
 			}
 		}
 		std::reverse(ops.begin(), ops.end());
-		al.ops = std::move(ops);
+		out.al.ops = std::move(ops);
+		return out;
+	}
+
+	/**
+	 * @brief Degenerate fallback alignment: insert every character of @p s
+	 *        as fresh nodes, reusing no graph structure.
+	 */
+	Alignment fresh_alignment(const std::string &s) const {
+		Alignment al;
+		al.ops.reserve(s.size());
+		for (const char c : s)
+			al.ops.push_back({AlignmentOp::Type::INSERT, START, c});
 		return al;
 	}
 
