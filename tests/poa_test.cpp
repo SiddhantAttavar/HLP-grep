@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 
@@ -28,10 +29,39 @@ void check(bool ok, const std::string &msg) {
 	}
 }
 
+/**
+ * @brief Builds the (u, v) -> traversal count map over all stored paths.
+ *
+ * Replaces the removed POAGraph::edge_weight(): the graph no longer
+ * exposes on-demand weight queries, but the test still verifies
+ * heavy/light classification against the raw path data.
+ */
+std::unordered_map<unsigned long long, std::size_t>
+path_weights(const POAGraph &g) {
+	std::unordered_map<unsigned long long, std::size_t> weights;
+	for (std::size_t s = 0; s < g.num_sequences(); ++s) {
+		const auto &p = g.path(s);
+		for (std::size_t i = 1; i < p.size(); ++i)
+			++weights[static_cast<unsigned long long>(p[i - 1]) << 32 |
+			          static_cast<unsigned long long>(p[i])];
+	}
+	return weights;
+}
+
+/** Weight of edge (u, v) from a path_weights() map; 0 if never traversed. */
+std::size_t weight_of(
+    const std::unordered_map<unsigned long long, std::size_t> &weights,
+    POAGraph::node_id u, POAGraph::node_id v) {
+	const auto it = weights.find(static_cast<unsigned long long>(u) << 32 |
+	                             static_cast<unsigned long long>(v));
+	return it == weights.end() ? 0 : it->second;
+}
+
 /** Asserts every path spells its dictionary string, connected by graph edges. */
 void check_paths(const POAGraph &g, const std::vector<std::string> &dict,
                  const std::string &name) {
 	check(g.num_sequences() == dict.size(), name + ": sequence count mismatch");
+	const auto weights = path_weights(g);
 	for (std::size_t i = 0; i < dict.size(); ++i) {
 		std::string spelled;
 		bool first = true;
@@ -39,7 +69,7 @@ void check_paths(const POAGraph &g, const std::vector<std::string> &dict,
 		for (const auto u : g.path(i)) {
 			check(u < g.num_nodes(), name + ": node id out of range");
 			if (!first)
-				check(g.edge_weight(prev, u) > 0,
+				check(weight_of(weights, prev, u) > 0,
 				      name + ": path " + std::to_string(i) + " has no edge " +
 				          std::to_string(prev) + "->" + std::to_string(u));
 			spelled += g.base(u);
@@ -75,15 +105,18 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 			// A HEAVY step must not occur right after another step whose
 			// heavy chain could have continued: no two steps may share a
 			// heavy chain (otherwise compression missed a merge).
-			check(!prev_was_heavy_end || cur == POAGraph::node_id(-1) ||
-			          g.edge_type(cur, g.heavy_edge(cur)) ==
-			                  POAGraph::EdgeType::LIGHT,
+			const auto chain_next = g.node(cur).heavy_neighbour;
+			check(!prev_was_heavy_end || !chain_next ||
+			          g.edge_type(cur, *chain_next) ==
+			              POAGraph::EdgeType::LIGHT,
 			      name + ": adjacent heavy steps on the same chain missed");
 			for (int h = 0; h < st.length; ++h) {
-				check(g.edge_type(cur, g.heavy_edge(cur)) ==
-				              POAGraph::EdgeType::HEAVY,
+				const auto hn = g.node(cur).heavy_neighbour;
+				check(hn.has_value() &&
+				              g.edge_type(cur, *hn) ==
+				                  POAGraph::EdgeType::HEAVY,
 				      name + ": heavy step traverses a non-heavy edge");
-				cur = g.heavy_edge(cur);
+				cur = *hn;
 				spelled += g.base(cur);
 			}
 			prev_was_heavy_end = true;
@@ -92,8 +125,6 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 		case POAGraph::EdgeType::LIGHT: {
 			check(st.next < g.num_nodes(),
 			      name + ": light step lands out of range");
-			check(g.edge_weight(cur, st.next) > 0,
-			      name + ": light step has no edge");
 			check(g.edge_type(cur, st.next) == POAGraph::EdgeType::LIGHT,
 			      name + ": light step traverses a heavy edge");
 			cur = st.next;
@@ -213,10 +244,11 @@ int main() {
 		const std::vector<std::string> dict = {"AACT", "AACT", "AAAT", "AACTA"};
 		const POAGraph g(dict);
 		check_paths(g, dict, "heavy-ties");
+		const auto weights = path_weights(g);
 
 		for (std::size_t u = 0; u < g.num_nodes(); ++u) {
-			const POAGraph::node_id heavy = g.heavy_edge(u);
-			if (heavy == POAGraph::node_id(-1)) {
+			const auto heavy = g.node(u).heavy_neighbour;
+			if (!heavy.has_value()) {
 				// No outgoing edges: every candidate edge must be LIGHT.
 				for (std::size_t v = 0; v < g.num_nodes(); ++v)
 					check(g.edge_type(u, v) == POAGraph::EdgeType::LIGHT,
@@ -224,22 +256,22 @@ int main() {
 					          " has no outgoing edges but an edge is HEAVY");
 				continue;
 			}
-			check(g.edge_weight(u, heavy) > 0,
+			check(weight_of(weights, u, *heavy) > 0,
 			      "heavy-ties: heavy edge must exist");
-			check(g.edge_type(u, heavy) == POAGraph::EdgeType::HEAVY,
-			      "heavy-ties: heavy_edge() disagrees with edge_type()");
+			check(g.edge_type(u, *heavy) == POAGraph::EdgeType::HEAVY,
+			      "heavy-ties: heavy_neighbour disagrees with edge_type()");
 			// HEAVY edge must be (a) max weight and (b) tie-broken by
 			// largest destination id among equal-weight edges.
 			for (std::size_t v = 0; v < g.num_nodes(); ++v) {
-				if (v == heavy || g.edge_weight(u, v) == 0)
+				if (v == *heavy || weight_of(weights, u, v) == 0)
 					continue;
-				const std::size_t wh = g.edge_weight(u, heavy);
-				const std::size_t wv = g.edge_weight(u, v);
-				check(wv < wh || (wv == wh && v < heavy),
+				const std::size_t wh = weight_of(weights, u, *heavy);
+				const std::size_t wv = weight_of(weights, u, v);
+				check(wv < wh || (wv == wh && v < *heavy),
 				      "heavy-ties: edge " + std::to_string(u) + "->" +
 				          std::to_string(v) + " (w=" + std::to_string(wv) +
 				          ") outranks heavy edge " + std::to_string(u) + "->" +
-				          std::to_string(heavy) + " (w=" + std::to_string(wh) +
+				          std::to_string(*heavy) + " (w=" + std::to_string(wh) +
 				          ")");
 				check(g.edge_type(u, v) == POAGraph::EdgeType::LIGHT,
 				      "heavy-ties: more than one HEAVY edge from node " +
@@ -247,9 +279,8 @@ int main() {
 			}
 		}
 
-		// The trunk A-A chain edge 0->1 is taken by all 4 paths and is heavy;
-		// absent edges report LIGHT.
-		check(g.edge_weight(0, 1) == 4, "heavy-ties: edge 0->1 weight");
+		// The trunk A-A chain edge 0->1 is taken by all 4 paths and is heavy.
+		check(weight_of(weights, 0, 1) == 4, "heavy-ties: edge 0->1 weight");
 		check(g.edge_type(0, 1) == POAGraph::EdgeType::HEAVY,
 		      "heavy-ties: edge 0->1 must be heavy");
 		check(g.edge_type(3, 0) == POAGraph::EdgeType::LIGHT,

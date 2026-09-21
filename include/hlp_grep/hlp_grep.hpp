@@ -61,22 +61,6 @@ public:
 	}
 
 	/**
-	 * @brief Copy constructor.
-	 *
-	 * The cost member is a unique_ptr holding a polymorphic model, so the
-	 * compiler-generated copy machinery cannot be used; the model is
-	 * deep-cloned and the graph is rebuilt against the cloned model.
-	 */
-	Solver(const Solver &other)
-	    : dict(other.dict), cost(other.cost->clone()),
-	      band_base(other.band_base), band_slope(other.band_slope),
-	      graph(this->dict, *this->cost, band_base, band_slope) {
-		build_compressed_paths();
-	}
-
-	Solver &operator=(const Solver &other) = delete;
-
-	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the
 	 *        query.
 	 *
@@ -86,6 +70,12 @@ public:
 	 * heavy chain (jump) or a single light edge (step). The last entry of
 	 * the final row is the edit distance between the sequence's path and
 	 * the query; it is reported when it does not exceed k.
+	 *
+	 * Scoring aborts a path early once every entry of its DP row exceeds
+	 * k: with nonnegative operation costs each transition only adds cost,
+	 * so the row minimum never decreases and no later state can fall back
+	 * to <= k. Costs are nonnegative in every sane model; negative-cost
+	 * models make the check unsound and must not rely on it.
 	 *
 	 * Sequences whose length differs from the query by more than k are
 	 * skipped without scoring: their length difference is a lower bound
@@ -118,6 +108,8 @@ public:
 					row = lifter.step(cur, st.next, row);
 					cur = st.next;
 				}
+				if (*std::min_element(row.begin(), row.end()) > k)
+					break;
 			}
 			const int dist = row.back();
 			if (dist <= k)

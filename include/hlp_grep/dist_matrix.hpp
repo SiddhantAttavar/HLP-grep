@@ -97,10 +97,24 @@ public:
 		if (a.rows == 0 || b.cols == 0)
 			return out;
 		if (monge) {
-			for (std::size_t i = 0; i < a.rows; ++i)
-				monge_row(&a.data[i * a.cols], b,
-				          &out.data[i * b.cols], 0, b.cols - 1,
-				          0, a.cols - 1);
+			for (std::size_t i = 0; i < a.rows; ++i) {
+				const int *arow = &a.data[i * a.cols];
+				int *orow = &out.data[i * b.cols];
+				// An all-INF input row saturates every candidate at INF:
+				// skip the divide-and-conquer and emit the row directly.
+				bool all_inf = true;
+				for (std::size_t c = 0; c < a.cols; ++c)
+					if (arow[c] < INF) {
+						all_inf = false;
+						break;
+					}
+				if (all_inf) {
+					for (std::size_t j = 0; j < b.cols; ++j)
+						orow[j] = INF;
+					continue;
+				}
+				monge_row(arow, b, orow, 0, b.cols - 1, 0, a.cols - 1);
+			}
 			return out;
 		}
 		for (std::size_t i = 0; i < a.rows; ++i) {
@@ -133,11 +147,17 @@ public:
 	 *
 	 * @param vec Row vector of costs, one per row of this matrix; entries
 	 *            must not exceed INF.
+	 * @param monge When true, this matrix is Monge: the column argmins
+	 *        of vec(i) + (*this)(i, j) are monotone in j, so the result
+	 *        is found with divide-and-conquer in O(rows + cols) argmin
+	 *        steps instead of the full rows x cols scan. The caller
+	 *        guarantees Monge-ness; no verification is done.
 	 * @return The resulting row vector, one entry per column.
 	 * @throws std::invalid_argument if vec.size() != rows or rows == 0
 	 *         (an empty row vector leaves the result undefined).
 	 */
-	std::vector<int> min_plus_apply(const std::vector<int> &vec) const {
+	std::vector<int> min_plus_apply(const std::vector<int> &vec,
+	                                bool monge = false) const {
 		if (vec.size() != rows)
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_apply: dimension mismatch");
@@ -146,6 +166,13 @@ public:
 			    "DistMatrix::min_plus_apply: empty row vector");
 
 		std::vector<int> out(cols);
+		if (monge) {
+			if (cols == 0)
+				return out;
+			monge_row(&vec[0], *this, &out[0], 0, cols - 1, 0,
+			          rows - 1);
+			return out;
+		}
 		for (std::size_t j = 0; j < cols; ++j) {
 			const int cand = vec[0] + data[j];
 			out[j] = cand > INF ? INF : cand;

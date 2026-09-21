@@ -165,21 +165,6 @@ public:
 	}
 
 	/**
-	 * @brief Temporary visiting frequency of edge (u, v): the number of
-	 *        stored sequence paths traversing it, or 0 if the edge is
-	 *        never traversed. Weights are not stored in the edges; this
-	 *        counts on demand and costs O(total path length) per call.
-	 */
-	std::size_t edge_weight(node_id u, node_id v) const {
-		std::size_t weight = 0;
-		for (const auto &path : paths)
-			for (std::size_t i = 1; i < path.size(); ++i)
-				if (path[i - 1] == u && path[i] == v)
-					++weight;
-		return weight;
-	}
-
-	/**
 	 * @brief Heavy/light classification of edge (u, v); LIGHT for absent
 	 *        edges.
 	 */
@@ -187,17 +172,6 @@ public:
 		if (const Edge *e = find_edge(out_edges[u], v))
 			return e->type;
 		return EdgeType::LIGHT;
-	}
-
-	/**
-	 * @brief The single heavy outgoing edge of a node, or START if the node
-	 *        has no outgoing edges.
-	 */
-	node_id heavy_edge(node_id u) const {
-		for (const Edge &e : out_edges[u])
-			if (e.type == EdgeType::HEAVY)
-				return e.neighbor;
-		return START;
 	}
 
 	/**

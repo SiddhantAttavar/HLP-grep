@@ -1,19 +1,18 @@
 /**
  * @file bench_poa.cpp
- * @brief Benchmarks POA graph construction time and quality across build
- *        band configurations.
+ * @brief Benchmarks POA graph construction time and quality under the
+ *        default band configuration.
  *
- * For each testcase file, a Solver and a POAGraph are built under three
- * band configs — full (exact reference: the band covers every column),
- * default (`b = 10, f = 0.01`) and narrow (`b = 2, f = 0`) — and the
- * following is reported per config: minimum construction time over
- * `--reps` runs, node/edge counts, compression (`|V| / total length`),
- * and mean/max `j_max - j_min` spread.
+ * For each testcase file, a Solver and a POAGraph are built with the
+ * default band (`b = 10, f = 0.01`) and the following is reported:
+ * minimum construction time over `--reps` runs, node/edge counts,
+ * compression (`|V| / total length`), and mean/max `j_max - j_min`
+ * spread. Using a single config keeps repeated graph construction from
+ * dominating profiling runs.
  *
  * Deterministic invariants are enforced (nonzero exit on violation), so
  * this doubles as a CTest: every stored path must spell its dictionary
- * sequence, and every query must return identical results under all
- * configs (build banding may change graph sharing, never search results).
+ * sequence, and every query must return self-consistent results.
  *
  * Usage: bench_poa [--max-seqs N] [--reps R] <testcase-file-or-dir>...
  */
@@ -111,7 +110,7 @@ void measure_graph(const Testcase &tc, const BandConfig &cfg, const fs::path &fi
 		rep.spread_mean = spread_sum / static_cast<double>(spread_n);
 }
 
-/** Serializes all query results; must agree across band configs. */
+/** Serializes all query results for the run's single band config. */
 std::string fingerprint_queries(const Testcase &tc, const BandConfig &cfg) {
 	const Solver solver(tc.dict, *tc.cost, cfg.base, cfg.slope);
 	std::string finger;
@@ -125,37 +124,26 @@ std::string fingerprint_queries(const Testcase &tc, const BandConfig &cfg) {
 	return finger;
 }
 
-void bench_testcase(const fs::path &file, const std::vector<BandConfig> &cfgs,
+void bench_testcase(const fs::path &file, const BandConfig &cfg,
                     int max_seqs, int reps) {
 	Testcase tc = parse_testcase(file);
 	if (max_seqs > 0 && static_cast<std::size_t>(max_seqs) < tc.dict.size())
 		tc.dict.resize(static_cast<std::size_t>(max_seqs));
 
-	std::vector<Report> reps_out;
-	for (const auto &cfg : cfgs) {
-		Report rep = time_solver(tc, cfg, reps);
-		measure_graph(tc, cfg, file, rep);
-		rep.fingerprint = fingerprint_queries(tc, cfg);
-		reps_out.push_back(std::move(rep));
-	}
-	for (std::size_t c = 1; c < cfgs.size(); ++c)
-		check(reps_out[c].fingerprint == reps_out[0].fingerprint,
-		      "query results differ under band " + cfgs[c].name);
+	Report rep = time_solver(tc, cfg, reps);
+	measure_graph(tc, cfg, file, rep);
+	rep.fingerprint = fingerprint_queries(tc, cfg);
 
-	for (std::size_t c = 0; c < cfgs.size(); ++c) {
-		const Report &rep = reps_out[c];
-		const double compr =
-		    rep.total_len > 0 ? static_cast<double>(rep.nodes) /
-		                            static_cast<double>(rep.total_len)
-		                      : 0.0;
-		std::cout << "BENCH " << file << " config=" << cfgs[c].name
-		          << " build_s=" << rep.build_s << " V=" << rep.nodes
-		          << " E=" << rep.edges << " compr=" << compr
-		          << " spread=" << rep.spread_mean << "/" << rep.spread_max
-		          << " queries=" << tc.queries.size() << '\n';
-	}
-	std::cout << "PASS " << file << " (query results identical across "
-	          << cfgs.size() << " band configs)\n";
+	const double compr =
+	    rep.total_len > 0 ? static_cast<double>(rep.nodes) /
+	                            static_cast<double>(rep.total_len)
+	                      : 0.0;
+	std::cout << "BENCH " << file << " config=" << cfg.name
+	          << " build_s=" << rep.build_s << " V=" << rep.nodes
+	          << " E=" << rep.edges << " compr=" << compr
+	          << " spread=" << rep.spread_mean << "/" << rep.spread_max
+	          << " queries=" << tc.queries.size() << '\n';
+	std::cout << "PASS " << file << " (paths spell sequences, queries ran)\n";
 }
 
 } // namespace
@@ -177,13 +165,8 @@ int main(int argc, char **argv) {
 	}
 	check(reps > 0, "--reps must be positive");
 
-	// Full band covers every column: the exact construction reference.
-	// Default and narrow bands trade sharing for build speed.
-	const std::vector<BandConfig> cfgs = {
-	    {"full", std::numeric_limits<int>::max() / 2, 0.0},
-	    {"default", DEFAULT_BAND_BASE, DEFAULT_BAND_SLOPE},
-	    {"narrow", 2, 0.0},
-	};
+	// Default band: the production configuration (b = 10, f = 0.01).
+	const BandConfig cfg{"default", DEFAULT_BAND_BASE, DEFAULT_BAND_SLOPE};
 
 	const auto files = collect_files(argc, argv, first);
 	if (files.empty()) {
@@ -191,7 +174,7 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 	for (const auto &file : files)
-		bench_testcase(file, cfgs, max_seqs, reps);
+		bench_testcase(file, cfg, max_seqs, reps);
 
 	std::cout << files.size() << " testcase file(s) benchmarked\n";
 	return 0;

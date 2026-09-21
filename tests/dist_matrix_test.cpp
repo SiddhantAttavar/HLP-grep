@@ -156,6 +156,47 @@ void test_apply() {
 	check(got[0] == 1 && got[1] == 5 && got[2] == 3, "apply: values wrong");
 }
 
+void test_monge_apply() {
+	// Monge matrix b(c, j) = |c - j|; vec {2, 0, 3}:
+	// out(0) = min(2+0, 0+1, 3+2) = 1; out(1) = min(2+1, 0+0, 3+1) = 0
+	// out(2) = min(2+2, 0+1, 3+0) = 1
+	const DistMatrix m = make(3, 3, {"012", "101", "210"});
+	const std::vector<int> got = m.min_plus_apply({2, 0, 3}, true);
+	check(got.size() == 3, "monge apply: result size");
+	check(got[0] == 1 && got[1] == 0 && got[2] == 1,
+	      "monge apply: values wrong");
+
+	// Rectangular Monge matrix must match the full scan exactly.
+	DistMatrix big(4, 5);
+	for (std::size_t c = 0; c < 4; ++c)
+		for (std::size_t j = 0; j < 5; ++j)
+			big(c, j) = static_cast<int>(c > j ? c - j : j - c);
+	const std::vector<int> fast = big.min_plus_apply({3, 0, 2, 5}, true);
+	const std::vector<int> slow = big.min_plus_apply({3, 0, 2, 5}, false);
+	check(fast == slow, "monge apply: mismatch against full scan");
+
+	// Lifter-style INF-below-the-staircase table with an INF input
+	// entry: saturation and the DnC argmin monotonicity must survive.
+	DistMatrix stair(5, 6, DistMatrix::INF);
+	for (std::size_t i = 0; i < 5; ++i)
+		for (std::size_t j = i; j < 6; ++j)
+			stair(i, j) = static_cast<int>(j - i);
+	const std::vector<int> sf =
+	    stair.min_plus_apply({0, DistMatrix::INF, 1, DistMatrix::INF, 0},
+	                         true);
+	const std::vector<int> ss =
+	    stair.min_plus_apply({0, DistMatrix::INF, 1, DistMatrix::INF, 0},
+	                         false);
+	check(sf == ss, "monge apply INF: mismatch against full scan");
+	check(sf[0] == 0, "monge apply INF: entry 0 wrong");
+	check(sf[5] == 1, "monge apply INF: entry 5 wrong");
+
+	// Zero columns take the early return on the monge path too.
+	const DistMatrix wide(2, 0);
+	check(wide.min_plus_apply({0, 0}, true).empty(),
+	      "monge apply: zero-column result not empty");
+}
+
 void test_errors() {
 	const DistMatrix a(2, 3);
 	const DistMatrix b(2, 2);
@@ -216,6 +257,7 @@ int main() {
 	test_monge_product();
 	test_monge_inf_fills();
 	test_apply();
+	test_monge_apply();
 	test_errors();
 	test_empty();
 	std::cout << "dist_matrix_test: all checks passed\n";

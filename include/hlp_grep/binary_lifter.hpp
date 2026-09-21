@@ -130,7 +130,8 @@ public:
 			if (!up[v][t].has_value())
 				throw std::out_of_range(
 				    "BinaryLifter::jump: heavy chain too short");
-			row = up_mat[v][t].min_plus_apply(row);
+			row = up_mat[v][t].min_plus_apply(row,
+			                                  cost_model.is_monge());
 			v = *up[v][t];
 		}
 		cost = std::move(row);
@@ -139,13 +140,22 @@ public:
 
 	/**
 	 * @brief Steps a DP row across the single edge (u, v): applies the
-	 *        one-edge transition (the same recurrence as the chain
-	 *        tables' level-0 blocks) to @p cost on demand and returns the
-	 *        advanced row.
+	 *        one-edge transition directly and returns the advanced row.
 	 *
-	 * Rows are the allowed query positions at u, columns those at v, i.e.
-	 * the pos_range windows [j_min - k, j_max + k + 1] clamped to
-	 * [0, |query|] (half-open). In effect, after the call
+	 * @p cost holds the allowed query positions at u (its clamped
+	 * pos_range window [j_min - k, j_max + k + 1] over [0, |query|]);
+	 * the returned row holds those at v, i.e. v's window. The row is
+	 * computed by a single left-to-right sweep over query positions b
+	 * with the recurrence
+	 *   out(b) = min( out(b - 1) + ins(query[b - 1]),
+	 *                 in(b) + del(base_v),
+	 *                 in(b - 1) + consume(base_v, query[b - 1]) )
+	 * where in(b) is the cost at (u, b), starting from prev == INF at
+	 * b - 1 < the sweep start. The insert term chains insertions at v,
+	 * the delete term realizes the bare edge, and the consume term is a
+	 * match or substitution of query[b - 1]. Columns b < lo_u come out
+	 * DistMatrix::INF since no source position realizes them. In effect,
+	 * after the call
 	 *   out(b) = min_a cost(a) + ed(u, 1, a, b)
 	 * for the one-edge chain landing on v.
 	 *
@@ -160,7 +170,38 @@ public:
 	 */
 	std::vector<int> step(node_id u, node_id v,
 	                      const std::vector<int> &cost) const {
-		return edge_matrix(u, v).min_plus_apply(cost);
+		const auto [lo_u, hi_u] = window(u);
+		const auto [lo_v, hi_v] = window(v);
+		if (cost.size() != static_cast<std::size_t>(hi_u - lo_u))
+			throw std::invalid_argument(
+			    "BinaryLifter::step: cost size does not match u's window");
+		const char base_v = graph.node(v).base;
+		const int del_v = cost_model.del(base_v);
+		// The sweep starts before both windows so that source positions
+		// a in [lo_u, lo_v) seed out(lo_v) through chained insertions;
+		// columns below lo_v are computed as seeds only and discarded.
+		const long b0 = std::min(lo_u, lo_v);
+		std::vector<int> out(static_cast<std::size_t>(hi_v - lo_v),
+		                     DistMatrix::INF);
+		long prev = DistMatrix::INF; // out(b - 1)
+		for (long b = b0; b < hi_v; ++b) {
+			long cur = DistMatrix::INF;
+			if (lo_u <= b && b < hi_u) // delete base_v: (u, b) -> (v, b)
+				cur = static_cast<long>(cost[b - lo_u]) + del_v;
+			if (prev < DistMatrix::INF) // insert query[b - 1] at v
+				cur = std::min(cur, prev + cost_model.ins(query[b - 1]));
+			if (lo_u <= b - 1 && b - 1 < hi_u) // match / substitute
+				cur = std::min(cur, static_cast<long>(cost[b - 1 - lo_u]) +
+				                        cost_model.consume(base_v,
+				                                           query[b - 1]));
+			if (cur > DistMatrix::INF)
+				cur = DistMatrix::INF;
+			prev = cur;
+			if (b >= lo_v)
+				out[static_cast<std::size_t>(b - lo_v)] =
+				    static_cast<int>(cur);
+		}
+		return out;
 	}
 
 private:
@@ -168,6 +209,9 @@ private:
 	 * @brief The DistMatrix of the single edge (u, v): ed(u, 1, a, b)
 	 *        between the one-edge chain landing on v and the query
 	 *        interval [a, b].
+	 *
+	 * Used only at construction, to build the level-0 chain tables;
+	 * step() applies the same transition directly without the matrix.
 	 *
 	 * Rows are the allowed query positions at u, columns those at v, i.e.
 	 * the pos_range windows [j_min - k, j_max + k + 1] clamped to
