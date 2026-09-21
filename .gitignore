@@ -78,3 +78,6 @@ tests/testcases/datasets/derived/*
 !tests/testcases/datasets/derived/.gitkeep
 tests/testcases/datasets/logs/*
 !tests/testcases/datasets/logs/.gitkeep
+
+# Vendored dependencies (local clones)
+third_party/*

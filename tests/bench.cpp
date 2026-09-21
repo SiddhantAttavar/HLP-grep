@@ -24,6 +24,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+// WFA2-lib headers are C-only (no extern "C" inside): wrap the inclusion.
+#ifdef HLP_GREP_WITH_WFA2
+extern "C" {
+#include <wavefront/wavefront_align.h>
+#include <wavefront/wavefront_attributes.h>
+}
+#endif
+
+#ifdef HLP_GREP_WITH_DT_PATRICIA
+#include <dt_patricia/dt_patricia.hpp>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -35,6 +47,8 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <cctype>
 #include <utility>
 #include <vector>
 
@@ -103,6 +117,19 @@ void report_query(int fd, std::size_t index, int k,
 	                  std::to_string(results.size()) + "\n");
 }
 
+#ifdef HLP_GREP_WITH_DT_PATRICIA
+/** Converts DT-Patricia results into library Result records. */
+std::vector<Result> from_dt_patricia(
+    const std::vector<dt_patricia::AlignmentResult> &rs) {
+	std::vector<Result> out;
+	out.reserve(rs.size());
+	for (const auto &r : rs)
+		out.push_back({static_cast<std::size_t>(r.string_id),
+		               static_cast<int>(r.score)});
+	return out;
+}
+#endif
+
 /**
  * @brief Runs the selected method and streams per-query records to @p fd.
  *
@@ -124,6 +151,125 @@ void run_method(int fd, const std::string &method, const Testcase &tc) {
 			const auto e = std::chrono::steady_clock::now();
 			report_query(fd, i, k, results, b, e);
 		}
+#ifdef HLP_GREP_WITH_WFA2
+	} else if (method == "wfa") {
+		// Threshold edit distance search with WFA2-lib: align the query
+		// against every dictionary sequence (Levenshtein distance via the
+		// built-in edit metric) and keep scores <= k. No index to build;
+		// the aligner is reused across pairs. Requires the unit-cost
+		// model (validated in the parent process).
+		//
+		// Early stopping: in the edit metric the wavefront count equals
+		// the score, so capping the aligner at k + 1 alignment steps
+		// (wavefronts) aborts every pair whose edit distance exceeds k:
+		// pairs with dist <= k always complete a full alignment within
+		// the cap, while the rest return WF_STATUS_MAX_STEPS_REACHED
+		// without the work of walking to their final score.
+		write_all(fd, "BUILD 0\n");
+
+		wavefront_aligner_attr_t attributes = wavefront_aligner_attr_default;
+		attributes.distance_metric = edit;
+		attributes.alignment_scope = compute_score;
+		attributes.memory_mode = wavefront_memory_high;
+		wavefront_aligner_t *wf = wavefront_aligner_new(&attributes);
+		if (wf == nullptr)
+			::_exit(1);
+
+		const auto report_candidates = [&](const std::string &query, int k) {
+			wavefront_aligner_set_max_alignment_steps(wf, k + 1);
+			std::vector<Result> results;
+			for (std::size_t i = 0; i < tc.dict.size(); ++i) {
+				const std::string &seq = tc.dict[i];
+				if (std::abs(static_cast<long>(seq.size()) -
+				             static_cast<long>(query.size())) > k)
+					continue;
+				const int status =
+				    wavefront_align(wf, query.data(),
+				                    static_cast<int>(query.size()),
+				                    seq.data(), static_cast<int>(seq.size()));
+				if (status == WF_STATUS_MAX_STEPS_REACHED) {
+					continue; // edit distance exceeds k: threshold-pruned
+				}
+				if (status != WF_STATUS_ALG_COMPLETED &&
+				    status != WF_STATUS_ALG_PARTIAL)
+					::_exit(1);
+				const int dist = wf->cigar->score;
+				if (dist >= 0 && dist <= k)
+					results.push_back({i, dist});
+			}
+			return results;
+		};
+
+		for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+			const auto [k, query] = tc.queries[i];
+			const auto b = std::chrono::steady_clock::now();
+			const auto results = report_candidates(query, k);
+			const auto e = std::chrono::steady_clock::now();
+			report_query(fd, i, k, results, b, e);
+		}
+		wavefront_aligner_delete(wf);
+#endif
+#ifdef HLP_GREP_WITH_DT_PATRICIA
+	} else if (method == "dt_patricia") {
+		// DT-Patricia: exact threshold edit distance search over a
+		// Patricia tree with the diagonal-transition algorithm. The tree
+		// is a shared-prefix index, so its construction cost is the
+		// method's build time (unlike naive/wfa). Unit-cost model and
+		// a supported alphabet (DNA ACGT or the 20 protein letters)
+		// are validated in the parent process.
+		using namespace dt_patricia;
+
+		// The alphabet policy must cover every testcase character.
+		const auto is_dna = [&] {
+			for (const char c : tc.alphabet)
+				if (std::string_view("ACGT").find(c) == std::string_view::npos)
+					return false;
+			return true;
+		}();
+
+		const auto build_b = std::chrono::steady_clock::now();
+		if (is_dna) {
+			PatriciaTree<DnaAlphabet> tree(tc.dict);
+			DTPatricia<DnaAlphabet, UnitCost> aligner(tree);
+			const auto build_e = std::chrono::steady_clock::now();
+			write_all(fd, "BUILD " +
+			                  std::to_string(elapsed_ms(build_b, build_e)) +
+			                  "\n");
+
+			for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+				const auto [k, query] = tc.queries[i];
+				const auto b = std::chrono::steady_clock::now();
+				auto results = aligner.ed_within_k(query, k);
+				std::sort(results.begin(), results.end(),
+				          [](const AlignmentResult &a,
+				             const AlignmentResult &b) {
+					          return a.string_id < b.string_id;
+				          });
+				const auto e = std::chrono::steady_clock::now();
+				report_query(fd, i, k, from_dt_patricia(results), b, e);
+			}
+		} else {
+			PatriciaTree<ProteinAlphabet> tree(tc.dict);
+			DTPatricia<ProteinAlphabet, UnitCost> aligner(tree);
+			const auto build_e = std::chrono::steady_clock::now();
+			write_all(fd, "BUILD " +
+			                  std::to_string(elapsed_ms(build_b, build_e)) +
+			                  "\n");
+
+			for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+				const auto [k, query] = tc.queries[i];
+				const auto b = std::chrono::steady_clock::now();
+				auto results = aligner.ed_within_k(query, k);
+				std::sort(results.begin(), results.end(),
+				          [](const AlignmentResult &a,
+				             const AlignmentResult &b) {
+					          return a.string_id < b.string_id;
+				          });
+				const auto e = std::chrono::steady_clock::now();
+				report_query(fd, i, k, from_dt_patricia(results), b, e);
+			}
+		}
+#endif
 	} else { // naive: no index to build.
 		write_all(fd, "BUILD 0\n");
 
@@ -225,9 +371,36 @@ std::optional<MethodRun> measure_method(const std::string &method,
 
 [[noreturn]] void usage(const char *argv0) {
 	std::cerr << "usage: " << argv0
-	          << " --method hlp_grep [--method naive ...] <testcase-file>"
-	          << " [--out out.json]\n";
+	          << " --method hlp_grep [--method naive|wfa|dt_patricia ...]"
+	          << " <testcase-file> [--out out.json]\n";
 	std::exit(1);
+}
+
+/** True when the model is unary unit-cost (WFA2 edit metric). */
+bool unit_cost_model(const Testcase &tc) {	const std::string &alpha = tc.alphabet;
+	for (const char a : alpha) {
+		if (tc.cost->ins(a) != 1 || tc.cost->del(a) != 1)
+			return false;
+		for (const char b : alpha) {
+			const int g = tc.cost->consume(a, b);
+			if (a == b ? g != 0 : g != 1)
+				return false;
+		}
+	}
+	return true;
+}
+
+/** True when every alphabet character maps in the chosen policy sets. */
+bool supported_alphabet(const Testcase &tc) {
+	for (const char c : tc.alphabet) {
+		const char up = static_cast<char>(std::toupper(
+		    static_cast<unsigned char>(c)));
+		if (std::string_view("ACGT").find(up) == std::string_view::npos &&
+		    std::string_view("ACDEFGHIKLMNPQRSTVWY").find(up) ==
+		        std::string_view::npos)
+			return false;
+	}
+	return true;
 }
 
 } // namespace
@@ -257,11 +430,30 @@ int main(int argc, char **argv) {
 		usage(argv[0]);
 	}
 	for (const auto &method : method_names) {
-		if (method != "hlp_grep" && method != "naive") {
+		if (method != "hlp_grep" && method != "naive" && method != "wfa" &&
+		    method != "dt_patricia") {
 			std::cerr << "unknown method: '" << method << "'\n";
 			usage(argv[0]);
 		}
 	}
+#ifndef HLP_GREP_WITH_WFA2
+	if (std::find(method_names.begin(), method_names.end(), "wfa")
+	    != method_names.end()) {
+		std::cerr << "method 'wfa' unavailable: bench was built without "
+		          << "WFA2 (tests/scripts/setup_wfa2.sh or cmake with "
+		          << "-DHLP_GREP_WITH_WFA2=OFF)\n";
+		return 1;
+	}
+#endif
+#ifndef HLP_GREP_WITH_DT_PATRICIA
+	if (std::find(method_names.begin(), method_names.end(), "dt_patricia")
+	    != method_names.end()) {
+		std::cerr << "method 'dt_patricia' unavailable: bench was built "
+		          << "without DT-Patricia (tests/scripts/setup_dt_patricia.sh "
+		          << "or cmake with -DHLP_GREP_WITH_DT_PATRICIA=OFF)\n";
+		return 1;
+	}
+#endif
 
 	if (testcase.empty()) {
 		std::cerr << "missing testcase file\n";
@@ -279,6 +471,29 @@ int main(int argc, char **argv) {
 	}
 
 	const Testcase tc = parse_testcase(file);
+
+	// WFA2 and DT-Patricia (as used here) implement the unit-cost
+	// Levenshtein distance only.
+	const bool wants_uniform = std::find(method_names.begin(),
+	                                     method_names.end(), "wfa")
+	                               != method_names.end()
+	                           || std::find(method_names.begin(),
+	                                        method_names.end(), "dt_patricia")
+	                                  != method_names.end();
+	if (wants_uniform && !unit_cost_model(tc)) {
+		std::cerr << "method(s) 'wfa'/'dt_patricia' require a unit-cost "
+		          << "model (match 0, ins/del/mismatch 1) but " << file
+		          << " uses a different cost model\n";
+		return 1;
+	}
+#ifdef HLP_GREP_WITH_DT_PATRICIA
+	if (wants_uniform && !supported_alphabet(tc)) {
+		std::cerr << "method(s) 'wfa'/'dt_patricia' require an alphabet "
+		          << "of DNA (ACGT) or protein (20 letters) characters; "
+		          << "testcase alphabet is '" << tc.alphabet << "'\n";
+		return 1;
+	}
+#endif
 
 	std::vector<MethodRun> runs;
 	for (const auto &method : method_names) {
