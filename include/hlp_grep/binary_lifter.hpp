@@ -77,17 +77,29 @@ public:
 		// single-edge blocks of the actual heavy outbound edges
 		// (ed(u, 1, a, b)); each higher level is the min-plus product of
 		// two adjacent level (t - 1) blocks sharing a chain midpoint.
+		// Level t of node u is computed only when u's heavy_length is a
+		// multiple of 2^t: the property is inherited by the two level
+		// (t - 1) halves (their chain lengths are heavy_length(u) and
+		// heavy_length(u) - 2^(t-1), both multiples of 2^(t-1)), so the
+		// products below only ever read blocks that were built. A chain
+		// of length L stores one block per power of two dividing one of
+		// its nodes' heavy lengths (~2L blocks in total), which bounds
+		// the whole table to O(V) matrices.
 		up_mat.assign(
 		    n, std::vector<DistMatrix>(max_level, DistMatrix(0, 0)));
 		for (std::size_t u = 0; u < n; ++u)
 			if (up[u][0].has_value())
 				up_mat[u][0] = edge_matrix(u, *up[u][0]);
-		for (std::size_t t = 1; t < max_level; ++t)
+		for (std::size_t t = 1; t < max_level; ++t) {
+			const std::size_t p = std::size_t{1} << t;
 			for (std::size_t u = 0; u < n; ++u)
-				if (up[u][t].has_value())
+				if (up[u][t].has_value() &&
+				    graph.node(u).heavy_length % p == 0)
 					up_mat[u][t] = DistMatrix::min_plus_product(
-					    up_mat[u][t - 1], up_mat[*up[u][t - 1]][t - 1],
+					    up_mat[u][t - 1],
+					    up_mat[*up[u][t - 1]][t - 1],
 					    cost_model.is_monge());
+		}
 	}
 
 	/**
@@ -98,10 +110,15 @@ public:
 	 * @p cost must hold one entry per allowed query position of the
 	 * start node — its clamped pos_range window [j_min - k, j_max + k + 1]
 	 * over [0, |query|]. It is advanced with DistMatrix::min_plus_apply
-	 * over the precomputed power-of-two chain blocks from the most
-	 * significant bit of l down, so the blocks apply in path order.
-	 * Afterwards @p cost holds one entry per allowed position of the
-	 * reached node. In effect, after the call
+	 * over precomputed power-of-two chain blocks chosen greedily: at each
+	 * node v with `rem` steps left, the block size is
+	 * 2^min(ctz(heavy_length(v)), floor(log2(rem))) — the smaller of the
+	 * lowest set bit of the node's heavy length and the highest set bit
+	 * of the remaining step count. The first term guarantees the block
+	 * was precomputed (level t exists exactly when 2^t divides the
+	 * heavy length), the second keeps the walked total at l; the blocks
+	 * apply in path order. Afterwards @p cost holds one entry per
+	 * allowed position of the reached node. In effect, after the call
 	 *   cost(b) = min_a cost_in(a) + ed(u, l, a, b)
 	 * for the chain [u, u^1, ..., u^l]. Cells no transition realizes
 	 * carry DistMatrix::INF, which dominates any real cost while keeping
@@ -124,15 +141,28 @@ public:
 		if (l == 0)
 			return u;
 		std::vector<int> row(cost);
-		for (std::size_t t = max_level; t-- > 0;) {
-			if (((l >> t) & 1) == 0)
-				continue;
-			if (!up[v][t].has_value())
+		std::size_t rem = static_cast<std::size_t>(l);
+		while (rem > 0) {
+			if (!graph.node(v).heavy_neighbour.has_value())
 				throw std::out_of_range(
 				    "BinaryLifter::jump: heavy chain too short");
-			row = up_mat[v][t].min_plus_apply(row,
-			                                  cost_model.is_monge());
-			v = *up[v][t];
+			// Block size 2^level: the smaller of the lowest set bit of
+			// the node's heavy length (guarantees the block exists) and
+			// the highest set bit of the remaining step count (keeps the
+			// walked total at l).
+			const std::size_t level =
+			    std::min(static_cast<unsigned long long>(
+			                 __builtin_ctzll(
+			                     graph.node(v).heavy_length)),
+			             static_cast<unsigned long long>(
+			                 63 - __builtin_clzll(rem)));
+			if (level >= max_level || !up[v][level].has_value())
+				throw std::out_of_range(
+				    "BinaryLifter::jump: heavy chain too short");
+			row = up_mat[v][level].min_plus_apply(row,
+			                                      cost_model.is_monge());
+			v = *up[v][level];
+			rem -= std::size_t{1} << level;
 		}
 		cost = std::move(row);
 		return v;

@@ -122,7 +122,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 	{
 		const auto &seed = graph.path(0);
 		std::set<POAGraph::node_id> on_seed(seed.begin(), seed.end());
-		std::size_t branching = 0, max_out = 0;
+		std::size_t branching = 0, max_out = 0, chain_nodes = 0, sinks = 0;
 		std::vector<std::size_t> outdeg(graph.num_nodes(), 0);
 		for (const auto &[u, v] : edges) {
 			(void)v;
@@ -131,12 +131,24 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 		for (const std::size_t d : outdeg) {
 			if (d > 1)
 				branching++;
+			if (d == 1)
+				chain_nodes++;
+			if (d == 0)
+				sinks++;
 			max_out = std::max(max_out, d);
 		}
+		const auto pct = [&graph](std::size_t c) {
+			return graph.num_nodes()
+			           ? 100.0 * c / graph.num_nodes()
+			           : 0.0;
+		};
 		std::cout << "  seed path: " << seed.size()
 		          << " nodes; nodes off the seed path: "
 		          << graph.num_nodes() - on_seed.size() << "\n"
 		          << "  branching nodes (out-degree > 1): " << branching
+		          << " (" << pct(branching) << "%), single-out-edge nodes: "
+		          << chain_nodes << " (" << pct(chain_nodes) << "%), sinks: "
+		          << sinks << " (" << pct(sinks) << "%)"
 		          << ", max out-degree: " << max_out << "\n";
 	}
 

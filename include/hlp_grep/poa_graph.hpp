@@ -73,6 +73,11 @@ public:
 		/// of build; valid only while the node's out-edge list is not
 		/// modified.
 		std::optional<node_id> heavy_neighbour;
+		/// Number of heavy edges reachable from this node by repeatedly
+		/// following the heavy outgoing edge (the length of the heavy chain
+		/// starting here). Computed in reverse topological order at the end
+		/// of build; 0 for nodes without a heavy outgoing edge.
+		std::size_t heavy_length = 0;
 	};
 
 	/**
@@ -330,6 +335,7 @@ private:
 
 		mark_heavy_edges();
 		compute_pos_ranges();
+		compute_heavy_lengths();
 	}
 
 	/** Creates a new node with base @p c at the end of the graph. */
@@ -805,6 +811,24 @@ private:
 			nodes[u].heavy_neighbour =
 			    heavy ? std::optional<node_id>(heavy->neighbor)
 			          : std::nullopt;
+		}
+	}
+
+	/**
+	 * @brief Computes Node::heavy_length for every node: the number of
+	 *        heavy edges reachable from the node by repeatedly following
+	 *        the heavy outgoing edge, i.e. the length of the heavy chain
+	 *        starting at that node. Nodes are processed in reverse
+	 *        topological order so each chain is resolved in one pass;
+	 *        nodes without a heavy outgoing edge get 0.
+	 */
+	void compute_heavy_lengths() {
+		for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+			Node &n = nodes[*it];
+			n.heavy_length =
+			    n.heavy_neighbour
+			        ? 1 + nodes[*n.heavy_neighbour].heavy_length
+			        : 0;
 		}
 	}
 
