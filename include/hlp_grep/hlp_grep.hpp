@@ -16,7 +16,6 @@
 #include <hlp_grep/result.hpp>
 
 #include <algorithm>
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,14 +41,14 @@ public:
 	 * @param dict Dictionary of DNA sequences to search. The position of each
 	 *             sequence in this vector defines the `id` reported in Result.
 	 * @param cost Cost model defining the costs of the basic edit operations;
-	 *             defaults to the unit-cost model. The solver clones the
-	 *             model, so it owns its own copy and there is no lifetime
-	 *             requirement on @p cost (temporaries are fine).
+	 *             defaults to the unit-cost model. The referenced model must
+	 *             outlive the solver.
 	 */
 	explicit Solver(std::vector<std::string> dict,
-	                const CostModel &cost = DEFAULT_COST_MODEL)
-	    : dict(std::move(dict)), cost(cost.clone()), graph(this->dict,
-	                                                        *this->cost) {
+	                const CostModel &cost = DEFAULT_COST_MODEL,
+	                bool compact_nodes = true)
+	    : dict(std::move(dict)), cost(cost), graph(this->dict, this->cost,
+	                                               compact_nodes) {
 		build_compressed_paths();
 	}
 
@@ -115,14 +114,13 @@ private:
 	/**
 	 * @brief Initial DP row at the start node of a compressed path.
 	 *
-	 * Row entries are the node's window positions, i.e. the number of
-	 * query characters already consumed arriving with the start node's
-	 * base already handled: that base is matched against some consumed
-	 * character or deleted, and every other consumed character is
-	 * inserted. Same recurrence style as BinaryLifter's single-edge
-	 * matrices. The window must match BinaryLifter::window (the start
-	 * node's base is never crossed by an edge, so no matrix can produce
-	 * this row).
+	 * Row entries are the node's window positions: the number of query
+	 * characters consumed before the start node's label begins. The
+	 * label is aligned as a block against some query substring ending at
+	 * b (matches, substitutions, and internal deletions via the ED
+	 * recurrence below), with every earlier query character inserted.
+	 * The window must match BinaryLifter::window (the start node's label
+	 * is never crossed by an edge, so no matrix can produce this row).
 	 *
 	 * @param start First node of the compressed path.
 	 * @param query Query string (may be empty).
@@ -134,43 +132,75 @@ private:
 		const auto [jmin, jmax] = graph.pos_range(start);
 		const long m = static_cast<long>(query.size());
 		const long mk = static_cast<long>(k);
-		const long lo = std::max(0L, static_cast<long>(jmin) - mk);
-		const long hi = std::min(m + 1, static_cast<long>(jmax) + mk + 2);
-
-		std::vector<int> row;
-		row.reserve(hi - lo);
-		// Running prefix data over the whole query; windows only decide
-		// which entries get recorded. The seed is INF (no consume seen
-		// yet); entries stay true transition costs and saturate at INF.
-		long best_alt =
-		    DistMatrix::INF; // min over j <= i of (consume_j - ins_j)
-		long sum_ins = 0;    // sum of insertion costs over query[0..i)
-		for (long i = 0; i < hi; ++i) {
-			if (i > 0) {
-				sum_ins += cost->ins(query[i - 1]);
-				best_alt = std::min(
-				    best_alt,
-				    static_cast<long>(
-				        cost->consume(graph.base(start),
-				                      query[i - 1])) -
-				        static_cast<long>(cost->ins(query[i - 1])));
+		const std::string &label = graph.seq(start);
+		const long label_len = static_cast<long>(label.size());
+		// After-label band of the start node: the output window, kept
+		// non-empty to match BinaryLifter::window (start nodes have
+		// jmin = 0, so this is [max(0, |label| - k), min(|query| + 1,
+		// jmax + |label| + k + 1))).
+		const long lo = std::max(0L, static_cast<long>(jmin) + label_len - mk);
+		const long hL =
+		    std::min(m + 1, static_cast<long>(jmax) + label_len + mk + 1);
+		const long hi = std::max(hL, lo + 1);
+		std::vector<int> row(static_cast<std::size_t>(hi - lo),
+		                     DistMatrix::INF);
+		// Semiglobal DP over (label prefix, query prefix): f[i][b] is the
+		// min cost of consuming the first i label characters against a
+		// query substring ending at b. Row 0 is the pure insertion prefix
+		// from the virtual source at position 0; each label character
+		// sweeps over its own band [max(0, jmin + i - k), min(m + 1,
+		// jmax + i + k + 1)) — mirroring BinaryLifter::sweep_label — so
+		// the work stays O(|label| * (spread + 2k)). Entries saturate at
+		// INF; when the after-label band is empty every band is, and the
+		// row stays all-INF.
+		if (lo >= hL)
+			return row;
+		const long l0 = std::max(0L, static_cast<long>(jmin) - mk);
+		const long h0 = std::min(m + 1, static_cast<long>(jmax) + mk + 1);
+		std::vector<long> f(static_cast<std::size_t>(hL - l0),
+		                    DistMatrix::INF);
+		// Virtual source at position 0 (start nodes have jmin = 0, so the
+		// seed sits at the entry band's bottom); chain insertions within
+		// the entry band [l0, h0).
+		f[0] = 0;
+		for (long b = 1; b < h0; ++b)
+			f[b - l0] = std::min(f[b - 1 - l0] + cost.ins(query[b - 1]),
+			                     static_cast<long>(DistMatrix::INF));
+		for (long i = 1; i <= label_len; ++i) {
+			const long li =
+			    std::max(0L, static_cast<long>(jmin) + i - mk);
+			const long hi_i =
+			    std::min(m + 1, static_cast<long>(jmax) + i + mk + 1);
+			const char c = label[i - 1];
+			const int del_c = cost.del(c);
+			long diag = li - 1 >= l0 ? f[li - 1 - l0] : DistMatrix::INF;
+			long left = DistMatrix::INF; // f[i][b - 1]: below-band at li
+			for (long b = li; b < hi_i; ++b) {
+				const long up = f[b - l0]; // f[i - 1][b]
+				long cur = up + del_c;
+				if (left < DistMatrix::INF)
+					cur = std::min(cur, left + cost.ins(query[b - 1]));
+				if (diag < DistMatrix::INF)
+					cur = std::min(cur,
+					               diag + cost.consume(c,
+					                                   query[b - 1]));
+				if (cur > DistMatrix::INF)
+					cur = DistMatrix::INF;
+				f[b - l0] = cur;
+				left = cur;
+				diag = up;
 			}
-			long cur = static_cast<long>(cost->del(graph.base(start))) +
-			           sum_ins;
-			if (i > 0)
-				cur = std::min(cur, best_alt + sum_ins);
-			if (cur > DistMatrix::INF)
-				cur = DistMatrix::INF;
-			if (i >= lo)
-				row.push_back(static_cast<int>(cur));
 		}
+		for (long b = lo; b < hi; ++b)
+			row[static_cast<std::size_t>(b - lo)] =
+			    static_cast<int>(f[b - l0]);
 		return row;
 	}
 
 	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
-	/// Owned clone of the cost model; polymorphic storage (Solver is the
-	/// only unique_ptr user) so it needs the manual deep-copy ctor above.
-	std::unique_ptr<CostModel> cost;
+	/// Cost model used for the edit distance computations; must outlive
+	/// the solver.
+	const CostModel &cost;
 	POAGraph graph;                ///< POA graph built from the dictionary.
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;

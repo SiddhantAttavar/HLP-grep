@@ -60,7 +60,7 @@ Report time_solver(const Testcase &tc, int reps) {
 	double best = std::numeric_limits<double>::infinity();
 	for (int r = 0; r < reps; ++r) {
 		const auto t0 = std::chrono::steady_clock::now();
-		Solver solver(tc.dict, *tc.cost);
+		Solver solver(tc.dict, tc.cost);
 		const auto t1 = std::chrono::steady_clock::now();
 		best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
 	}
@@ -70,7 +70,7 @@ Report time_solver(const Testcase &tc, int reps) {
 
 /** Fills graph quality metrics and enforces the path-spelling invariant. */
 void measure_graph(const Testcase &tc, const fs::path &file, Report &rep) {
-	const POAGraph graph(tc.dict, *tc.cost);
+	const POAGraph graph(tc.dict, tc.cost);
 	rep.nodes = graph.num_nodes();
 	std::unordered_set<std::uint64_t> edges;
 	double spread_sum = 0;
@@ -81,7 +81,7 @@ void measure_graph(const Testcase &tc, const fs::path &file, Report &rep) {
 		std::string spelled;
 		for (std::size_t i = 0; i < path.size(); ++i) {
 			check(path[i] < graph.num_nodes(), "node id out of range");
-			spelled += graph.base(path[i]);
+			spelled += graph.seq(path[i]);
 			if (i > 0)
 				edges.insert(static_cast<std::uint64_t>(path[i - 1]) << 32 |
 				             static_cast<std::uint64_t>(path[i]));
@@ -104,7 +104,7 @@ void measure_graph(const Testcase &tc, const fs::path &file, Report &rep) {
 
 /** Serializes all query results for the run's single band config. */
 std::string fingerprint_queries(const Testcase &tc) {
-	const Solver solver(tc.dict, *tc.cost);
+	const Solver solver(tc.dict, tc.cost);
 	std::string finger;
 	for (const auto &[k, query] : tc.queries) {
 		const auto results = solver.query(query, k);

@@ -24,10 +24,12 @@ namespace hlp_grep {
 /**
  * @brief A POA (partial order alignment) graph of a sequence dictionary.
  *
- * Nodes represent aligned bases, edges are classified heavy/light by
+ * Nodes represent aligned base runs, edges are classified heavy/light by
  * visiting frequencies, and each dictionary sequence is represented
- * as a path through the graph. The DAG is kept in a topological order
- * maintained by the graph.
+ * as a path through the graph. After construction, maximal runs of
+ * single-in/single-out nodes are compacted into single multi-character
+ * nodes (see compact_chain_nodes()); paths are stored over the compacted
+ * nodes. The DAG is kept in a topological order maintained by the graph.
  */
 class POAGraph {
 public:
@@ -59,15 +61,19 @@ public:
 	};
 
 	/**
-	 * @brief A node of the graph: its base character and the range of
-	 *        offsets at which it occurs among the sequence paths passing
-	 *        through it (j_min / j_max). Offsets use
+	 * @brief A node of the graph: the base-run string it represents and
+	 *        the range of offsets at which it occurs among the sequence
+	 *        paths passing through it (j_min / j_max, counting bases
+	 *        consumed before the label starts). Offsets use
 	 *        START as a "never on a path" sentinel.
 	 */
 	struct Node {
-		char base = 0;            ///< Base character represented by this node.
-		std::size_t pos_min = 0;  ///< Minimum path offset through this node.
-		std::size_t pos_max = 0;  ///< Maximum path offset through this node.
+		/// String of bases represented by this node (a single base for
+		/// nodes that survived compaction unmerged; the concatenation of
+		/// a merged run otherwise).
+		std::string seq;
+		std::size_t pos_min = 0;  ///< Min bases consumed before the label.
+		std::size_t pos_max = 0;  ///< Max bases consumed before the label.
 		/// Destination node of the heaviest outgoing edge, or empty if the
 		/// node has no outgoing edges. Set by mark_heavy_edges() at the end
 		/// of build; valid only while the node's out-edge list is not
@@ -99,9 +105,10 @@ public:
 	 *             must outlive the graph.
 	 */
 	explicit POAGraph(const std::vector<std::string> &dict,
-	                  const CostModel &cost = DEFAULT_COST_MODEL)
+	                  const CostModel &cost = DEFAULT_COST_MODEL,
+	                  bool compact_nodes = true)
 	    : cost(cost) {
-		build(dict);
+		build(dict, compact_nodes);
 	}
 
 	/**
@@ -112,12 +119,12 @@ public:
 	}
 
 	/**
-	 * @brief Returns the base character represented by a node.
+	 * @brief Returns the string of bases represented by a node.
 	 *
 	 * @param u Node id.
 	 */
-	char base(node_id u) const {
-		return nodes[u].base;
+	const std::string &seq(node_id u) const {
+		return nodes[u].seq;
 	}
 
 	/**
@@ -170,15 +177,16 @@ public:
 	}
 
 	/**
-	 * @brief Position range of a node: (min, max) 0-based offsets of the node
+	 * @brief Position range of a node: (min, max) offsets of the node
 	 *        among the sequence paths passing through it, i.e. the
 	 *        j_min/j_max pair used to bound query
 	 *        precomputation windows to [j_min - k, j_max + k + 1] clamped
 	 *        to [0, |query|].
 	 *
-	 * The offset of a node in a path is its 0-based index along that path.
-	 * Both values equal SIZE_MAX for nodes on no stored path (an
-	 * empty dictionary sequence).
+	 * The offset of a node in a path is the number of bases consumed
+	 * before the node's label starts (the running sum of preceding
+	 * labels). Both values equal SIZE_MAX for nodes on no stored path
+	 * (an empty dictionary sequence).
 	 */
 	std::pair<std::size_t, std::size_t> pos_range(node_id u) const {
 		return {nodes[u].pos_min, nodes[u].pos_max};
@@ -289,8 +297,121 @@ private:
 
 	// -- construction ---------------------------------------------------------
 
-	/** Builds the graph from the dictionary, in input order. */
-	void build(const std::vector<std::string> &dict) {
+	/**
+	 * @brief Compacts maximal runs of single-in/single-out nodes into
+	 *        single multi-character nodes, after the last alignment.
+	 *
+	 * An edge (u, v) is contracted when
+	 *   - u has exactly one outgoing edge,
+	 *   - v has exactly one incoming edge,
+	 *   - v is the first node of no stored path (a path may begin
+	 *     mid-run via a deletion at the sequence start), and
+	 *   - v is the last node of no stored path (a path may end mid-run
+	 *     the same way).
+	 * The first two conditions keep the contraction from forcing extra
+	 * bases onto paths that enter or leave elsewhere; the last two keep
+	 * stored paths from being forced across label characters their
+	 * dictionary sequence does not contain. The run head is also left
+	 * unextended when a path ends on it, for the same reason.
+	 *
+	 * Merged nodes concatenate the run's labels; their in-edges are the
+	 * head's in-edges and their out-edges the tail's out-edges (both
+	 * remapped onto the new ids). Stored paths are rewritten over the new
+	 * ids with consecutive duplicates collapsed (the run's interior
+	 * nodes). The position ranges are left to compute_pos_ranges(), which
+	 * runs right after and yields exactly the merged head's old offsets
+	 * (every path through the run enters at the head).
+	 */
+	void compact_chain_nodes() {
+		const std::size_t V = nodes.size();
+		std::vector<char> is_start(V, 0), is_end(V, 0);
+		for (const auto &path : paths)
+			if (!path.empty()) {
+				is_start[path.front()] = 1;
+				is_end[path.back()] = 1;
+			}
+
+		// Greedy run walk: absorb the successor while the guards hold.
+		std::vector<node_id> run_end(V, START); // run head -> run tail
+		std::vector<node_id> run_head(V, START); // absorbed node -> head
+		std::vector<char> absorbed(V, 0);
+		for (std::size_t u = 0; u < V; ++u) {
+			if (absorbed[u])
+				continue;
+			node_id cur = u;
+			if (!is_end[u]) { // a path must not end mid-label
+				while (out_edges[cur].size() == 1) {
+					const node_id v = out_edges[cur][0].neighbor;
+					if (in_edges[v].size() != 1 || is_start[v] ||
+					    is_end[v])
+						break;
+					absorbed[v] = 1;
+					run_head[v] = u;
+					cur = v;
+				}
+			}
+			run_end[u] = cur;
+		}
+
+		// Assign new ids in discovery order and rebuild the arrays.
+		std::vector<node_id> new_id(V, START);
+		std::size_t n = 0;
+		for (std::size_t u = 0; u < V; ++u)
+			if (!absorbed[u])
+				new_id[u] = n++;
+		for (std::size_t u = 0; u < V; ++u)
+			if (absorbed[u])
+				new_id[u] = new_id[run_head[u]];
+		std::vector<Node> new_nodes;
+		new_nodes.reserve(n);
+		std::vector<std::vector<Edge>> new_out(n), new_in(n);
+		next_edge_id = 0;
+		for (std::size_t u = 0; u < V; ++u) {
+			if (absorbed[u])
+				continue;
+			const node_id h = new_id[u];
+			std::string label;
+			for (node_id x = u;; x = out_edges[x][0].neighbor) {
+				label += nodes[x].seq;
+				if (x == run_end[u])
+					break;
+			}
+			new_nodes.push_back({std::move(label), START, START});
+			for (const Edge &e : in_edges[u])
+				if (!absorbed[e.neighbor])
+					new_in[h].push_back(
+					    {EdgeType::LIGHT, new_id[e.neighbor],
+					     next_edge_id++});
+			for (const Edge &e : out_edges[run_end[u]])
+				if (!absorbed[e.neighbor])
+					new_out[h].push_back(
+					    {EdgeType::LIGHT, new_id[e.neighbor],
+					     next_edge_id++});
+		}
+		nodes = std::move(new_nodes);
+		out_edges = std::move(new_out);
+		in_edges = std::move(new_in);
+		for (auto &path : paths) {
+			std::vector<node_id> remapped;
+			remapped.reserve(path.size());
+			for (const node_id u : path) {
+				const node_id h = new_id[u];
+				if (!remapped.empty() && remapped.back() == h)
+					continue; // collapse run-internal hops
+				remapped.push_back(h);
+			}
+			path = std::move(remapped);
+		}
+		rebuild_topo();
+	}
+
+	/** Builds the graph from the dictionary, in input order.
+	 *
+	 * @param compact_nodes: whether to merge chains of single-in/
+	 * single-out nodes into multi-character nodes after the last
+	 * alignment (the run compaction pass; see compact_chain_nodes()).
+	 */
+	void build(const std::vector<std::string> &dict, bool compact_nodes = true) {
 		if (dict.empty())
 			return;
 
@@ -333,6 +454,8 @@ private:
 			band_w = std::max(band_w / 2, 1L);
 		}
 
+		if (compact_nodes)
+			compact_chain_nodes();
 		mark_heavy_edges();
 		compute_pos_ranges();
 		compute_heavy_lengths();
@@ -341,7 +464,7 @@ private:
 	/** Creates a new node with base @p c at the end of the graph. */
 	node_id append_node(char c) {
 		const node_id u = nodes.size();
-		nodes.push_back({c, START, START});
+		nodes.push_back({std::string(1, c), START, START});
 		out_edges.emplace_back();
 		in_edges.emplace_back();
 		return u;
@@ -350,17 +473,21 @@ private:
 	/**
 	 * @brief Extends Node::pos_min / Node::pos_max with one stored path.
 	 *
-	 * For every offset `j` of @p path, node `path[j]` gets
-	 * `pos_min = min(pos_min, j)` and `pos_max = max(pos_max, j)`.
-	 * Nodes skipped by the new path keep their previous ranges.
+	 * The offset of a node in a path is the number of bases consumed
+	 * before the node's label starts (the running sum of preceding
+	 * labels): node `path[j]` gets `pos_min = min(pos_min, offset_j)`
+	 * and `pos_max = max(pos_max, offset_j)`. Nodes skipped by the new
+	 * path keep their previous ranges.
 	 */
 	void update_pos_ranges(const std::vector<node_id> &path) {
-		for (std::size_t j = 0; j < path.size(); ++j) {
-			Node &n = nodes[path[j]];
-			if (n.pos_min == START || j < n.pos_min)
-				n.pos_min = j;
-			if (n.pos_max == START || j > n.pos_max)
-				n.pos_max = j;
+		std::size_t offset = 0;
+		for (const node_id u : path) {
+			Node &n = nodes[u];
+			if (n.pos_min == START || offset < n.pos_min)
+				n.pos_min = offset;
+			if (n.pos_max == START || offset > n.pos_max)
+				n.pos_max = offset;
+			offset += nodes[u].seq.size();
 		}
 	}
 
@@ -540,7 +667,7 @@ private:
 				continue; // column 0 out of band
 			int d = INF;
 			if (in_edges[topo[p]].empty()) {
-				d = cost.del(nodes[topo[p]].base);
+				d = cost.del(nodes[topo[p]].seq[0]);
 			} else {
 				for (const Edge &e : in_edges[topo[p]]) {
 					const node_id prow = row_of[e.neighbor];
@@ -548,7 +675,7 @@ private:
 						continue; // predecessor has no column 0
 					const int c =
 					    dp[row_off[prow]] +
-					    cost.del(nodes[topo[p]].base);
+					    cost.del(nodes[topo[p]].seq[0]);
 					if (c < d)
 						d = c;
 				}
@@ -586,7 +713,7 @@ private:
 					const int c =
 					    dp[row_off[prow] +
 					       static_cast<std::size_t>(il - lo[prow])] +
-					    cost.del(nodes[u].base);
+					    cost.del(nodes[u].seq[0]);
 					if (c < best || (c == best && bpri < 1)) {
 						best = c;
 						bop = DEL_CODE;
@@ -600,10 +727,10 @@ private:
 					const int c =
 					    dp[row_off[prow] +
 					       static_cast<std::size_t>(il - 1 - lo[prow])] +
-					    cost.consume(nodes[u].base, s[i - 1]);
+					    cost.consume(nodes[u].seq[0], s[i - 1]);
 					int pri = 2;
-					if (nodes[u].base == s[i - 1] &&
-					    cost.consume(nodes[u].base, s[i - 1]) == 0)
+					if (nodes[u].seq[0] == s[i - 1] &&
+					    cost.consume(nodes[u].seq[0], s[i - 1]) == 0)
 						pri = 3;
 					if (c < best || (c == best && bpri < pri)) {
 						best = c;
@@ -652,7 +779,7 @@ private:
 				pri = 1;
 				break;
 			case 3:
-				pri = (m > 0 && nodes[u].base == s[m - 1]) ? 3 : 2;
+				pri = (m > 0 && nodes[u].seq[0] == s[m - 1]) ? 3 : 2;
 				break;
 			default:
 				break;
@@ -765,8 +892,9 @@ private:
 				break;
 			}
 			case AlignmentOp::Type::CONSUME: {
-				const node_id u = (nodes[a.node].base == a.ch) ? a.node
-				                                           : append_node(a.ch);
+				const node_id u = (nodes[a.node].seq[0] == a.ch)
+				                      ? a.node
+				                      : append_node(a.ch);
 				add_edge(prev, u);
 				path.push_back(u);
 				prev = u;
@@ -836,21 +964,25 @@ private:
 	 * @brief Computes Node::pos_min / Node::pos_max: for every node, the
 	 *        minimum and maximum offset at which the node occurs among the
 	 *        stored sequence paths (j_min / j_max).
-	 *        Offsets are 0-based positions along each path.
+	 *        Offsets count bases consumed before the node's label starts
+	 *        along each path (the running sum of preceding labels).
 	 */
 	void compute_pos_ranges() {
 		for (Node &n : nodes) {
 			n.pos_min = START;
 			n.pos_max = START;
 		}
-		for (const auto &path : paths)
-			for (std::size_t j = 0; j < path.size(); ++j) {
-				Node &n = nodes[path[j]];
-				if (n.pos_min == START || j < n.pos_min)
-					n.pos_min = j;
-				if (n.pos_max == START || j > n.pos_max)
-					n.pos_max = j;
+		for (const auto &path : paths) {
+			std::size_t offset = 0;
+			for (const node_id u : path) {
+				Node &n = nodes[u];
+				if (n.pos_min == START || offset < n.pos_min)
+					n.pos_min = offset;
+				if (n.pos_max == START || offset > n.pos_max)
+					n.pos_max = offset;
+				offset += nodes[u].seq.size();
 			}
+		}
 	}
 };
 

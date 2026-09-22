@@ -47,30 +47,53 @@ std::vector<int> initial_row(const POAGraph &graph, const CostModel &cost,
 	const auto [jmin, jmax] = graph.pos_range(start);
 	const long m = static_cast<long>(query.size());
 	const long mk = static_cast<long>(k);
-	const long lo = std::max(0L, static_cast<long>(jmin) - mk);
-	const long hi = std::min(m + 1, static_cast<long>(jmax) + mk + 2);
-
-	std::vector<int> row;
-	row.reserve(static_cast<std::size_t>(hi - lo));
-	long best_alt = DistMatrix::INF;
-	long sum_ins = 0;
-	for (long i = 0; i < hi; ++i) {
-		if (i > 0) {
-			sum_ins += cost.ins(query[i - 1]);
-			best_alt = std::min(
-			    best_alt,
-			    static_cast<long>(cost.consume(graph.base(start),
-			                                   query[i - 1])) -
-			        static_cast<long>(cost.ins(query[i - 1])));
+	const std::string &label = graph.seq(start);
+	const long label_len = static_cast<long>(label.size());
+	// After-label output window, kept non-empty; see Solver::initial_row.
+	const long lo = std::max(0L, static_cast<long>(jmin) + label_len - mk);
+	const long hL =
+	    std::min(m + 1, static_cast<long>(jmax) + label_len + mk + 1);
+	const long hi = std::max(hL, lo + 1);
+	std::vector<int> row(static_cast<std::size_t>(hi - lo),
+	                     DistMatrix::INF);
+	if (lo >= hL)
+		return row;
+	const long l0 = std::max(0L, static_cast<long>(jmin) - mk);
+	const long h0 = std::min(m + 1, static_cast<long>(jmax) + mk + 1);
+	// Semiglobal ED DP over the start node's label, each character swept
+	// over its own band; see Solver::initial_row and
+	// BinaryLifter::sweep_label.
+	std::vector<long> f(static_cast<std::size_t>(hL - l0), DistMatrix::INF);
+	f[0] = 0;
+	for (long b = 1; b < h0; ++b)
+		f[b - l0] = std::min(f[b - 1 - l0] + cost.ins(query[b - 1]),
+		                     static_cast<long>(DistMatrix::INF));
+	for (long i = 1; i <= label_len; ++i) {
+		const long li = std::max(0L, static_cast<long>(jmin) + i - mk);
+		const long hi_i =
+		    std::min(m + 1, static_cast<long>(jmax) + i + mk + 1);
+		const char c = label[i - 1];
+		const int del_c = cost.del(c);
+		long diag = li - 1 >= l0 ? f[li - 1 - l0] : DistMatrix::INF;
+		long left = DistMatrix::INF;
+		for (long b = li; b < hi_i; ++b) {
+			const long up = f[b - l0];
+			long cur = up + del_c;
+			if (left < DistMatrix::INF)
+				cur = std::min(cur, left + cost.ins(query[b - 1]));
+			if (diag < DistMatrix::INF)
+				cur = std::min(cur,
+				               diag + cost.consume(c, query[b - 1]));
+			if (cur > DistMatrix::INF)
+				cur = DistMatrix::INF;
+			f[b - l0] = cur;
+			left = cur;
+			diag = up;
 		}
-		long cur = static_cast<long>(cost.del(graph.base(start))) + sum_ins;
-		if (i > 0)
-			cur = std::min(cur, best_alt + sum_ins);
-		if (cur > DistMatrix::INF)
-			cur = DistMatrix::INF;
-		if (i >= lo)
-			row.push_back(static_cast<int>(cur));
 	}
+	for (long b = lo; b < hi; ++b)
+		row[static_cast<std::size_t>(b - lo)] =
+		    static_cast<int>(f[b - l0]);
 	return row;
 }
 
@@ -89,7 +112,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 		return;
 	}
 
-	const POAGraph graph(tc.dict, *tc.cost);
+	const POAGraph graph(tc.dict, tc.cost);
 	const std::size_t n = graph.num_nodes();
 	std::size_t max_level = 0;
 	while ((std::size_t{1} << max_level) <= n)
@@ -158,13 +181,17 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 	};
 
 	// Window width of a node under the first (probe) query; mirrors
-	// BinaryLifter::window with (k0, m0).
+	// BinaryLifter::window with (k0, m0): the after-label band
+	// [jmin + |label| - k, jmin ... jmax + |label| + k + 1), clamped to
+	// [0, m0] and kept non-empty.
 	auto window_width = [&](std::size_t u) -> std::size_t {
 		const auto [jmin, jmax] = graph.pos_range(u);
-		const long lo = std::max(0L, static_cast<long>(jmin) -
+		const long label = static_cast<long>(graph.seq(u).size());
+		const long lo = std::max(0L, static_cast<long>(jmin) + label -
 		                              static_cast<long>(k0));
-		const long hi = std::min(m0 + 1, static_cast<long>(jmax) +
-		                            static_cast<long>(k0) + 2);
+		const long hi =
+		    std::min(m0 + 1, static_cast<long>(jmax) + label +
+		                         static_cast<long>(k0) + 1);
 		return static_cast<std::size_t>(std::max(hi, lo + 1) - lo);
 	};
 
@@ -195,7 +222,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 			if (std::abs(static_cast<long>(tc.dict[i].size()) - m) > k)
 				continue;
 			const auto &cp = graph.compressed_path(i);
-			std::vector<int> row = initial_row(graph, *tc.cost, cp.start,
+			std::vector<int> row = initial_row(graph, tc.cost, cp.start,
 			                                   query, k);
 			POAGraph::node_id cur = cp.start;
 			for (const auto &st : cp.steps) {

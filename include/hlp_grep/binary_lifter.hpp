@@ -48,9 +48,10 @@ public:
 	 * no topological order is needed.
 	 *
 	 * The chain tables are built right after: level 0 holds the
-	 * single-edge blocks of the actual heavy outgoing edges
-	 * (ed(u, 1, a, b)), and each higher level is the min-plus product of
-	 * two adjacent level (t - 1) blocks sharing a chain midpoint.
+	 * per-edge blocks of the actual heavy outgoing edges (the edge
+	 * transition plus the destination node's label), and each higher
+	 * level is the min-plus product of two adjacent level (t - 1)
+	 * blocks sharing a chain midpoint.
 	 *
 	 * @param graph POAGraph whose heavy chains are indexed; must outlive
 	 *              this object and must not be modified while it is alive.
@@ -73,10 +74,11 @@ public:
 				if (up[u][t - 1])
 					up[u][t] = up[*up[u][t - 1]][t - 1];
 
-		// Per-level chain DistMatrix tables: level 0 holds the
-		// single-edge blocks of the actual heavy outbound edges
-		// (ed(u, 1, a, b)); each higher level is the min-plus product of
-		// two adjacent level (t - 1) blocks sharing a chain midpoint.
+		// Per-level chain DistMatrix tables: level 0 holds the per-edge
+		// blocks of the actual heavy outbound edges — the transition
+		// across the edge (u, v) followed by v's whole label. Each higher
+		// level is the min-plus product of two adjacent level (t - 1)
+		// blocks sharing a chain midpoint.
 		// Level t of node u is computed only when u's heavy_length is a
 		// multiple of 2^t: the property is inherited by the two level
 		// (t - 1) halves (their chain lengths are heavy_length(u) and
@@ -108,8 +110,8 @@ public:
 	 *        jumped chain.
 	 *
 	 * @p cost must hold one entry per allowed query position of the
-	 * start node — its clamped pos_range window [j_min - k, j_max + k + 1]
-	 * over [0, |query|]. It is advanced with DistMatrix::min_plus_apply
+	 * start node — its after-label window (see window()). It is advanced
+	 * with DistMatrix::min_plus_apply
 	 * over precomputed power-of-two chain blocks chosen greedily: at each
 	 * node v with `rem` steps left, the block size is
 	 * 2^min(ctz(heavy_length(v)), floor(log2(rem))) — the smaller of the
@@ -120,9 +122,10 @@ public:
 	 * apply in path order. Afterwards @p cost holds one entry per
 	 * allowed position of the reached node. In effect, after the call
 	 *   cost(b) = min_a cost_in(a) + ed(u, l, a, b)
-	 * for the chain [u, u^1, ..., u^l]. Cells no transition realizes
-	 * carry DistMatrix::INF, which dominates any real cost while keeping
-	 * every entry within the saturating product's overflow-free range.
+	 * for the chain [u, u^1, ..., u^l] (each heavy edge crossing its
+	 * destination node's full label). Cells no transition realizes carry
+	 * DistMatrix::INF, which dominates any real cost while keeping every
+	 * entry within the saturating product's overflow-free range.
 	 *
 	 * @param u    Node to start from.
 	 * @param l    Number of heavy steps to walk.
@@ -170,24 +173,27 @@ public:
 
 	/**
 	 * @brief Steps a DP row across the single edge (u, v): applies the
-	 *        one-edge transition directly and returns the advanced row.
+	 *        edge transition plus v's whole label directly to the input
+	 *        row and returns the advanced row.
 	 *
-	 * @p cost holds the allowed query positions at u (its clamped
-	 * pos_range window [j_min - k, j_max + k + 1] over [0, |query|]);
-	 * the returned row holds those at v, i.e. v's window. The row is
-	 * computed by a single left-to-right sweep over query positions b
-	 * with the recurrence
-	 *   out(b) = min( out(b - 1) + ins(query[b - 1]),
-	 *                 in(b) + del(base_v),
-	 *                 in(b - 1) + consume(base_v, query[b - 1]) )
-	 * where in(b) is the cost at (u, b), starting from prev == INF at
-	 * b - 1 < the sweep start. The insert term chains insertions at v,
-	 * the delete term realizes the bare edge, and the consume term is a
-	 * match or substitution of query[b - 1]. Columns b < lo_u come out
-	 * DistMatrix::INF since no source position realizes them. In effect,
-	 * after the call
-	 *   out(b) = min_a cost(a) + ed(u, 1, a, b)
-	 * for the one-edge chain landing on v.
+	 * @p cost holds the allowed query positions at u (its after-label
+	 * window, see window()); the returned row holds those at v. The row
+	 * is computed by a semiglobal ED DP that superposes all source
+	 * positions: row 0 seeds the source costs within the entry band
+	 * window(v, 0) — sources below it die, since every continuation
+	 * leaves all bands — chained left to right with insertions, and
+	 * sweep_label() then advances each of v's label characters over its
+	 * own band window(v, j) with the recurrence
+	 *   f(i, b) = min( f(i - 1, b) + del(label[i - 1]),
+	 *                  f(i, b - 1) + ins(query[b - 1]),
+	 *                  f(i - 1, b - 1) + consume(label[i - 1],
+	 *                                             query[b - 1]) )
+	 * After |label| sweeps the row holds, at each b,
+	 *   out(b) = min_a cost(a) + ed(u, v, a, b)
+	 * — the exact min over all entry positions of the same transition
+	 * edge_matrix() materializes, without building the matrix, in
+	 * O(|label| * (spread + 2k) + |cost|) time. Row |label|'s band is
+	 * exactly v's window, so the output reads the swept cells directly.
 	 *
 	 * @param u    Source node of the edge.
 	 * @param v    Destination node of the edge.
@@ -205,132 +211,181 @@ public:
 		if (cost.size() != static_cast<std::size_t>(hi_u - lo_u))
 			throw std::invalid_argument(
 			    "BinaryLifter::step: cost size does not match u's window");
-		const char base_v = graph.node(v).base;
-		const int del_v = cost_model.del(base_v);
-		// The sweep starts before both windows so that source positions
-		// a in [lo_u, lo_v) seed out(lo_v) through chained insertions;
-		// columns below lo_v are computed as seeds only and discarded.
-		const long b0 = std::min(lo_u, lo_v);
+		const std::string &label = graph.seq(v);
 		std::vector<int> out(static_cast<std::size_t>(hi_v - lo_v),
 		                     DistMatrix::INF);
-		long prev = DistMatrix::INF; // out(b - 1)
-		for (long b = b0; b < hi_v; ++b) {
-			long cur = DistMatrix::INF;
-			if (lo_u <= b && b < hi_u) // delete base_v: (u, b) -> (v, b)
-				cur = static_cast<long>(cost[b - lo_u]) + del_v;
-			if (prev < DistMatrix::INF) // insert query[b - 1] at v
-				cur = std::min(cur, prev + cost_model.ins(query[b - 1]));
-			if (lo_u <= b - 1 && b - 1 < hi_u) // match / substitute
-				cur = std::min(cur, static_cast<long>(cost[b - 1 - lo_u]) +
-				                        cost_model.consume(base_v,
-				                                           query[b - 1]));
+		const auto [lL, hL] = window(v, static_cast<long>(label.size()));
+		if (lL >= hL)
+			return out; // final band empty: every crossing exceeds k
+		const auto [l0, h0] = window(v, 0);
+		std::vector<long> f(static_cast<std::size_t>(hL - l0),
+		                    DistMatrix::INF);
+		// Row 0: the source row clipped to the entry band, then chained
+		// with insertions at v. Sources outside [l0, h0) die: below the
+		// band every continuation leaves all bands, above it they start
+		// past the query (possible only for clamped all-INF rows).
+		for (long b = std::max(l0, lo_u); b < std::min(h0, hi_u); ++b)
+			f[b - l0] = cost[b - lo_u];
+		for (long b = l0 + 1; b < h0; ++b) {
+			const long prev = f[b - 1 - l0];
+			if (prev >= DistMatrix::INF)
+				continue;
+			long cur = prev + cost_model.ins(query[b - 1]);
 			if (cur > DistMatrix::INF)
 				cur = DistMatrix::INF;
-			prev = cur;
-			if (b >= lo_v)
-				out[static_cast<std::size_t>(b - lo_v)] =
-				    static_cast<int>(cur);
+			if (cur < f[b - l0])
+				f[b - l0] = cur;
 		}
+		sweep_label(v, f, l0);
+		for (long b = lo_v; b < hi_v; ++b)
+			out[static_cast<std::size_t>(b - lo_v)] =
+			    static_cast<int>(f[b - l0]);
 		return out;
 	}
 
 private:
 	/**
-	 * @brief The DistMatrix of the single edge (u, v): ed(u, 1, a, b)
-	 *        between the one-edge chain landing on v and the query
+	 * @brief The DistMatrix of the heavy edge (u, v): the transition
+	 *        across the edge followed by v's whole label, i.e.
+	 *        ed(u, v, a, b) between the edge landing on v and the query
 	 *        interval [a, b].
 	 *
 	 * Used only at construction, to build the level-0 chain tables;
 	 * step() applies the same transition directly without the matrix.
 	 *
 	 * Rows are the allowed query positions at u, columns those at v, i.e.
-	 * the pos_range windows [j_min - k, j_max + k + 1] clamped to
-	 * [0, |query|] (half-open). Entry (a, b) is the min cost to go from
-	 * DP state (u, a) to (v, b) across the edge, built left to right
-	 * along b with the recurrence
-	 *   mat(a, b) = min( mat(a, b - 1) + ins,
-	 *                    del + ins * (b - a),
-	 *                    match + ins * (b - a - 1) )
-	 * where the consume term is the running min of consume(base(v), query[j]) over
-	 * j in [a, b - 1]. Cells with b < a cannot be realized by any
-	 * transition; they take DistMatrix::INF, which keeps the stored
-	 * table Monge: every inequality corner involving an INF cell holds
-	 * trivially, so the realized Monge structure (guaranteed by
-	 * CostModel::is_monge) extends to the whole table.
+	 * the after-label windows of the two nodes (see window()). Entry
+	 * (a, b) is the min cost to go from DP state (u, a) to (v, b) — the
+	 * source position a seeds a semiglobal DP that aligns v's label
+	 * against query[a..b) with insertions, deletions, and consumes,
+	 * sweeping each label character over its own band window(v, j) so
+	 * the construction costs O(rows * |label| * (spread + 2k)) instead
+	 * of quadratic-in-|label| work. For a one-character label this
+	 * reduces to the closed single-edge form; in general the matrix
+	 * equals the min-plus product of the label's one-character
+	 * transitions restricted to the band rectangle, so it is Monge
+	 * whenever the cost model is (see CostModel::is_monge), with INF
+	 * cells (b < a, seeds below the entry band, band-infeasible states)
+	 * holding the inequalities trivially.
 	 */
 	DistMatrix edge_matrix(node_id u, node_id v) const {
 		const auto [lo_u, hi_u] = window(u);
 		const auto [lo_v, hi_v] = window(v);
-		const char base_v = graph.node(v).base;
+		const std::string &label = graph.seq(v);
 		DistMatrix mat(static_cast<std::size_t>(hi_u - lo_u),
 		               static_cast<std::size_t>(hi_v - lo_v),
 		               DistMatrix::INF);
-		const int del_v = cost_model.del(base_v);
+		const auto [lL, hL] = window(v, static_cast<long>(label.size()));
+		if (lL >= hL)
+			return mat; // final band empty: every crossing exceeds k
+		const auto [l0, h0] = window(v, 0);
+		// DP row over [l0, hL); band j of the label occupies
+		// window(v, j), and row L's band is exactly [lo_v, hi_v).
+		std::vector<long> f(static_cast<std::size_t>(hL - l0),
+		                    DistMatrix::INF);
 		for (long a = lo_u; a < hi_u; ++a) {
-			// Prefix data already accumulated for the source window: the
-			// cells realize transitions over query[a..b), so the insertion
-			// sums and consume candidates must start at position a even
-			// when the destination window begins at lo_v > a.
-			long best_alt =
-			    DistMatrix::INF; // min over j of (consume_j - ins_j)
-			long sum_ins = 0;    // sum of insertion costs over query[a..b)
-			for (long j = a; j < std::max(lo_v, a); ++j) {
-				const int ins_j = cost_model.ins(query[j]);
-				sum_ins += ins_j;
-				best_alt = std::min(
-				    best_alt,
-				    static_cast<long>(
-				        cost_model.consume(base_v, query[j])) -
-				        static_cast<long>(ins_j));
-			}
-			int prev = DistMatrix::INF;
-			for (long b = std::max(lo_v, a); b < hi_v; ++b) {
-				const int span = static_cast<int>(b - a);
-				int cur;
-				if (span > 0) {
-					const int ins_b = cost_model.ins(query[b - 1]);
-					sum_ins += ins_b;
-					best_alt = std::min(
-					    best_alt,
-					    static_cast<long>(
-					        cost_model.consume(base_v, query[b - 1])) -
-					        static_cast<long>(ins_b));
-					cur = std::min(
-					    static_cast<int>(del_v + sum_ins),
-					    std::min(static_cast<int>(best_alt + sum_ins),
-					             prev + ins_b));
-					if (cur > DistMatrix::INF)
-						cur = DistMatrix::INF;
-				} else {
-					cur = del_v; // delete base_v, insert nothing
-				}
+			if (a < l0 || a >= h0)
+				continue; // entry outside the seed band: no
+				          // transition survives the bands
+			std::fill(f.begin(), f.end(), DistMatrix::INF);
+			// Row 0: seed at a, chain insertions within the entry band.
+			f[a - l0] = 0;
+			for (long b = a + 1; b < h0; ++b)
+				f[b - l0] = std::min(
+				    f[b - 1 - l0] + cost_model.ins(query[b - 1]),
+				    static_cast<long>(DistMatrix::INF));
+			sweep_label(v, f, l0);
+			for (long b = std::max(a, lo_v); b < hi_v; ++b)
 				mat(static_cast<std::size_t>(a - lo_u),
-				    static_cast<std::size_t>(b - lo_v)) = cur;
-				prev = cur;
-			}
+				    static_cast<std::size_t>(b - lo_v)) =
+				    static_cast<int>(f[b - l0]);
 		}
 		return mat;
 	}
 
 	/**
+	 * @brief Advances the DP row @p f across v's whole label, sweeping
+	 *        each label character over its own band window(v, j).
+	 *
+	 * @p f holds one entry per position of [l0, hL) — the span from the
+	 * entry band's bottom window(v, 0).lo to the after-label band's top
+	 * window(v, |label|).hi — and its row 0 must already hold the entry
+	 * states (seeds or source costs, insertion-chained within the entry
+	 * band). Afterwards f holds the after-label states: row |label|'s
+	 * band is exactly the node window [window(v).lo, window(v).hi).
+	 * Cells a band never covers stay INF; they are below-band states
+	 * whose continuations all exceed the threshold k.
+	 */
+	void sweep_label(node_id v, std::vector<long> &f, long l0) const {
+		const std::string &label = graph.seq(v);
+		for (long j = 1; j <= static_cast<long>(label.size()); ++j) {
+			const auto [lj, hj] = window(v, j);
+			const char c = label[j - 1];
+			const int del_c = cost_model.del(c);
+			// f(j - 1, lj - 1): the band bottom's diagonal source; INF
+			// when the bands are clamped apart (no query char there).
+			long diag = lj - 1 >= l0 ? f[lj - 1 - l0] : DistMatrix::INF;
+			long left = DistMatrix::INF; // f(j, b - 1): below-band at lj
+			for (long b = lj; b < hj; ++b) {
+				const char qb = query[b - 1];
+				const long up = f[b - l0]; // f(j - 1, b)
+				long cur = up + del_c;
+				if (left < DistMatrix::INF)
+					cur = std::min(cur, left + cost_model.ins(qb));
+				if (diag < DistMatrix::INF)
+					cur = std::min(cur, diag + cost_model.consume(c, qb));
+				if (cur > DistMatrix::INF)
+					cur = DistMatrix::INF;
+				f[b - l0] = cur;
+				left = cur;
+				diag = up;
+			}
+		}
+	}
+
+	/**
 	 * @brief Half-open [lo, hi) window of query positions allowed at a
-	 *        node under the stored query context: [j_min - k, j_max + k + 1]
-	 *        clamped to [0, |query|] (pos_range shifted by k and clamped).
-	 *        The upper end includes position |query| (all query characters
-	 *        consumed), which Solver::query reads as the final row's last
-	 *        entry for any path matched within k.
+	 *        node under the stored query context: the after-label band
+	 *        window(u, |label|) (see the offset overload), with the
+	 *        lower end clamped to a non-empty range. The upper end
+	 *        includes position |query| (all query characters consumed),
+	 *        which Solver::query reads as the final row's last entry for
+	 *        any path matched within k.
+	 *
+	 * The non-empty clamp keeps matrix dimensions positive for nodes
+	 * whose feasible band lies entirely outside [0, |query|]: their rows
+	 * carry valid (large) transition values only.
 	 */
 	std::pair<long, long> window(node_id u) const {
+		const auto [lo, hi] =
+		    window(u, static_cast<long>(graph.seq(u).size()));
+		return {lo, std::max(hi, lo + 1)};
+	}
+
+	/**
+	 * @brief Half-open [lo, hi) band of query positions feasible at the
+	 *        state @p offset label characters into u's label (offset 0 =
+	 *        before the label, |label| = after it): the node occurs at
+	 *        path offsets j_min + offset .. j_max + offset (bases
+	 *        consumed up to that state), and any alignment of cost <= k
+	 *        satisfies |b - consumed| <= k, so the band is
+	 *        [j_min + offset - k, j_max + offset + k + 1) clamped to
+	 *        [0, |query|]. Width spread + 2k + 1, independent of the
+	 *        label length — sweeping each label character over its own
+	 *        band keeps the DP linear in |label| times the window width.
+	 *        The band may be empty (label running past |query|); the
+	 *        bands of consecutive offsets overlap so that transitions
+	 *        between them stay covered.
+	 */
+	std::pair<long, long> window(node_id u, long offset) const {
 		const auto [jmin, jmax] = graph.pos_range(u);
 		const long mk = static_cast<long>(k);
 		const long m = static_cast<long>(query.size());
-		const long lo = std::max(0L, static_cast<long>(jmin) - mk);
-		const long hi = std::min(m + 1, static_cast<long>(jmax) + mk + 2);
-		// Nodes outside every threshold-feasible path (their pos_range
-		// window lies entirely above |query|) would otherwise get an empty
-		// window, which corrupts the chain-table products at construction.
-		// Their rows carry valid (large) transition values only.
-		return {lo, std::max(hi, lo + 1)};
+		const long lo =
+		    std::max(0L, static_cast<long>(jmin) + offset - mk);
+		const long hi =
+		    std::min(m + 1, static_cast<long>(jmax) + offset + mk + 1);
+		return {lo, hi};
 	}
 
 	/// Graph the lifter was built from; its heavy edges must not be
@@ -338,7 +393,6 @@ private:
 	const POAGraph &graph;
 	/// Query string the chain tables were built for.
 	std::string query;
-	/// Cost model snapshotted from the graph at construction.
 	/// Cost model referenced from the graph; must outlive the lifter.
 	const CostModel &cost_model;
 	/// Edit distance threshold the chain tables were built with; cells

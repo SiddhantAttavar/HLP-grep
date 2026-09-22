@@ -136,10 +136,11 @@ std::vector<Result> from_dt_patricia(
  * First line: `BUILD <build_ms>`; then one `QUERY <index> <k> <ms> <hash>
  * <matches>` line per query, in testcase order.
  */
-void run_method(int fd, const std::string &method, const Testcase &tc) {
+void run_method(int fd, const std::string &method, const Testcase &tc,
+                bool compact_nodes) {
 	if (method == "hlp_grep") {
 		const auto build_b = std::chrono::steady_clock::now();
-		const Solver solver(tc.dict, *tc.cost);
+		const Solver solver(tc.dict, tc.cost, compact_nodes);
 		const auto build_e = std::chrono::steady_clock::now();
 		write_all(fd, "BUILD " + std::to_string(elapsed_ms(build_b, build_e)) +
 		                  "\n");
@@ -273,7 +274,7 @@ void run_method(int fd, const std::string &method, const Testcase &tc) {
 	} else { // naive: no index to build.
 		write_all(fd, "BUILD 0\n");
 
-		const NaiveSolver solver(tc.dict, *tc.cost, tc.alphabet);
+		const NaiveSolver solver(tc.dict, tc.cost, tc.alphabet);
 		for (std::size_t i = 0; i < tc.queries.size(); ++i) {
 			const auto [k, query] = tc.queries[i];
 			const auto b = std::chrono::steady_clock::now();
@@ -294,7 +295,8 @@ void run_method(int fd, const std::string &method, const Testcase &tc) {
  *         Reports failure on stderr and returns nullopt on any error.
  */
 std::optional<MethodRun> measure_method(const std::string &method,
-                                        const Testcase &tc) {
+                                        const Testcase &tc,
+                                        bool compact_nodes) {
 	int pipefd[2];
 	if (pipe(pipefd) != 0) {
 		std::cerr << "pipe() failed\n";
@@ -307,7 +309,7 @@ std::optional<MethodRun> measure_method(const std::string &method,
 	}
 	if (pid == 0) {
 		close(pipefd[0]);
-		run_method(pipefd[1], method, tc); // never returns
+		run_method(pipefd[1], method, tc, compact_nodes); // never returns
 	}
 	close(pipefd[1]);
 
@@ -372,17 +374,17 @@ std::optional<MethodRun> measure_method(const std::string &method,
 [[noreturn]] void usage(const char *argv0) {
 	std::cerr << "usage: " << argv0
 	          << " --method hlp_grep [--method naive|wfa|dt_patricia ...]"
-	          << " <testcase-file> [--out out.json]\n";
+	          << " <testcase-file> [--out out.json] [--no-compact]\n";
 	std::exit(1);
 }
 
 /** True when the model is unary unit-cost (WFA2 edit metric). */
 bool unit_cost_model(const Testcase &tc) {	const std::string &alpha = tc.alphabet;
 	for (const char a : alpha) {
-		if (tc.cost->ins(a) != 1 || tc.cost->del(a) != 1)
+		if (tc.cost.ins(a) != 1 || tc.cost.del(a) != 1)
 			return false;
 		for (const char b : alpha) {
-			const int g = tc.cost->consume(a, b);
+			const int g = tc.cost.consume(a, b);
 			if (a == b ? g != 0 : g != 1)
 				return false;
 		}
@@ -408,6 +410,7 @@ bool supported_alphabet(const Testcase &tc) {
 int main(int argc, char **argv) {
 	std::vector<std::string> method_names;
 	std::string testcase, out_path;
+	bool compact_nodes = true;
 	for (int i = 1; i < argc; ++i) {
 		const std::string arg = argv[i];
 		if (arg == "--method") {
@@ -418,6 +421,8 @@ int main(int argc, char **argv) {
 			if (i + 1 >= argc)
 				usage(argv[0]);
 			out_path = argv[++i];
+		} else if (arg == "--no-compact") {
+			compact_nodes = false; // POAGraph run compaction off
 		} else if (!arg.empty() && arg[0] != '-' && testcase.empty()) {
 			testcase = arg;
 		} else {
@@ -497,7 +502,7 @@ int main(int argc, char **argv) {
 
 	std::vector<MethodRun> runs;
 	for (const auto &method : method_names) {
-		auto run = measure_method(method, tc);
+		auto run = measure_method(method, tc, compact_nodes);
 		if (!run)
 			return 1;
 		runs.push_back(std::move(*run));
@@ -520,6 +525,7 @@ int main(int argc, char **argv) {
 	json << std::fixed << std::setprecision(6);
 	json << "{\n"
 	     << "  \"testcase\": \"" << file.string() << "\",\n"
+	     << "  \"compact_nodes\": " << (compact_nodes ? "true" : "false" ) << ",\n"
 	     << "  \"dict_size\": " << tc.dict.size() << ",\n"
 	     << "  \"num_queries\": " << tc.queries.size() << ",\n";
 	if (sorted.empty()) {

@@ -24,11 +24,11 @@ namespace {
 /**
  * @brief Minimum insertion/deletion and substitution costs of the model.
  *
- * Enumerates the full 256-byte domain (out-of-alphabet characters fall back
- * Characters outside the alphabet fall back to index 0 (i.e. alphabet[0]),
- * so scanning the testcase alphabet covers every table entry the DP can
- * ever use. The caller computes this once per query so no per-solver state
- * is needed.
+ * Scans the testcase alphabet, which covers every cost the DP can ever
+ * use since insertion/deletion costs are character-independent and
+ * substitution costs only distinguish equal from distinct characters.
+ * The caller computes this once per query so no per-solver state is
+ * needed.
  */
 std::pair<int, int> model_mins(const CostModel &cost,
                                const std::string &alphabet) {
@@ -134,8 +134,8 @@ public:
 	 * @param cost Cost model defining the costs of the basic edit operations;
 	 *             defaults to the unit-cost model. The referenced model must
 	 *             outlive the solver.
-	 * @param alphabet Characters of the testcase alphabet, in matrix order;
-	 *             band parameters are derived from these characters only.
+	 * @param alphabet Characters of the testcase alphabet; band parameters
+	 *             are derived from these characters only.
 	 */
 	explicit NaiveSolver(std::vector<std::string> dict,
 	                     const CostModel &cost = DEFAULT_COST_MODEL,

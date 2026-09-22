@@ -31,7 +31,7 @@ using namespace hlp_grep;
 namespace {
 
 void solve_testcase(const fs::path &file, const Testcase &tc) {
-	const NaiveSolver solver(tc.dict, *tc.cost, tc.alphabet);
+	const NaiveSolver solver(tc.dict, tc.cost, tc.alphabet);
 
 	const fs::path out_path = solution_path(file);
 	std::ofstream out(out_path);

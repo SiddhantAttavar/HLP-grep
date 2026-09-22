@@ -44,7 +44,8 @@ std::string summary(const std::vector<std::size_t> &xs) {
 	          }());
 }
 
-void stats_testcase(const fs::path &file, const Testcase &tc) {
+void stats_testcase(const fs::path &file, const Testcase &tc,
+                    bool compact_nodes) {
 	std::cout << "=== " << file << " ===\n";
 
 	std::vector<std::size_t> seq_lens;
@@ -58,7 +59,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 
 	const std::chrono::steady_clock::time_point start =
 	    std::chrono::steady_clock::now();
-	const POAGraph graph(tc.dict, *tc.cost);
+	const POAGraph graph(tc.dict, tc.cost, compact_nodes);
 	const std::chrono::steady_clock::time_point end =
 	    std::chrono::steady_clock::now();
 
@@ -164,6 +165,35 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 	std::cout << "  node offset spread (pos_max - pos_min): "
 	          << summary(spreads) << "\n";
 
+	// Window outliers: nodes whose pos_range sentinel/garbage values would
+	// blow up the BinaryLifter window (its width would otherwise be
+	// clamp-wise proportional to the spread).
+	std::size_t wide_nodes = 0, start_nodes = 0;
+	std::size_t widest = 0;
+	POAGraph::node_id wide_id = 0;
+	std::pair<std::size_t, std::size_t> wide_range{0, 0};
+	for (std::size_t u = 0; u < graph.num_nodes(); ++u) {
+		const auto [lo, hi] = graph.pos_range(u);
+		if (lo == START) {
+			start_nodes++;
+			continue;
+		}
+		const std::size_t width = hi - lo;
+		if (width > widest) {
+			widest = width;
+			wide_id = u;
+			wide_range = {lo, hi};
+		}
+		if (width > 1000)
+			wide_nodes++;
+	}
+	std::cout << "  window outliers: START nodes=" << start_nodes
+	          << " nodes wider than 1000: " << wide_nodes
+	          << " widest node " << wide_id << " := ["
+	          << wide_range.first << ", " << wide_range.second
+	          << ") label len "
+	          << graph.node(wide_id).seq.size() << "\n\n";
+
 	// Per-query BinaryLifter: rebuilt per query, its chain tables scale
 	// with nodes * max_level * window width; time its construction.
 	std::size_t max_level = 0;
@@ -189,17 +219,37 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 } // namespace
 
 int main(int argc, char **argv) {
-	if (argc < 2) {
-		std::cerr << "usage: " << argv[0] << " <testcase-file-or-dir>...\n";
+	bool compact_nodes = true;
+	std::vector<const char *> args;
+	for (int i = 1; i < argc; ++i) {
+		if (std::string(argv[i]) == "--no-compact") {
+			compact_nodes = false;
+		} else {
+			args.push_back(argv[i]);
+		}
+	}
+	if (args.empty()) {
+		std::cerr << "usage: " << argv[0]
+		          << " [--no-compact] <testcase-file-or-dir>...\n";
 		return 1;
 	}
 
-	const auto files = collect_files(argc, argv);
-	if (files.empty()) {
+	// collect_files() indexes argv terms from 1 (argv[0] is the program
+	// name), so keep a dummy first element.
+	auto arg_ptrs = [&] {
+		std::vector<char *> p{const_cast<char *>(argv[0])};
+		for (const char *a : args)
+			p.push_back(const_cast<char *>(a));
+		return p;
+	}();
+	const auto files = collect_files(static_cast<int>(arg_ptrs.size()),
+	                                 arg_ptrs.data());	if (files.empty()) {
 		std::cout << "no testcase files found\n";
 		return 0;
 	}
-	for (const auto &file : files)
-		stats_testcase(file, parse_testcase(file));
+	std::cout << "run compaction: " << (compact_nodes ? "on" : "off") << "\n";
+	for (const auto &file : files) {
+		stats_testcase(file, parse_testcase(file), compact_nodes);
+	}
 	return 0;
 }

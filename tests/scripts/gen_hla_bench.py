@@ -122,8 +122,7 @@ def mutate(rng, seq, edits):
 
 def write_testcase(path, dictionary, queries, k):
     with open(path, "w") as out:
-        out.write("AGCT\n1 1 1 1\n1 1 1 1\n"
-                  "0 1 1 1\n1 0 1 1\n1 1 0 1\n1 1 1 0\n")
+        out.write("AGCT\n1 1 0 1\n")
         out.write(f"{len(dictionary)}\n")
         for seq in dictionary:
             out.write(f"{seq}\n")

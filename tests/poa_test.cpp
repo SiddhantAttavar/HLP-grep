@@ -72,7 +72,7 @@ void check_paths(const POAGraph &g, const std::vector<std::string> &dict,
 				check(weight_of(weights, prev, u) > 0,
 				      name + ": path " + std::to_string(i) + " has no edge " +
 				          std::to_string(prev) + "->" + std::to_string(u));
-			spelled += g.base(u);
+			spelled += g.seq(u);
 			prev = u;
 			first = false;
 		}
@@ -94,7 +94,7 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 	const auto cp = g.compressed_path(seq);
 	check(!p.empty() && cp.start == p.front(),
 	      name + ": start node must be path front");
-	std::string spelled(1, g.base(cp.start));
+	std::string spelled = g.seq(cp.start);
 	POAGraph::node_id cur = cp.start;
 	bool prev_was_heavy_end = false;
 	for (const auto &st : cp.steps) {
@@ -117,7 +117,7 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 				                  POAGraph::EdgeType::HEAVY,
 				      name + ": heavy step traverses a non-heavy edge");
 				cur = *hn;
-				spelled += g.base(cur);
+				spelled += g.seq(cur);
 			}
 			prev_was_heavy_end = true;
 			break;
@@ -128,7 +128,7 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 			check(g.edge_type(cur, st.next) == POAGraph::EdgeType::LIGHT,
 			      name + ": light step traverses a heavy edge");
 			cur = st.next;
-			spelled += g.base(cur);
+			spelled += g.seq(cur);
 			prev_was_heavy_end = false;
 			break;
 		}
@@ -140,46 +140,56 @@ void check_compressed(const POAGraph &g, std::size_t seq,
 	                                "'");
 }
 
+const std::vector<POAGraph::node_id> PATH_AC_T = {0, 1};   // ACG + T
+const std::vector<POAGraph::node_id> PATH_AC_A = {0, 2};   // ACG + A
+const std::vector<POAGraph::node_id> PATH_AC_G_T = {0, 1, 2}; // AC + G + T
+const std::vector<POAGraph::node_id> PATH_AC_T2 = {0, 2};  // AC + T
 const std::vector<POAGraph::node_id> PATH_0123 = {0, 1, 2, 3};
-const std::vector<POAGraph::node_id> PATH_0124 = {0, 1, 2, 4};
-const std::vector<POAGraph::node_id> PATH_013 = {0, 1, 3};
 
 } // namespace
 
 int main() {
 	// Substitution: shared prefix, one alternate path for the last base.
+	// The shared prefix ACG compacts into one node; the two last bases
+	// branch off it.
 	{
 		const std::vector<std::string> dict = {"ACGT", "ACGA"};
 		const POAGraph g(dict);
-		check(g.num_nodes() == 5, "substitution: expected 5 nodes");
-		check(g.base(4) == 'A', "substitution: last node must be 'A'");
-		check(g.path(0) == PATH_0123, "substitution: path0");
-		check(g.path(1) == PATH_0124, "substitution: path1");
+		check(g.num_nodes() == 3, "substitution: expected 3 nodes");
+		check(g.seq(1) == "T", "substitution: node 1 must be 'T'");
+		check(g.seq(2) == "A", "substitution: node 2 must be 'A'");
+		check(g.path(0) == PATH_AC_T, "substitution: path0");
+		check(g.path(1) == PATH_AC_A, "substitution: path1");
 		check_paths(g, dict, "substitution");
 		std::cout << "PASS substitution\n";
 	}
 
-	// Duplicates reuse the entire path; no new nodes.
+	// Duplicates reuse the entire path; no new nodes. The trunk ACG
+	// compacts; the shared last base T stays alone (it ends both paths).
 	{
 		const std::vector<std::string> dict = {"ACGT", "ACGT"};
 		const POAGraph g(dict);
-		check(g.num_nodes() == 4, "duplicate: expected 4 nodes");
+		check(g.num_nodes() == 2, "duplicate: expected 2 nodes");
 		check(g.path(0) == g.path(1), "duplicate: paths must be identical");
 		check_paths(g, dict, "duplicate");
 		std::cout << "PASS duplicate\n";
 	}
 
-	// Deletion: second sequence skips the G node.
+	// Deletion: second sequence skips the G node. A and C merge into
+	// one node (C's two out-edges keep the skip edge intact); G and T
+	// cannot merge (T has two in-edges).
 	{
 		const std::vector<std::string> dict = {"ACGT", "ACT"};
 		const POAGraph g(dict);
-		check(g.num_nodes() == 4, "deletion: expected 4 nodes");
-		check(g.path(1) == PATH_013, "deletion: expected path [0,1,3]");
+		check(g.num_nodes() == 3, "deletion: expected 3 nodes");
+		check(g.path(1) == PATH_AC_T2, "deletion: expected path [0,2]");
+		check(g.path(0) == PATH_AC_G_T, "deletion: expected path [0,1,2]");
 		check_paths(g, dict, "deletion");
 		std::cout << "PASS deletion\n";
 	}
 
-	// Insertion: new suffix nodes, shared first two nodes.
+	// Insertion: new suffix nodes, shared first two nodes. Nothing
+	// merges: a path ends on C (blocking A->C and the C-G-T run).
 	{
 		const std::vector<std::string> dict = {"AC", "ACGT"};
 		const POAGraph g(dict);
@@ -187,6 +197,7 @@ int main() {
 		check(g.path(1) == PATH_0123, "insertion: expected path [0,1,2,3]");
 		check(g.path(0) == std::vector<POAGraph::node_id>{0, 1},
 		      "insertion: path0 expected [0,1]");
+		check(g.seq(1) == "C", "insertion: node 1 must be 'C'");
 		check_paths(g, dict, "insertion");
 		std::cout << "PASS insertion\n";
 	}
@@ -194,10 +205,10 @@ int main() {
 	// Weighted insertion/deletion costs still produce the same graph shape.
 	{
 		const std::vector<std::string> dict = {"ACGT", "ACGA"};
-		const UnitCostModel weighted(2, 3); // reference must outlive graph
+		const CostModel weighted(2, 3); // reference must outlive graph
 		const POAGraph g(dict, weighted);
-		check(g.num_nodes() == 5, "weighted: expected 5 nodes");
-		check(g.path(1) == PATH_0124, "weighted: path1 expected [0,1,2,4]");
+		check(g.num_nodes() == 3, "weighted: expected 3 nodes");
+		check(g.path(1) == PATH_AC_A, "weighted: path1 expected [0,2]");
 		check_paths(g, dict, "weighted");
 		std::cout << "PASS weighted\n";
 	}
@@ -206,7 +217,7 @@ int main() {
 	{
 		const std::vector<std::string> dict = {"", "ACGT"};
 		const POAGraph g(dict);
-		check(g.num_nodes() == 4, "empty-string: expected 4 nodes");
+		check(g.num_nodes() == 2, "empty-string: expected 2 nodes");
 		check(g.path(0).empty(), "empty-string: path 0 must be empty");
 		check_paths(g, dict, "empty-string");
 		std::cout << "PASS empty-string\n";
@@ -220,15 +231,17 @@ int main() {
 		std::cout << "PASS empty-dict\n";
 	}
 
-	// A mutation family shares everything except the final base: the graph
-	// must stay compact (5 shared nodes + one node per distinct last base).
+	// A mutation family shares everything except the final base: the
+	// shared trunk compacts into one node per in-tact run (the two
+	// trailing Cs gain extra in-edges from a mid-trunk insertion, so
+	// they stay separate), plus one node per distinct last base.
 	{
 		std::vector<std::string> dict;
 		for (int i = 0; i < 8; ++i)
 			dict.push_back("ACGCC" + std::string(1, char('A' + i)));
 		const POAGraph g(dict);
-		check(g.num_nodes() == 13,
-		      "mutation-family: expected 13 nodes (5 shared + 8 last bases)");
+		check(g.num_nodes() == 11, "mutation-family: expected 11 nodes");
+		check(g.seq(0) == "ACG", "mutation-family: trunk label");
 		check_paths(g, dict, "mutation-family");
 		std::cout << "PASS mutation-family\n";
 	}
@@ -279,8 +292,9 @@ int main() {
 			}
 		}
 
-		// The trunk A-A chain edge 0->1 is taken by all 4 paths and is heavy.
-		check(weight_of(weights, 0, 1) == 4, "heavy-ties: edge 0->1 weight");
+		// The trunk AA chain merges into one node whose edge to C is
+		// taken by 3 of the 4 paths and is heavy.
+		check(weight_of(weights, 0, 1) == 3, "heavy-ties: edge 0->1 weight");
 		check(g.edge_type(0, 1) == POAGraph::EdgeType::HEAVY,
 		      "heavy-ties: edge 0->1 must be heavy");
 		check(g.edge_type(3, 0) == POAGraph::EdgeType::LIGHT,
@@ -331,19 +345,22 @@ int main() {
 		const POAGraph g(dict);
 		check_paths(g, dict, "pos-range");
 
-		// Recompute expected ranges directly from the paths.
+		// Recompute expected ranges directly from the paths: an offset
+		// counts the bases consumed before a node's label starts.
 		const std::size_t NONE = static_cast<std::size_t>(-1);
 		std::vector<std::pair<std::size_t, std::size_t>> expected(
 		    g.num_nodes(), {NONE, NONE});
-		for (std::size_t s = 0; s < dict.size(); ++s)
-			for (std::size_t j = 0; j < g.path(s).size(); ++j) {
-				const auto u = g.path(s)[j];
+		for (std::size_t s = 0; s < dict.size(); ++s) {
+			std::size_t offset = 0;
+			for (const auto u : g.path(s)) {
 				auto &er = expected[u];
-				if (er.first == NONE || j < er.first)
-					er.first = j;
-				if (er.second == NONE || j > er.second)
-					er.second = j;
+				if (er.first == NONE || offset < er.first)
+					er.first = offset;
+				if (er.second == NONE || offset > er.second)
+					er.second = offset;
+				offset += g.seq(u).size();
 			}
+		}
 		for (std::size_t u = 0; u < g.num_nodes(); ++u) {
 			const auto [lo, hi] = g.pos_range(u);
 			check(lo == expected[u].first && hi == expected[u].second,
@@ -363,6 +380,51 @@ int main() {
 			check(lo == 0 && hi == 0, "pos-range: node 0 expected (0,0)");
 		}
 		std::cout << "PASS pos-range\n";
+	}
+
+	// Compaction maximality: no contractible chain edge may survive
+	// compaction. An edge (u, v) is contractible exactly when u's
+	// out-degree is 1, v's in-degree is 1, and no stored path forbids
+	// it: u must not end a path, and v must neither start nor end one
+	// (paths may begin or end mid-run via deletions, and contraction
+	// would force those across label characters they never had).
+	{
+		const std::vector<std::string> dict = {"ACGT", "ACT",  "ACGA",
+		                                       "CGT",  "ACGTAC", "AC"};
+		const POAGraph g(dict);
+		check_paths(g, dict, "compaction-maximal");
+		for (std::size_t s = 0; s < dict.size(); ++s)
+			check_compressed(g, s, dict, "compaction-maximal");
+
+		const auto weights = path_weights(g);
+		std::unordered_map<POAGraph::node_id, std::size_t> outdeg, indeg;
+		for (const auto &[edge, w] : weights) {
+			(void)w;
+			outdeg[static_cast<POAGraph::node_id>(edge >> 32)]++;
+			indeg[static_cast<POAGraph::node_id>(edge & 0xffffffffUL)]++;
+		}
+		std::vector<char> is_start(g.num_nodes(), 0), is_end(g.num_nodes(), 0);
+		for (std::size_t s = 0; s < dict.size(); ++s) {
+			const auto &p = g.path(s);
+			if (p.empty())
+				continue;
+			is_start[p.front()] = 1;
+			is_end[p.back()] = 1;
+		}
+		for (const auto &[edge, w] : weights) {
+			(void)w;
+			const auto u = static_cast<POAGraph::node_id>(edge >> 32);
+			const auto v =
+			    static_cast<POAGraph::node_id>(edge & 0xffffffffUL);
+			const bool contractible = outdeg[u] == 1 && indeg[v] == 1 &&
+			                          !is_start[v] && !is_end[v] &&
+			                          !is_end[u];
+			check(!contractible,
+			      "compaction-maximal: contractible edge " +
+			          std::to_string(u) + "->" + std::to_string(v) +
+			          " survived");
+		}
+		std::cout << "PASS compaction-maximal\n";
 	}
 
 	std::cout << "all POA alignment checks passed\n";
