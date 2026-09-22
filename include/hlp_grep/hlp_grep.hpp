@@ -16,6 +16,7 @@
 #include <hlp_grep/result.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,12 +44,17 @@ public:
 	 * @param cost Cost model defining the costs of the basic edit operations;
 	 *             defaults to the unit-cost model. The referenced model must
 	 *             outlive the solver.
+	 * @param compact_nodes Whether to merge single-in/single-out node runs
+	 *             into multi-character nodes after graph construction.
+	 * @param num_threads Worker threads for the per-query BinaryLifter
+	 *             chain table build; 0 means use the hardware concurrency.
 	 */
 	explicit Solver(std::vector<std::string> dict,
 	                const CostModel &cost = DEFAULT_COST_MODEL,
-	                bool compact_nodes = true)
-	    : dict(std::move(dict)), cost(cost), graph(this->dict, this->cost,
-	                                               compact_nodes) {
+	                bool compact_nodes = true,
+	                std::size_t num_threads = 0)
+	    : dict(std::move(dict)), cost(cost), num_threads(num_threads),
+	      graph(this->dict, this->cost, compact_nodes) {
 		build_compressed_paths();
 	}
 
@@ -86,7 +92,7 @@ public:
 		if (dict.empty())
 			return results;
 		const long m = static_cast<long>(query.size());
-		BinaryLifter lifter(graph, query, k);
+		BinaryLifter lifter(graph, query, k, num_threads);
 		for (std::size_t i = 0; i < dict.size(); ++i) {
 			if (std::abs(static_cast<long>(dict[i].size()) - m) > k)
 				continue;
@@ -201,6 +207,8 @@ private:
 	/// Cost model used for the edit distance computations; must outlive
 	/// the solver.
 	const CostModel &cost;
+	/// Worker threads for the per-query BinaryLifter build (0 = auto).
+	std::size_t num_threads = 0;
 	POAGraph graph;                ///< POA graph built from the dictionary.
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;

@@ -12,6 +12,7 @@
  */
 #pragma once
 #include <hlp_grep/dist_matrix.hpp>
+#include <hlp_grep/parallel_for.hpp>
 #include <hlp_grep/poa_graph.hpp>
 
 #include <algorithm>
@@ -57,11 +58,14 @@ public:
 	 *              this object and must not be modified while it is alive.
 	 * @param query Query string the chain distance tables index into.
 	 * @param k     Edit distance threshold widening the windows.
+	 * @param num_threads Worker threads for the chain table build; 0 means
+	 *              use the hardware concurrency. The result is identical
+	 *              for every thread count.
 	 */
 	explicit BinaryLifter(const POAGraph &graph, const std::string &query,
-	                      int k)
-	    : graph(graph), query(query), k(k),
-	      cost_model(graph.cost_model()) {
+	                      int k, std::size_t num_threads = 0)
+	    : graph(graph), query(query), cost_model(graph.cost_model()), k(k),
+	      num_threads(num_threads) {
 		const std::size_t n = graph.num_nodes();
 		max_level = 0;
 		while ((std::size_t{1} << max_level) <= n)
@@ -89,18 +93,32 @@ public:
 		// the whole table to O(V) matrices.
 		up_mat.assign(
 		    n, std::vector<DistMatrix>(max_level, DistMatrix(0, 0)));
-		for (std::size_t u = 0; u < n; ++u)
-			if (up[u][0].has_value())
-				up_mat[u][0] = edge_matrix(u, *up[u][0]);
+		// Level 0 blocks are independent per node, so they build in
+		// parallel; every read touches const graph/query state and each
+		// worker writes its own slot.
+		parallel_for(
+		    0, n,
+		    [&](std::size_t u) {
+			    if (up[u][0].has_value())
+				    up_mat[u][0] = edge_matrix(u, *up[u][0]);
+		    },
+		    num_threads);
+		// Higher levels read only level (t - 1); the implicit barrier
+		// between levels keeps that dependency safe. Within a level the
+		// nodes are independent again.
 		for (std::size_t t = 1; t < max_level; ++t) {
 			const std::size_t p = std::size_t{1} << t;
-			for (std::size_t u = 0; u < n; ++u)
-				if (up[u][t].has_value() &&
-				    graph.node(u).heavy_length % p == 0)
-					up_mat[u][t] = DistMatrix::min_plus_product(
-					    up_mat[u][t - 1],
-					    up_mat[*up[u][t - 1]][t - 1],
-					    cost_model.is_monge());
+			parallel_for(
+			    0, n,
+			    [&](std::size_t u) {
+				    if (up[u][t].has_value() &&
+				        graph.node(u).heavy_length % p == 0)
+					    up_mat[u][t] = DistMatrix::min_plus_product(
+					        up_mat[u][t - 1],
+					        up_mat[*up[u][t - 1]][t - 1],
+					        cost_model.is_monge());
+			    },
+			    num_threads);
 		}
 	}
 
@@ -398,6 +416,8 @@ private:
 	/// Edit distance threshold the chain tables were built with; cells
 	/// no transition realizes take DistMatrix::INF as their bound.
 	int k = -1;
+	/// Worker threads used for the chain table build (0 = auto).
+	std::size_t num_threads = 0;
 	/// Number of table levels: floor(log2(num_nodes)) + 1 (0 for an empty
 	/// graph).
 	std::size_t max_level = 0;
