@@ -242,20 +242,20 @@ public:
 		// with insertions at v. Sources outside [l0, h0) die: below the
 		// band every continuation leaves all bands, above it they start
 		// past the query (possible only for clamped all-INF rows).
-		for (long b = std::max(l0, lo_u); b < std::min(h0, hi_u); ++b)
+		for (std::size_t b = std::max(l0, lo_u); b < std::min(h0, hi_u); ++b)
 			f[b - l0] = cost[b - lo_u];
-		for (long b = l0 + 1; b < h0; ++b) {
+		for (std::size_t b = l0 + 1; b < h0; ++b) {
 			const long prev = f[b - 1 - l0];
 			if (prev >= DistMatrix::INF)
 				continue;
-			long cur = prev + cost_model.ins(query[b - 1]);
+			long cur = prev + cost_model.ins();
 			if (cur > DistMatrix::INF)
 				cur = DistMatrix::INF;
 			if (cur < f[b - l0])
 				f[b - l0] = cur;
 		}
 		sweep_label(v, f, l0);
-		for (long b = lo_v; b < hi_v; ++b)
+		for (std::size_t b = lo_v; b < hi_v; ++b)
 			out[static_cast<std::size_t>(b - lo_v)] =
 			    static_cast<int>(f[b - l0]);
 		return out;
@@ -293,30 +293,25 @@ private:
 		DistMatrix mat(static_cast<std::size_t>(hi_u - lo_u),
 		               static_cast<std::size_t>(hi_v - lo_v),
 		               DistMatrix::INF);
-		const auto [lL, hL] = window(v, static_cast<long>(label.size()));
+		const auto [lL, hL] = window(v, label.size());
 		if (lL >= hL)
 			return mat; // final band empty: every crossing exceeds k
 		const auto [l0, h0] = window(v, 0);
 		// DP row over [l0, hL); band j of the label occupies
 		// window(v, j), and row L's band is exactly [lo_v, hi_v).
-		std::vector<long> f(static_cast<std::size_t>(hL - l0),
-		                    DistMatrix::INF);
-		for (long a = lo_u; a < hi_u; ++a) {
+		std::vector<long> f(hL - l0);
+		for (std::size_t a = lo_u; a < hi_u; ++a) {
 			if (a < l0 || a >= h0)
 				continue; // entry outside the seed band: no
 				          // transition survives the bands
 			std::fill(f.begin(), f.end(), DistMatrix::INF);
 			// Row 0: seed at a, chain insertions within the entry band.
 			f[a - l0] = 0;
-			for (long b = a + 1; b < h0; ++b)
-				f[b - l0] = std::min(
-				    f[b - 1 - l0] + cost_model.ins(query[b - 1]),
-				    static_cast<long>(DistMatrix::INF));
-			sweep_label(v, f, l0);
-			for (long b = std::max(a, lo_v); b < hi_v; ++b)
-				mat(static_cast<std::size_t>(a - lo_u),
-				    static_cast<std::size_t>(b - lo_v)) =
-				    static_cast<int>(f[b - l0]);
+			for (std::size_t b = a + 1; b < h0; ++b)
+				f[b - l0] = (b - a) * cost_model.ins();
+			sweep_label(v, f, l0, true);
+			for (std::size_t b = std::max(a, lo_v); b < hi_v; ++b)
+				mat(a - lo_u, b - lo_v) = static_cast<int>(f[b - l0]);
 		}
 		return mat;
 	}
@@ -334,28 +329,30 @@ private:
 	 * Cells a band never covers stay INF; they are below-band states
 	 * whose continuations all exceed the threshold k.
 	 */
-	void sweep_label(node_id v, std::vector<long> &f, long l0) const {
+	void sweep_label(node_id v, std::vector<long> &f, std::size_t l0,
+				  bool single_source = false) const {
+		std::size_t a = l0;
+		while (a - l0 < f.size() && f[a - l0] == DistMatrix::INF) a++;
+		if (a - l0 == f.size()) return;
 		const std::string &label = graph.seq(v);
-		for (long j = 1; j <= static_cast<long>(label.size()); ++j) {
-			const auto [lj, hj] = window(v, j);
+		for (std::size_t j = 1; j <= label.size(); ++j) {
+			auto [lj, hj] = window(v, j);
+			if (single_source) {
+				lj = std::max(lj, a);
+				hj = std::min(hj, a + j + k + 1);
+			}
 			const char c = label[j - 1];
-			const int del_c = cost_model.del(c);
 			// f(j - 1, lj - 1): the band bottom's diagonal source; INF
 			// when the bands are clamped apart (no query char there).
-			long diag = lj - 1 >= l0 ? f[lj - 1 - l0] : DistMatrix::INF;
-			long left = DistMatrix::INF; // f(j, b - 1): below-band at lj
-			for (long b = lj; b < hj; ++b) {
+			long diag = lj > l0 ? f[lj - 1 - l0] : DistMatrix::INF;
+			long cur = DistMatrix::INF; // f(j, b - 1): below-band at lj
+			for (std::size_t b = lj; b < hj; ++b) {
+				cur += cost_model.ins();
 				const char qb = query[b - 1];
 				const long up = f[b - l0]; // f(j - 1, b)
-				long cur = up + del_c;
-				if (left < DistMatrix::INF)
-					cur = std::min(cur, left + cost_model.ins(qb));
-				if (diag < DistMatrix::INF)
-					cur = std::min(cur, diag + cost_model.consume(c, qb));
-				if (cur > DistMatrix::INF)
-					cur = DistMatrix::INF;
+				cur = std::min(cur, up + cost_model.del());
+				cur = std::min(cur, diag + cost_model.consume(c, qb));
 				f[b - l0] = cur;
-				left = cur;
 				diag = up;
 			}
 		}
@@ -374,9 +371,8 @@ private:
 	 * whose feasible band lies entirely outside [0, |query|]: their rows
 	 * carry valid (large) transition values only.
 	 */
-	std::pair<long, long> window(node_id u) const {
-		const auto [lo, hi] =
-		    window(u, static_cast<long>(graph.seq(u).size()));
+	std::pair<std::size_t, std::size_t> window(node_id u) const {
+		const auto [lo, hi] = window(u, graph.seq(u).size());
 		return {lo, std::max(hi, lo + 1)};
 	}
 
@@ -395,14 +391,12 @@ private:
 	 *        bands of consecutive offsets overlap so that transitions
 	 *        between them stay covered.
 	 */
-	std::pair<long, long> window(node_id u, long offset) const {
+	std::pair<std::size_t, std::size_t> window(node_id u, std::size_t offset) const {
 		const auto [jmin, jmax] = graph.pos_range(u);
-		const long mk = static_cast<long>(k);
-		const long m = static_cast<long>(query.size());
-		const long lo =
-		    std::max(0L, static_cast<long>(jmin) + offset - mk);
-		const long hi =
-		    std::min(m + 1, static_cast<long>(jmax) + offset + mk + 1);
+		const std::size_t mk = static_cast<std::size_t>(k);
+		const std::size_t m = query.size();
+		const std::size_t lo = jmin + offset >= mk ? jmin + offset - mk : 0;
+		const std::size_t hi = std::min(m + 1, jmax + offset + mk + 1);
 		return {lo, hi};
 	}
 

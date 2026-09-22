@@ -657,7 +657,7 @@ private:
 		dp[row_off[vr]] = 0;
 		for (std::size_t j = 1; j <= m; ++j) {
 			const std::size_t k = row_off[vr] + j;
-			dp[k] = dp[k - 1] + cost.ins(s[j - 1]);
+			dp[k] = dp[k - 1] + cost.ins();
 			op[k] = INS_CODE;
 			from[k] = vr;
 		}
@@ -667,7 +667,7 @@ private:
 				continue; // column 0 out of band
 			int d = INF;
 			if (in_edges[topo[p]].empty()) {
-				d = cost.del(nodes[topo[p]].seq[0]);
+				d = cost.del();
 			} else {
 				for (const Edge &e : in_edges[topo[p]]) {
 					const node_id prow = row_of[e.neighbor];
@@ -675,7 +675,7 @@ private:
 						continue; // predecessor has no column 0
 					const int c =
 					    dp[row_off[prow]] +
-					    cost.del(nodes[topo[p]].seq[0]);
+					    cost.del();
 					if (c < d)
 						d = c;
 				}
@@ -701,7 +701,7 @@ private:
 				int bpri = -1;
 
 				if (il - 1 >= lo[p]) {
-					best = dp[k - 1] + cost.ins(s[i - 1]); // insert s[i-1] at u
+					best = dp[k - 1] + cost.ins(); // insert s[i-1] at u
 					bop = INS_CODE;
 					bfrom = p;
 					bpri = 0;
@@ -713,7 +713,7 @@ private:
 					const int c =
 					    dp[row_off[prow] +
 					       static_cast<std::size_t>(il - lo[prow])] +
-					    cost.del(nodes[u].seq[0]);
+					    cost.del();
 					if (c < best || (c == best && bpri < 1)) {
 						best = c;
 						bop = DEL_CODE;

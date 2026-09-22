@@ -379,9 +379,10 @@ std::optional<MethodRun> measure_method(const std::string &method,
 }
 
 /** True when the model is unary unit-cost (WFA2 edit metric). */
-bool unit_cost_model(const Testcase &tc) {	const std::string &alpha = tc.alphabet;
+bool unit_cost_model(const Testcase &tc) {
+	const std::string &alpha = tc.alphabet;
 	for (const char a : alpha) {
-		if (tc.cost.ins(a) != 1 || tc.cost.del(a) != 1)
+		if (tc.cost.ins() != 1 || tc.cost.del() != 1)
 			return false;
 		for (const char b : alpha) {
 			const int g = tc.cost.consume(a, b);

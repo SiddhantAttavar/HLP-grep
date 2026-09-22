@@ -66,21 +66,21 @@ std::vector<int> initial_row(const POAGraph &graph, const CostModel &cost,
 	std::vector<long> f(static_cast<std::size_t>(hL - l0), DistMatrix::INF);
 	f[0] = 0;
 	for (long b = 1; b < h0; ++b)
-		f[b - l0] = std::min(f[b - 1 - l0] + cost.ins(query[b - 1]),
+		f[b - l0] = std::min(f[b - 1 - l0] + cost.ins(),
 		                     static_cast<long>(DistMatrix::INF));
 	for (long i = 1; i <= label_len; ++i) {
 		const long li = std::max(0L, static_cast<long>(jmin) + i - mk);
 		const long hi_i =
 		    std::min(m + 1, static_cast<long>(jmax) + i + mk + 1);
 		const char c = label[i - 1];
-		const int del_c = cost.del(c);
+		const int del_c = cost.del();
 		long diag = li - 1 >= l0 ? f[li - 1 - l0] : DistMatrix::INF;
 		long left = DistMatrix::INF;
 		for (long b = li; b < hi_i; ++b) {
 			const long up = f[b - l0];
 			long cur = up + del_c;
 			if (left < DistMatrix::INF)
-				cur = std::min(cur, left + cost.ins(query[b - 1]));
+				cur = std::min(cur, left + cost.ins());
 			if (diag < DistMatrix::INF)
 				cur = std::min(cur,
 				               diag + cost.consume(c, query[b - 1]));

@@ -24,20 +24,16 @@ namespace {
 /**
  * @brief Minimum insertion/deletion and substitution costs of the model.
  *
- * Scans the testcase alphabet, which covers every cost the DP can ever
- * use since insertion/deletion costs are character-independent and
- * substitution costs only distinguish equal from distinct characters.
- * The caller computes this once per query so no per-solver state is
- * needed.
+ * With the concrete cost model, insertion/deletion are scalar (character
+ * independent) and substitution is a two-way match/mismatch matrix, so the
+ * band parameters are simply the scalar costs and the smaller of
+ * match/mismatch.
  */
 std::pair<int, int> model_mins(const CostModel &cost,
                                const std::string &alphabet) {
-	int c_min = INT_MAX, g_min = INT_MAX;
-	for (const char ch : alphabet) {
-		c_min = std::min({c_min, cost.ins(ch), cost.del(ch)});
-		for (const char dh : alphabet)
-			g_min = std::min(g_min, cost.consume(ch, dh));
-	}
+	(void)alphabet;
+	int c_min = std::min(cost.ins(), cost.del());
+	int g_min = std::min(cost.match, cost.mismatch);
 	return {c_min, g_min};
 }
 
@@ -62,14 +58,14 @@ int edit_distance(const std::string &a, const std::string &b,
 		std::vector<int> prev(b.size() + 1), curr(b.size() + 1);
 		prev[0] = 0;
 		for (std::size_t j = 1; j <= b.size(); ++j)
-			prev[j] = prev[j - 1] + cost.ins(b[j - 1]);
+			prev[j] = prev[j - 1] + cost.ins();
 
 		for (std::size_t i = 1; i <= a.size(); ++i) {
-			curr[0] = prev[0] + cost.del(a[i - 1]);
+			curr[0] = prev[0] + cost.del();
 			for (std::size_t j = 1; j <= b.size(); ++j)
 				curr[j] = std::min(
-				    {prev[j] + cost.del(a[i - 1]),
-				     curr[j - 1] + cost.ins(b[j - 1]),
+				    {prev[j] + cost.del(),
+				     curr[j - 1] + cost.ins(),
 				     prev[j - 1] + cost.consume(a[i - 1], b[j - 1])});
 			std::swap(prev, curr);
 		}
@@ -91,7 +87,7 @@ int edit_distance(const std::string &a, const std::string &b,
 	const long row0_hi = std::min(m, width);
 	prev[0] = 0;
 	for (long j = 1; j <= row0_hi; ++j) {
-		const long v = static_cast<long>(prev[j - 1]) + cost.ins(b[j - 1]);
+		const long v = static_cast<long>(prev[j - 1]) + cost.ins();
 		prev[j] = v > cap ? cap : static_cast<int>(v);
 	}
 
@@ -104,13 +100,13 @@ int edit_distance(const std::string &a, const std::string &b,
 			long best = cap;
 			if (j >= plo && j <= phi)
 				best = std::min(
-				    best, static_cast<long>(prev[j]) + cost.del(a[i - 1]));
+				    best, static_cast<long>(prev[j]) + cost.del());
 			if (j - 1 >= plo && j - 1 <= phi)
 				best = std::min(best, static_cast<long>(prev[j - 1]) +
 				                           cost.consume(a[i - 1], b[j - 1]));
 			if (j > lo)
 				best = std::min(
-				    best, static_cast<long>(curr[j - 1]) + cost.ins(b[j - 1]));
+				    best, static_cast<long>(curr[j - 1]) + cost.ins());
 			curr[j] = best > cap ? cap : static_cast<int>(best);
 		}
 		std::swap(prev, curr);

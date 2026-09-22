@@ -37,12 +37,12 @@ public:
 	}
 
 	/** @brief Cost of inserting a character. */
-	int ins(char) const {
+	int ins() const {
 		return ins_cost;
 	}
 
 	/** @brief Cost of deleting a character. */
-	int del(char) const {
+	int del() const {
 		return del_cost;
 	}
 
