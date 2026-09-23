@@ -34,6 +34,12 @@ namespace hlp_grep {
  * outgoing heavy edge (sinks) start the empty entries. No sentinel node id
  * is used, so the table cannot be confused with POAGraph's internal
  * markers.
+ *
+ * The lifter is built in two stages. The constructor builds only the
+ * query-independent node table; mark() then walks the dictionary's
+ * compressed paths to record which (node, level) chain blocks queries can
+ * need, and build(query, k) materializes only those blocks for one
+ * (query, k) pair.
  */
 class BinaryLifter {
 public:
@@ -41,7 +47,7 @@ public:
 	using node_id = POAGraph::node_id;
 
 	/**
-	 * @brief Constructs the lifter and builds both tables.
+	 * @brief Constructs the lifter's query-independent top half.
 	 *
 	 * The node table has one row per graph node and one column per level
 	 * 0 .. max_level - 1, where max_level = floor(log2(num_nodes)) + 1 is
@@ -50,27 +56,21 @@ public:
 	 * up[u][t] = up[up[u][t - 1]][t - 1] whenever up[u][t - 1] is set, so
 	 * no topological order is needed.
 	 *
-	 * The chain tables are built right after: level 0 holds the
-	 * per-edge blocks of the actual heavy outgoing edges (the edge
-	 * transition plus the destination node's label), and each higher
-	 * level is the min-plus product of two adjacent level (t - 1)
-	 * blocks sharing a chain midpoint.
+	 * The chain tables are NOT built here: mark() records which blocks
+	 * queries touch and build(query, k) materializes exactly those. jump
+	 * and step must not be called before build().
 	 *
 	 * @param graph POAGraph whose heavy chains are indexed; must outlive
 	 *              this object and must not be modified while it is alive.
-	 * @param query Query string the chain distance tables index into.
-	 * @param k     Edit distance threshold widening the windows.
 	 * @param num_threads Worker threads for the chain table build; 0 means
-	 *              use the hardware concurrency. The result is identical
-	 *              for every thread count.
+	 *              use up to half of the hardware concurrency (past ~8
+	 *              threads barrier overhead dominates the per-level loop).
 	 */
-	explicit BinaryLifter(const POAGraph &graph, const std::string &query,
-	                      int k, std::size_t num_threads = 0)
-	    : graph(graph), query(query), cost_model(graph.cost_model()), k(k),
+	explicit BinaryLifter(const POAGraph &graph,
+	                      std::size_t num_threads = 0)
+	    : graph(graph), cost_model(graph.cost_model()),
 	      num_threads(num_threads) {
 		const std::size_t n = graph.num_nodes();
-		const int threads = static_cast<int>(
-		    num_threads == 0 ? omp_get_max_threads() : num_threads);
 		max_level = 0;
 		while ((std::size_t{1} << max_level) <= n)
 			++max_level; // floor(log2(n)) + 1; 0 for n == 0
@@ -81,60 +81,110 @@ public:
 			for (std::size_t u = 0; u < n; ++u)
 				if (up[u][t - 1])
 					up[u][t] = up[*up[u][t - 1]][t - 1];
+	}
 
-		// Per-level chain DistMatrix tables: level 0 holds the per-edge
-		// blocks of the actual heavy outbound edges — the transition
-		// across the edge (u, v) followed by v's whole label. Each higher
-		// level is the min-plus product of two adjacent level (t - 1)
-		// blocks sharing a chain midpoint.
-		// Level t of node u is computed only when u's heavy_length is a
-		// multiple of 2^t: the property is inherited by the two level
-		// (t - 1) halves (their chain lengths are heavy_length(u) and
-		// heavy_length(u) - 2^(t-1), both multiples of 2^(t-1)), so the
-		// products below only ever read blocks that were built. A chain
-		// of length L stores one block per power of two dividing one of
-		// its nodes' heavy lengths (~2L blocks in total), which bounds
-		// the whole table to O(V) matrices.
-		up_mat.assign(
-		    n, std::vector<DistMatrix>(max_level, DistMatrix(0, 0)));
-		// Per level, filter the nodes that actually build a block up
-		// front (serial, O(n * max_level), trivially cheap next to the
-		// per-node work). The surviving work is uniform — one block of
-		// roughly constant dimensions per node — so a static schedule
-		// with one task per remaining node fills the level evenly.
-		std::vector<std::vector<std::size_t>> level_nodes(max_level);
-		{
-			std::vector<std::size_t> elig;
-			elig.reserve(n);
-			for (std::size_t u = 0; u < n; ++u)
-				if (up[u][0].has_value())
-					elig.push_back(u);
-			level_nodes[0] = std::move(elig);
-			for (std::size_t t = 1; t < max_level; ++t) {
-				const std::size_t p = std::size_t{1} << t;
-				std::vector<std::size_t> elig;
-				elig.reserve(n);
-				for (std::size_t u = 0; u < n; ++u)
-					if (up[u][t].has_value() &&
-					    graph.node(u).heavy_length % p == 0)
-						elig.push_back(u);
-				level_nodes[t] = std::move(elig);
+	/**
+	 * @brief Dry-runs the dictionary's compressed paths to record which
+	 *        (node, level) chain blocks queries touch.
+	 *
+	 * Every path is walked exactly as Solver::query's scoring loop
+	 * walks it, but without DP rows: light edges only move the walk
+	 * cursor, and each heavy jump is expanded arithmetically over the up
+	 * table — the greedy block choice (level = the smaller of the
+	 * lowest set bit of heavy_length(v) and the highest set bit of the
+	 * remaining step count) is purely chain-structure arithmetic, so
+	 * the marked set is the same for every (query, k). Scoring aborts
+	 * rows whose minimum exceeds k; the dry run cannot evaluate that,
+	 * so it marks the abort-free superset for the dictionary. The
+	 * dependency closure is included: block (u, t) needs (u, t - 1) and
+	 * (*up[u][t - 1], t - 1), recursively down to level 0, so the
+	 * per-level build lists contain exactly the blocks the products
+	 * read. mark() must run before build(); it is idempotent via a
+	 * fresh touched table per call.
+	 *
+	 * @param paths Compressed paths, one per dictionary sequence.
+	 */
+	void mark(const std::vector<POAGraph::CompressedPath> &paths) {
+		const std::size_t n = graph.num_nodes();
+		touched.assign(n, std::vector<char>(max_level, 0));
+		for (const auto &cp : paths) {
+			node_id cur = cp.start;
+			for (const auto &st : cp.steps) {
+				if (st.type == POAGraph::EdgeType::HEAVY) {
+					// Expand the jump arithmetically, marking
+					// the greedy block sequence; the cursor
+					// mirrors the runtime walk.
+					node_id v = cur;
+					std::size_t rem = st.length;
+					while (rem > 0) {
+						const std::size_t level =
+						    std::min(
+						        static_cast<unsigned long long>(
+						            __builtin_ctzll(graph.node(
+						                v).heavy_length)),
+						        static_cast<unsigned long long>(
+						            63 - __builtin_clzll(rem)));
+						touched[v][level] = true;
+						v = *up[v][level];
+						rem -= std::size_t{1} << level;
+					}
+					cur = v;
+				} else {
+					cur = st.next;
+				}
 			}
 		}
-		// One region for all levels: a small fixed spawn cost instead of
-		// one region per level, with a single barrier between levels (the
-		// block being produced by a level can be read by the next one, the
-		// implicit work-sharing barrier separates them).
+		// Dependency closure: (u, t) needs (u, t - 1) and its chain
+		// midpoint's (t - 1) block. One sweep per level from the top
+		// catches every transitive requirement.
+		for (std::size_t t = max_level; t-- > 1;) {
+			for (std::size_t u = 0; u < n; ++u)
+				if (touched[u][t]) {
+					touched[u][t - 1] = true;
+					touched[*up[u][t - 1]][t - 1] = true;
+				}
+		}
+		// Per-level build lists (ascending node order).
+		build_nodes.assign(max_level, {});
+		for (std::size_t t = 0; t < max_level; ++t) {
+			for (std::size_t u = 0; u < n; ++u)
+				if (touched[u][t])
+					build_nodes[t].push_back(u);
+		}
+	}
+
+	/**
+	 * @brief Materializes the chain tables for one (query, k) pair.
+	 *
+	 * Only the blocks marked by mark() are built — level 0 holds the
+	 * per-edge blocks of the touched heavy outgoing edges (the edge
+	 * transition plus the destination node's label), and each higher
+	 * level is the min-plus product of two adjacent level (t - 1) blocks
+	 * sharing a chain midpoint. Untouched (u, t) slots stay empty.
+	 * Must be called before jump()/step()/window() reads; rebuilds
+	 * unconditionally on every call.
+	 *
+	 * @param query Query string the chain distance tables index into.
+	 * @param k     Edit distance threshold widening the windows.
+	 */
+	void build(const std::string &query, int k) {
+		const std::size_t n = graph.num_nodes();
+		// The per-node blocks are one task each with uniform cost; past
+		// ~8 threads barrier and spawn overhead dominate the level loop.
+		const int threads = static_cast<int>(
+		    num_threads == 0 ? std::min(omp_get_max_threads(), 8)
+		                     : num_threads);
+		this->query = query;
+		this->k = k;
+		up_mat.assign(
+		    n, std::vector<DistMatrix>(max_level, DistMatrix(0, 0)));
 #pragma omp parallel num_threads(threads)
 		{
 			for (std::size_t t = 0; t < max_level; ++t) {
-				// Level 0 blocks are independent per node; higher
-				// levels read only level (t - 1), produced behind
-				// the single-barrier of the previous round.
 #pragma omp for schedule(static)
 				for (std::size_t idx = 0;
-				     idx < level_nodes[t].size(); ++idx) {
-					const std::size_t u = level_nodes[t][idx];
+				     idx < build_nodes[t].size(); ++idx) {
+					const std::size_t u = build_nodes[t][idx];
 					if (t == 0)
 						up_mat[u][0] =
 						    edge_matrix(u, *up[u][0]);
@@ -212,6 +262,10 @@ public:
 			if (level >= max_level || !up[v][level].has_value())
 				throw std::out_of_range(
 				    "BinaryLifter::jump: heavy chain too short");
+			if (up_mat[v][level].num_cols() == 0)
+				throw std::out_of_range(
+				    "BinaryLifter::jump: chain block was not "
+				    "marked/built");
 			row = up_mat[v][level].min_plus_apply(row);
 			v = *up[v][level];
 			rem -= std::size_t{1} << level;
@@ -451,22 +505,14 @@ private:
 	/// ends before then.
 	std::vector<std::vector<std::optional<node_id>>> up;
 	/// up_mat[u][t] is the DistMatrix ed(u, 2^t, a, b) for every (u, t)
-	/// with a non-empty sub-chain.
+	/// touched by queries and built by the last build() call; untouched
+	/// slots stay empty.
 	std::vector<std::vector<DistMatrix>> up_mat;
-
-public:
-	/** Debug hook: raw level-t table of node u (temporary). */
-	const DistMatrix &level_table(node_id u, std::size_t t) const {
-		return up_mat[u][t];
-	}
-	/** Debug hook: number of levels (temporary). */
-	std::size_t max_levels_pub() const {
-		return max_level;
-	}
-	/** Debug hook: midpoint node of the level-t product (temporary). */
-	node_id mid(node_id u, std::size_t t) const {
-		return *up[u][t - 1];
-	}
+	/// touched[u][t] (mark-time) flags chain blocks the dry run marked;
+	/// consumed into the per-level build lists by mark().
+	std::vector<std::vector<char>> touched;
+	/// Per-level (ascending node order) list of blocks build() builds.
+	std::vector<std::vector<std::size_t>> build_nodes;
 };
 
 } // namespace hlp_grep

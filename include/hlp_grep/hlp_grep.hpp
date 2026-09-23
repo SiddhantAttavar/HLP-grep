@@ -54,15 +54,19 @@ public:
 	                bool compact_nodes = true,
 	                std::size_t num_threads = 0)
 	    : dict(std::move(dict)), cost(cost), num_threads(num_threads),
-	      graph(this->dict, this->cost, compact_nodes) {
+	      graph(this->dict, this->cost, compact_nodes),
+	      lifter(this->graph, num_threads) {
 		build_compressed_paths();
+		lifter.mark(compressed_paths);
 	}
 
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the
 	 *        query.
 	 *
-	 * Builds a BinaryLifter over the graph for this query, then scores
+	 * Rebuilds the per-query chain tables of the pre-marked BinaryLifter
+	 * (build(query, k) over the blocks mark() touched — the touched set is
+	 * query-independent, so every query fills the same blocks), then scores
 	 * every dictionary sequence's compressed path: the DP row starts at
 	 * the path's start node and each compressed step advances it across a
 	 * heavy chain (jump) or a single light edge (step). The last entry of
@@ -92,7 +96,7 @@ public:
 		if (dict.empty())
 			return results;
 		const long m = static_cast<long>(query.size());
-		BinaryLifter lifter(graph, query, k, num_threads);
+		lifter.build(query, k);
 		// Every path is scored independently: each iteration reads const
 		// graph/lifter state and its own compressed path, and writes only
 		// its own slot of dist.
@@ -216,6 +220,9 @@ private:
 	/// Worker threads for the per-query BinaryLifter build (0 = auto).
 	std::size_t num_threads = 0;
 	POAGraph graph;                ///< POA graph built from the dictionary.
+	/// Query-independent lifter: up table + touched-block marks filled
+	/// at construction; build(current_query, k) runs per query() call.
+	mutable BinaryLifter lifter;
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
 

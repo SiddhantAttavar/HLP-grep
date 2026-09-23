@@ -205,11 +205,11 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 	for (std::size_t qi = 0; qi < tc.queries.size() && qi < 3; ++qi) {
 		const auto [k, query] = tc.queries[qi];
 		const auto b = std::chrono::steady_clock::now();
-		BinaryLifter lifter(graph, query, k);
+		BinaryLifter lifter(graph);
 		const auto e = std::chrono::steady_clock::now();
 		(void)lifter;
 		std::cout << "  query " << qi << " (len=" << query.size()
-		          << ", k=" << k << "): BinaryLifter built in "
+		          << ", k=" << k << "): BinaryLifter up-table built in "
 		          << std::chrono::duration<double, std::milli>(e - b).count()
 		          << " ms\n";
 	}
