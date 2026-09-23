@@ -12,13 +12,18 @@
  */
 #pragma once
 #include <hlp_grep/dist_matrix.hpp>
-#include <hlp_grep/parallel_for.hpp>
 #include <hlp_grep/poa_graph.hpp>
 
+#include <omp.h>
+
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -66,7 +71,21 @@ public:
 	                      int k, std::size_t num_threads = 0)
 	    : graph(graph), query(query), cost_model(graph.cost_model()), k(k),
 	      num_threads(num_threads) {
-		const std::size_t n = graph.num_nodes();
+		const char *timing_env = std::getenv("HLP_GREP_LEVEL_TIMING");
+	const bool timing = timing_env && *timing_env != '0';
+	using clk = std::chrono::steady_clock;
+	clk::time_point stamp_ref = clk::now();
+	auto stamp = [&]() {
+		auto now = clk::now();
+		const double d =
+		    std::chrono::duration<double>(now - stamp_ref).count();
+		stamp_ref = now;
+		return d;
+	};
+	std::vector<std::pair<std::string, double>> timings;
+	const std::size_t n = graph.num_nodes();
+		const int threads = static_cast<int>(
+		    num_threads == 0 ? omp_get_max_threads() : num_threads);
 		max_level = 0;
 		while ((std::size_t{1} << max_level) <= n)
 			++max_level; // floor(log2(n)) + 1; 0 for n == 0
@@ -93,32 +112,81 @@ public:
 		// the whole table to O(V) matrices.
 		up_mat.assign(
 		    n, std::vector<DistMatrix>(max_level, DistMatrix(0, 0)));
-		// Level 0 blocks are independent per node, so they build in
-		// parallel; every read touches const graph/query state and each
-		// worker writes its own slot.
-		parallel_for(
-		    0, n,
-		    [&](std::size_t u) {
-			    if (up[u][0].has_value())
-				    up_mat[u][0] = edge_matrix(u, *up[u][0]);
-		    },
-		    num_threads);
-		// Higher levels read only level (t - 1); the implicit barrier
-		// between levels keeps that dependency safe. Within a level the
-		// nodes are independent again.
-		for (std::size_t t = 1; t < max_level; ++t) {
-			const std::size_t p = std::size_t{1} << t;
-			parallel_for(
-			    0, n,
-			    [&](std::size_t u) {
-				    if (up[u][t].has_value() &&
-				        graph.node(u).heavy_length % p == 0)
-					    up_mat[u][t] = DistMatrix::min_plus_product(
-					        up_mat[u][t - 1],
-					        up_mat[*up[u][t - 1]][t - 1],
-					        cost_model.is_monge());
-			    },
-			    num_threads);
+		const double t_level0 = stamp();
+		// Per level, filter the nodes that actually build a block up
+		// front (serial, O(n * max_level), trivially cheap next to the
+		// per-node work). The surviving work is uniform — one block of
+		// roughly constant dimensions per node — so a static schedule
+		// with one task per remaining node fills the level evenly.
+		std::vector<std::vector<std::size_t>> level_nodes(max_level);
+		{
+			std::vector<std::size_t> elig;
+			elig.reserve(n);
+			for (std::size_t u = 0; u < n; ++u)
+				if (up[u][0].has_value())
+					elig.push_back(u);
+			level_nodes[0] = std::move(elig);
+			for (std::size_t t = 1; t < max_level; ++t) {
+				const std::size_t p = std::size_t{1} << t;
+				std::vector<std::size_t> elig;
+				elig.reserve(n);
+				for (std::size_t u = 0; u < n; ++u)
+					if (up[u][t].has_value() &&
+					    graph.node(u).heavy_length % p == 0)
+						elig.push_back(u);
+				level_nodes[t] = std::move(elig);
+			}
+		}
+		if (timing)
+			timings.emplace_back("elig", stamp());
+		// One region for all levels: only 16 threads benched once, with a
+		// single barrier between levels (the block being produced by a
+		// level can be read by the next one, the implicit work-sharing
+		// barrier separates them).
+#pragma omp parallel num_threads(threads)
+		{
+			for (std::size_t t = 0; t < max_level; ++t) {
+				// Level 0 blocks are independent per node; higher
+				// levels read only level (t - 1), produced behind
+				// the single-barrier of the previous round.
+#pragma omp for schedule(static)
+				for (std::size_t idx = 0;
+				     idx < level_nodes[t].size(); ++idx) {
+					const std::size_t u = level_nodes[t][idx];
+					if (t == 0)
+						up_mat[u][0] =
+						    edge_matrix(u, *up[u][0]);
+					else {
+						const std::size_t v =
+						    *up[u][t - 1];
+						up_mat[u][t] =
+						    DistMatrix::min_plus_product(
+						        up_mat[u][t - 1],
+						        up_mat[v][t - 1],
+						        cost_model.is_monge());
+					}
+				}
+				// single's barrier also separates consecutive
+				// levels (a level's blocks may be read by the
+				// next one).
+#pragma omp single
+				if (timing)
+					timings.emplace_back(
+					    "level" + std::to_string(t),
+					    stamp());
+			}
+		}
+		if (timing) {
+			double total = 0;
+			for (const auto &[what, secs] : timings)
+				total += secs;
+			std::fprintf(stderr, "== lifter ctor (threads=%d)\n",
+			             threads);
+			for (const auto &[what, secs] : timings)
+				std::fprintf(stderr, "  %-12s %7.3f ms\n", what.c_str(),
+				             secs * 1e3);
+			std::fprintf(stderr, "  %-12s %7.3f ms\n", "TOTAL_ms",
+			             total * 1e3);
 		}
 	}
 
@@ -352,6 +420,7 @@ private:
 				const long up = f[b - l0]; // f(j - 1, b)
 				cur = std::min(cur, up + cost_model.del());
 				cur = std::min(cur, diag + cost_model.consume(c, qb));
+				cur = std::min(cur, (long) DistMatrix::INF);
 				f[b - l0] = cur;
 				diag = up;
 			}

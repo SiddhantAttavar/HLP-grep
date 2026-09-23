@@ -17,6 +17,9 @@ add_library(hlp_grep::hlp_grep ALIAS hlp_grep)
 
 target_compile_features(hlp_grep INTERFACE cxx_std_17)
 
+find_package(OpenMP REQUIRED)
+target_link_libraries(hlp_grep INTERFACE OpenMP::OpenMP_CXX)
+
 include(GNUInstallDirs)
 
 target_include_directories(hlp_grep INTERFACE

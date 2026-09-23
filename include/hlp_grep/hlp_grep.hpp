@@ -93,6 +93,11 @@ public:
 			return results;
 		const long m = static_cast<long>(query.size());
 		BinaryLifter lifter(graph, query, k, num_threads);
+		// Every path is scored independently: each iteration reads const
+		// graph/lifter state and its own compressed path, and writes only
+		// its own slot of dist.
+		std::vector<int> dist(dict.size(), DistMatrix::INF);
+#pragma omp parallel for schedule(dynamic)
 		for (std::size_t i = 0; i < dict.size(); ++i) {
 			if (std::abs(static_cast<long>(dict[i].size()) - m) > k)
 				continue;
@@ -109,10 +114,11 @@ public:
 				if (*std::min_element(row.begin(), row.end()) > k)
 					break;
 			}
-			const int dist = row.back();
-			if (dist <= k)
-				results.push_back({i, dist});
+			dist[i] = row.back();
 		}
+		for (std::size_t i = 0; i < dict.size(); ++i)
+			if (dist[i] <= k)
+				results.push_back({i, dist[i]});
 		return results;
 	}
 
