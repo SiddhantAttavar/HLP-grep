@@ -69,23 +69,32 @@ public:
 	 * @brief Min-plus product of two matrices.
 	 *
 	 * Computes `out(i, j) = min_c (a(i, c) + b(c, j))` with plain integer
-	 * addition, in O(a.rows * a.cols * b.cols) time. Candidates saturate
-	 * at INF, so entries never exceed INF.
+	 * addition. Candidates saturate at INF, so entries never exceed INF.
+	 *
+	 * Both factors must be layers of edit-distance DAGs driven by a
+	 * CostModel-validated cost assignment (match == 0, nonnegative
+	 * ins/del, ins + del >= mismatch): mat(a, b) is the lowest ED cost to
+	 * go from (row1, a) to (row3, b) across the shared DAG, so the
+	 * shortest paths of (row3, b) and (row3, b - 1) cannot cross and the
+	 * leftmost argmins over the candidate layer c obey the staircase
+	 *   opt(a, b - 1) <= opt(a, b) <= opt(a + 1, b)
+	 * (the right inequality follows the same non-crossing argument read
+	 * from the reverse direction, paths starting at (row3, b)). Every
+	 * candidate scan in [opt(a, b - 1), opt(a + 1, b)] therefore
+	 * telescopes: rows a are processed in decreasing order, columns in
+	 * increasing order, for O(a.rows * a.cols) cell operations instead
+	 * of the cubic scan. The monotone-argmin behaviour of every single
+	 * output row (opt(a, b - 1) <= opt(a, b)) is what the divide-and-
+	 * conquer of min_plus_apply relies on as well.
 	 *
 	 * @param a Left factor; entries must not exceed INF.
 	 * @param b Right factor; entries must not exceed INF.
-	 * @param monge When true, both factors are Monge: for each row of a,
-	 *        the column argmins of arow(c) + b(c, j) are monotone in j,
-	 *        so each output row is found with divide-and-conquer in
-	 *        O(a.cols + b.cols) argmin steps instead of the cubic scan.
-	 *        The caller guarantees Monge-ness; no verification is done.
 	 * @return The min-plus product a (x) b.
 	 * @throws std::invalid_argument if a.cols != b.rows or a.cols == 0
 	 *         (an empty inner dimension leaves the product undefined).
 	 */
 	static DistMatrix min_plus_product(const DistMatrix &a,
-	                                   const DistMatrix &b,
-	                                   bool monge = false) {
+	                                   const DistMatrix &b) {
 		if (a.cols != b.rows)
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_product: dimension mismatch");
@@ -96,46 +105,7 @@ public:
 		DistMatrix out(a.rows, b.cols);
 		if (a.rows == 0 || b.cols == 0)
 			return out;
-		if (monge) {
-			for (std::size_t i = 0; i < a.rows; ++i) {
-				const int *arow = &a.data[i * a.cols];
-				int *orow = &out.data[i * b.cols];
-				// An all-INF input row saturates every candidate at INF:
-				// skip the divide-and-conquer and emit the row directly.
-				bool all_inf = true;
-				for (std::size_t c = 0; c < a.cols; ++c)
-					if (arow[c] < INF) {
-						all_inf = false;
-						break;
-					}
-				if (all_inf) {
-					for (std::size_t j = 0; j < b.cols; ++j)
-						orow[j] = INF;
-					continue;
-				}
-				monge_row(arow, b, orow, 0, b.cols - 1, 0, a.cols - 1);
-			}
-			return out;
-		}
-		for (std::size_t i = 0; i < a.rows; ++i) {
-			const int *arow = &a.data[i * a.cols];
-			int *orow = &out.data[i * b.cols];
-			for (std::size_t j = 0; j < b.cols; ++j) {
-				const int cand = arow[0] + b.data[j];
-				orow[j] = cand > INF ? INF : cand;
-			}
-			for (std::size_t c = 1; c < a.cols; ++c) {
-				const int left = arow[c];
-				const int *brow = &b.data[c * b.cols];
-				for (std::size_t j = 0; j < b.cols; ++j) {
-					int cand = left + brow[j];
-					if (cand > INF)
-						cand = INF;
-					if (cand < orow[j])
-						orow[j] = cand;
-				}
-			}
-		}
+		argmin_sweep(a, b, out);
 		return out;
 	}
 
@@ -145,19 +115,20 @@ public:
 	 * Computes `out(j) = min_i (vec(i) + (*this)(i, j))` with plain integer
 	 * addition. Candidates saturate at INF, so entries never exceed INF.
 	 *
+	 * This matrix must be a layer of an edit-distance DAG driven by a
+	 * CostModel-validated cost assignment, so for a fixed vec the
+	 * leftmost argmins of vec(i) + (*this)(i, j) are monotone in j (the
+	 * same non-crossing shortest-path argument as
+	 * min_plus_product): the result is found with divide-and-conquer in
+	 * O(rows + cols) argmin steps instead of the full rows x cols scan.
+	 *
 	 * @param vec Row vector of costs, one per row of this matrix; entries
 	 *            must not exceed INF.
-	 * @param monge When true, this matrix is Monge: the column argmins
-	 *        of vec(i) + (*this)(i, j) are monotone in j, so the result
-	 *        is found with divide-and-conquer in O(rows + cols) argmin
-	 *        steps instead of the full rows x cols scan. The caller
-	 *        guarantees Monge-ness; no verification is done.
 	 * @return The resulting row vector, one entry per column.
 	 * @throws std::invalid_argument if vec.size() != rows or rows == 0
 	 *         (an empty row vector leaves the result undefined).
 	 */
-	std::vector<int> min_plus_apply(const std::vector<int> &vec,
-	                                bool monge = false) const {
+	std::vector<int> min_plus_apply(const std::vector<int> &vec) const {
 		if (vec.size() != rows)
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_apply: dimension mismatch");
@@ -166,37 +137,165 @@ public:
 			    "DistMatrix::min_plus_apply: empty row vector");
 
 		std::vector<int> out(cols);
-		if (monge) {
-			if (cols == 0)
-				return out;
-			monge_row(&vec[0], *this, &out[0], 0, cols - 1, 0,
-			          rows - 1);
+		if (cols == 0)
 			return out;
-		}
-		for (std::size_t j = 0; j < cols; ++j) {
-			const int cand = vec[0] + data[j];
-			out[j] = cand > INF ? INF : cand;
-		}
-		for (std::size_t i = 1; i < rows; ++i) {
-			const int left = vec[i];
-			const int *row = &data[i * cols];
-			for (std::size_t j = 0; j < cols; ++j) {
-				int cand = left + row[j];
-				if (cand > INF)
-					cand = INF;
-				if (cand < out[j])
-					out[j] = cand;
-			}
-		}
+		argmin_row(&vec[0], *this, &out[0], 0, cols - 1, 0, rows - 1);
 		return out;
 	}
 
 private:
 	/**
+	 * @brief Argmin-window computation of the min-plus product.
+	 *
+	 * Implements the staircase described in min_plus_product. The bottom
+	 * row (a = rows - 1) has no (a + 1) upper bound yet, so it is solved
+	 * by the divide-and-conquer once, capturing its leftmost argmins for
+	 * the rows above. Rows then run in decreasing a, columns increasing:
+	 * each cell scans candidates in [opt(a, j - 1), opt(a + 1, j)].
+	 *
+	 * Cheap INF emission: per call the sweep computes
+	 * first_finite1(a) = first c with in1(a, c) < INF and
+	 * first_finite2(c) = first j with in2(c, j) < INF — both with a
+	 * forward-only cursor (copy the previous row's value, advance while
+	 * the cell is INF), linear in the matrix since the values are
+	 * monotone across consecutive ED-layer rows. With the row's first
+	 * finite candidate at first_finite1(a), the earliest finite landing
+	 * over all remaining candidates is the suffix minimum of
+	 * first_finite2 at that index (a suffix-minimum prefix is needed
+	 * because real window-clamped layer blocks can have non-monotone
+	 * first_finite2 values). For b below that minimum every candidate
+	 * saturates at INF, so the cell is emitted in O(1) without
+	 * scanning; scans also start at left = first_finite1(a), since no
+	 * argmin can be smaller. An all-INF left row (first_finite1 == B)
+	 * whole-row INF-emits with a loose bound for the row above.
+	 *
+	 * @param a Left factor.
+	 * @param b Right factor.
+	 * @param out Pre-sized product matrix to fill (a.rows x b.cols).
+	 */
+	static void argmin_sweep(const DistMatrix &a, const DistMatrix &b,
+	                         DistMatrix &out) {
+		const std::size_t E = a.rows;
+		const std::size_t F = b.cols;
+		const std::size_t B = a.cols;
+		// first_finite1(ra): first candidate c with in1(ra, c) < INF
+		// (or B for an all-INF row); first_finite2(c): first column j
+		// with in2(c, j) < INF (or F). For ED-DAG layers all-INF rows
+		// are reserved pedantically: delete below and the reaches band
+		// shifts right monotonically with the index, so both are swept
+		// with a forward-only cursor: copy the previous row's value,
+		// then advance while the cell is INF. Amortized
+		// O(a.rows + B) and O(b.rows + F) over the whole
+		// precomputation; an all-INF row records itself as B/F and
+		// hands its predecessor's cursor to the next row. Nothing below
+		// relies on the monotonicity packing the cursor with (a wrong
+		// too-small cursor only costs extra scans).
+		std::vector<std::size_t> ff1(a.rows, B);
+		{
+			std::size_t cur = 0;
+			for (std::size_t ra = 0; ra < E; ++ra) {
+				std::size_t p = cur;
+				while (p < B && a.data[ra * B + p] >= INF)
+					++p;
+				ff1[ra] = p;
+				if (p < B)
+					cur = p; // all-INF rows retry at cur
+			}
+		}
+		std::vector<std::size_t> ff2(b.rows, F);
+		{
+			std::size_t cur = 0;
+			for (std::size_t c = 0; c < B; ++c) {
+				std::size_t p = cur;
+				while (p < F && b.data[c * F + p] >= INF)
+					++p;
+				ff2[c] = p;
+				if (p < F)
+					cur = p;
+			}
+		}
+		// suffix_min_ff2[c] = min over c' >= c of first_finite2(c').
+		// Columns below this are INF for every candidate from first
+		// finite on — the gate needs no monotonicity of ff2 itself
+		// (real window-clamped layer blocks can violate it).
+		std::vector<std::size_t> smin_ff2(b.rows + 1, F);
+		for (std::size_t c = b.rows; c-- > 0;)
+			smin_ff2[c] = std::min(ff2[c], smin_ff2[c + 1]);
+		// Argmins of the row below the one being processed (loose B - 1
+		// until the bottom row is computed for real). Argmins are
+		// candidate indices, so any loose bound must be the last
+		// candidate row; using an output-row index would read out of
+		// range. Processing rows in decreasing a keeps every needed
+		// bound one swap behind.
+		std::vector<std::size_t> opt_next(F, B - 1);
+		std::vector<std::size_t> opt_cur(F);
+		for (std::size_t ra = E; ra-- > 0;) {
+			const int *arow = &a.data[ra * a.cols];
+			int *orow = &out.data[ra * F];
+			const std::size_t ff = ff1[ra];
+			// First column that can be finite at all for this row:
+			// with the row's first finite candidate at ff, every
+			// candidate's first finite landing is the suffix
+			// minimum from ff, so columns below that are INF
+			// outright.
+			const std::size_t thr = ff < B ? smin_ff2[ff] : F;
+			if (ra + 1 == E) {
+				// Bottom row: solve with the divide-and-conquer
+				// and capture its leftmost argmins, seeded at the
+				// row's first finite candidate.
+				argmin_row(arow, b, orow, 0, F - 1,
+				           ff < B ? ff : 0, a.cols - 1, &opt_cur);
+			} else {
+				// Columns below the first finite landing are INF
+				// without scanning; the loose argmin bound keeps
+				// the staircase valid for the row above.
+				std::size_t j = 0;
+				for (; j < thr; ++j) {
+					orow[j] = INF;
+					opt_cur[j] = B - 1;
+				}
+				std::size_t left = ff;
+				for (; j < F; ++j) {
+					const std::size_t hi = opt_next[j];
+					std::size_t best_k = left;
+					int best =
+					    arow[left] + b.data[left * F + j];
+					if (best > INF)
+						best = INF;
+					for (std::size_t k = left + 1;
+					     k <= hi; ++k) {
+						int cand =
+						    arow[k] +
+						    b.data[k * F + j];
+						if (cand > INF)
+							cand = INF;
+						if (cand < best) {
+							best = cand;
+							best_k = k;
+						}
+					}
+					orow[j] = best;
+					// A saturated cell has no
+					// meaningful argmin; the
+					// loose whole-range bound
+					// keeps the staircase valid
+					// as the upper bound for the
+					// row above.
+					opt_cur[j] =
+					    best < INF ? best_k : B - 1;
+					left = best_k;
+				}
+			}
+			opt_next.swap(opt_cur);
+		}
+	}
+
+	/**
 	 * @brief Divide-and-conquer column minima of M(c, j) = arow(c) + b(c, j).
 	 *
-	 * With b Monge, M is Monge and the column argmins are monotone in j,
-	 * so the argmin of the middle column bounds the argmin ranges of both
+	 * With both factors ED-DAG layers, M's leftmost column argmins are
+	 * monotone in j (the non-crossing shortest-path staircase), so the
+	 * argmin of the middle column bounds the argmin ranges of both
 	 * halves. Ties resolve to the leftmost argmin, preserving monotonicity.
 	 *
 	 * @param arow One row of the left factor, length b.rows.
@@ -206,10 +305,13 @@ private:
 	 * @param j_hi Last column of the range to solve (inclusive).
 	 * @param k_lo First candidate row of the argmin range.
 	 * @param k_hi Last candidate row of the argmin range (inclusive).
+	 * @param found Optional buffer of length b.cols — when set, receives
+	 *        the leftmost argmin of each solved column (indexed by j).
 	 */
-	static void monge_row(const int *arow, const DistMatrix &b, int *orow,
-	                      std::size_t j_lo, std::size_t j_hi,
-	                      std::size_t k_lo, std::size_t k_hi) {
+	static void argmin_row(const int *arow, const DistMatrix &b, int *orow,
+	                       std::size_t j_lo, std::size_t j_hi,
+	                       std::size_t k_lo, std::size_t k_hi,
+	                       std::vector<std::size_t> *found = nullptr) {
 		if (j_lo > j_hi)
 			return;
 		const std::size_t j_mid = (j_lo + j_hi) / 2;
@@ -227,10 +329,17 @@ private:
 			}
 		}
 		orow[j_mid] = best;
+		// A saturated cell has no meaningful argmin; the loose k_hi
+		// bound keeps the staircase valid for callers of this row as an
+		// upper bound.
+		if (found)
+			(*found)[j_mid] = best < INF ? best_k : k_hi;
 		if (j_mid > j_lo)
-			monge_row(arow, b, orow, j_lo, j_mid - 1, k_lo, best_k);
+			argmin_row(arow, b, orow, j_lo, j_mid - 1, k_lo, best_k,
+			           found);
 		if (j_mid < j_hi)
-			monge_row(arow, b, orow, j_mid + 1, j_hi, best_k, k_hi);
+			argmin_row(arow, b, orow, j_mid + 1, j_hi, best_k, k_hi,
+			           found);
 	}
 
 	std::size_t rows;      ///< Number of rows.

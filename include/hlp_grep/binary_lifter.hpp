@@ -17,9 +17,6 @@
 #include <omp.h>
 
 #include <algorithm>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
@@ -71,19 +68,7 @@ public:
 	                      int k, std::size_t num_threads = 0)
 	    : graph(graph), query(query), cost_model(graph.cost_model()), k(k),
 	      num_threads(num_threads) {
-		const char *timing_env = std::getenv("HLP_GREP_LEVEL_TIMING");
-	const bool timing = timing_env && *timing_env != '0';
-	using clk = std::chrono::steady_clock;
-	clk::time_point stamp_ref = clk::now();
-	auto stamp = [&]() {
-		auto now = clk::now();
-		const double d =
-		    std::chrono::duration<double>(now - stamp_ref).count();
-		stamp_ref = now;
-		return d;
-	};
-	std::vector<std::pair<std::string, double>> timings;
-	const std::size_t n = graph.num_nodes();
+		const std::size_t n = graph.num_nodes();
 		const int threads = static_cast<int>(
 		    num_threads == 0 ? omp_get_max_threads() : num_threads);
 		max_level = 0;
@@ -112,7 +97,6 @@ public:
 		// the whole table to O(V) matrices.
 		up_mat.assign(
 		    n, std::vector<DistMatrix>(max_level, DistMatrix(0, 0)));
-		const double t_level0 = stamp();
 		// Per level, filter the nodes that actually build a block up
 		// front (serial, O(n * max_level), trivially cheap next to the
 		// per-node work). The surviving work is uniform — one block of
@@ -137,12 +121,10 @@ public:
 				level_nodes[t] = std::move(elig);
 			}
 		}
-		if (timing)
-			timings.emplace_back("elig", stamp());
-		// One region for all levels: only 16 threads benched once, with a
-		// single barrier between levels (the block being produced by a
-		// level can be read by the next one, the implicit work-sharing
-		// barrier separates them).
+		// One region for all levels: a small fixed spawn cost instead of
+		// one region per level, with a single barrier between levels (the
+		// block being produced by a level can be read by the next one, the
+		// implicit work-sharing barrier separates them).
 #pragma omp parallel num_threads(threads)
 		{
 			for (std::size_t t = 0; t < max_level; ++t) {
@@ -162,31 +144,13 @@ public:
 						up_mat[u][t] =
 						    DistMatrix::min_plus_product(
 						        up_mat[u][t - 1],
-						        up_mat[v][t - 1],
-						        cost_model.is_monge());
+						        up_mat[v][t - 1]);
 					}
 				}
-				// single's barrier also separates consecutive
-				// levels (a level's blocks may be read by the
-				// next one).
-#pragma omp single
-				if (timing)
-					timings.emplace_back(
-					    "level" + std::to_string(t),
-					    stamp());
+				// The for's implicit barrier separates
+				// consecutive levels (a level's blocks may be
+				// read by the next one).
 			}
-		}
-		if (timing) {
-			double total = 0;
-			for (const auto &[what, secs] : timings)
-				total += secs;
-			std::fprintf(stderr, "== lifter ctor (threads=%d)\n",
-			             threads);
-			for (const auto &[what, secs] : timings)
-				std::fprintf(stderr, "  %-12s %7.3f ms\n", what.c_str(),
-				             secs * 1e3);
-			std::fprintf(stderr, "  %-12s %7.3f ms\n", "TOTAL_ms",
-			             total * 1e3);
 		}
 	}
 
@@ -248,8 +212,7 @@ public:
 			if (level >= max_level || !up[v][level].has_value())
 				throw std::out_of_range(
 				    "BinaryLifter::jump: heavy chain too short");
-			row = up_mat[v][level].min_plus_apply(row,
-			                                      cost_model.is_monge());
+			row = up_mat[v][level].min_plus_apply(row);
 			v = *up[v][level];
 			rem -= std::size_t{1} << level;
 		}
@@ -349,10 +312,10 @@ private:
 	 * of quadratic-in-|label| work. For a one-character label this
 	 * reduces to the closed single-edge form; in general the matrix
 	 * equals the min-plus product of the label's one-character
-	 * transitions restricted to the band rectangle, so it is Monge
-	 * whenever the cost model is (see CostModel::is_monge), with INF
-	 * cells (b < a, seeds below the entry band, band-infeasible states)
-	 * holding the inequalities trivially.
+	 * transitions restricted to the band rectangle, so it satisfies the
+	 * ED-DAG layer precondition of DistMatrix::min_plus_product, with
+	 * INF cells (b < a, seeds below the entry band, band-infeasible
+	 * states) being unreachable constants of that DAG.
 	 */
 	DistMatrix edge_matrix(node_id u, node_id v) const {
 		const auto [lo_u, hi_u] = window(u);
@@ -398,7 +361,7 @@ private:
 	 * whose continuations all exceed the threshold k.
 	 */
 	void sweep_label(node_id v, std::vector<long> &f, std::size_t l0,
-				  bool single_source = false) const {
+			  bool single_source = false) const {
 		std::size_t a = l0;
 		while (a - l0 < f.size() && f[a - l0] == DistMatrix::INF) a++;
 		if (a - l0 == f.size()) return;
@@ -490,6 +453,20 @@ private:
 	/// up_mat[u][t] is the DistMatrix ed(u, 2^t, a, b) for every (u, t)
 	/// with a non-empty sub-chain.
 	std::vector<std::vector<DistMatrix>> up_mat;
+
+public:
+	/** Debug hook: raw level-t table of node u (temporary). */
+	const DistMatrix &level_table(node_id u, std::size_t t) const {
+		return up_mat[u][t];
+	}
+	/** Debug hook: number of levels (temporary). */
+	std::size_t max_levels_pub() const {
+		return max_level;
+	}
+	/** Debug hook: midpoint node of the level-t product (temporary). */
+	node_id mid(node_id u, std::size_t t) const {
+		return *up[u][t - 1];
+	}
 };
 
 } // namespace hlp_grep

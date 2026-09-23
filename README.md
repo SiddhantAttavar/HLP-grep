@@ -92,10 +92,11 @@ named object and keep it alive for as long as the consumer is used
 (`DEFAULT_COST_MODEL` is a permanent unit-cost object used as the default
 argument when no explicit model is supplied).
 
-`is_monge()` reports whether the model yields Monge single-edge chain
-blocks (and, by min-plus composition, Monge composed chain tables) the
-cheap way, with no DP tables: it checks in O(1) that match, mismatch,
-insertion and deletion costs are all nonnegative.
+The constructor enforces the structural precondition behind the
+argmin-staircase composition used by `DistMatrix::min_plus_product`
+(non-crossing shortest paths in the edit-distance DAG): `match == 0`,
+nonnegative `ins`/`del` and `ins + del >= mismatch`; violating models
+throw `std::invalid_argument`.
 
 ```cpp
 // Heavier noise operations: alignments prefer matching bases and
