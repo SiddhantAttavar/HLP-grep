@@ -126,6 +126,43 @@ public:
 		return results;
 	}
 
+public:
+	/** Debug hook: build()/scoring split (temporary). */
+	void lifter_build(const std::string &query, int k) const {
+		lifter.build(query, k);
+	}
+	/** Debug hook: scoring only, skipping the build (temporary). */
+	std::vector<Result> query_rows(const std::string &query, int k) const {
+		std::vector<Result> results;
+		if (dict.empty())
+			return results;
+		const long m = static_cast<long>(query.size());
+		std::vector<int> dist(dict.size(), DistMatrix::INF);
+#pragma omp parallel for schedule(dynamic)
+		for (std::size_t i = 0; i < dict.size(); ++i) {
+			if (std::abs(static_cast<long>(dict[i].size()) - m) > k)
+				continue;
+			const auto &cp = compressed_paths[i];
+			std::vector<int> row = initial_row(cp.start, query, k);
+			POAGraph::node_id cur = cp.start;
+			for (const auto &st : cp.steps) {
+				if (st.type == POAGraph::EdgeType::HEAVY) {
+					cur = lifter.jump(cur, st.length, row);
+				} else {
+					row = lifter.step(cur, st.next, row);
+					cur = st.next;
+				}
+				if (*std::min_element(row.begin(), row.end()) > k)
+					break;
+			}
+			dist[i] = row.back();
+		}
+		for (std::size_t i = 0; i < dict.size(); ++i)
+			if (dist[i] <= k)
+				results.push_back({i, dist[i]});
+		return results;
+	}
+
 private:
 	/**
 	 * @brief Initial DP row at the start node of a compressed path.

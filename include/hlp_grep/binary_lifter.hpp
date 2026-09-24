@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -100,7 +102,10 @@ public:
 	 * (*up[u][t - 1], t - 1), recursively down to level 0, so the
 	 * per-level build lists contain exactly the blocks the products
 	 * read. mark() must run before build(); it is idempotent via a
-	 * fresh touched table per call.
+	 * fresh touched table per call. mark() also pre-sizes up_mat: node
+	 * u's matrix vector holds levels 0 .. its largest touched level, so
+	 * build() fills slots in place instead of re-assigning the whole
+	 * structure per query.
 	 *
 	 * @param paths Compressed paths, one per dictionary sequence.
 	 */
@@ -151,6 +156,21 @@ public:
 				if (touched[u][t])
 					build_nodes[t].push_back(u);
 		}
+		// Pre-size up_mat: since (u, t) touched drags (u, t - 1) into
+		// the closure, each node's touched levels form a prefix of
+		// 0..its largest touched level; one vector per node sized to
+		// the top of that prefix. build() then fills the slots in
+		// place, and build() may not run without mark().
+		up_mat.assign(n, {});
+		for (std::size_t u = 0; u < n; ++u) {
+			std::size_t last = 0;
+			for (std::size_t t = max_level; t-- > 0;)
+				if (touched[u][t]) {
+					last = t + 1;
+					break;
+				}
+			up_mat[u].resize(last, DistMatrix(0, 0));
+		}
 	}
 
 	/**
@@ -161,26 +181,29 @@ public:
 	 * transition plus the destination node's label), and each higher
 	 * level is the min-plus product of two adjacent level (t - 1) blocks
 	 * sharing a chain midpoint. Untouched (u, t) slots stay empty.
-	 * Must be called before jump()/step()/window() reads; rebuilds
+	 * Must be called after mark() (which pre-sizes up_mat) and before
+	 * jump()/step()/window() reads; rebuilds every marked slot
 	 * unconditionally on every call.
 	 *
 	 * @param query Query string the chain distance tables index into.
 	 * @param k     Edit distance threshold widening the windows.
 	 */
 	void build(const std::string &query, int k) {
-		const std::size_t n = graph.num_nodes();
 		// The per-node blocks are one task each with uniform cost; past
 		// ~8 threads barrier and spawn overhead dominate the level loop.
 		const int threads = static_cast<int>(
 		    num_threads == 0 ? std::min(omp_get_max_threads(), 8)
 		                     : num_threads);
+		const char *timing_env = std::getenv("HLP_GREP_LEVEL_TIMING");
+		const bool timing = timing_env && *timing_env != '0';
+		// Per-level times collected by the master for env HLP_GREP_LEVEL_TIMING.
+		std::vector<double> level_ms(max_level);
 		this->query = query;
 		this->k = k;
-		up_mat.assign(
-		    n, std::vector<DistMatrix>(max_level, DistMatrix(0, 0)));
 #pragma omp parallel num_threads(threads)
 		{
 			for (std::size_t t = 0; t < max_level; ++t) {
+				const double t0 = omp_get_wtime();
 #pragma omp for schedule(static)
 				for (std::size_t idx = 0;
 				     idx < build_nodes[t].size(); ++idx) {
@@ -200,7 +223,28 @@ public:
 				// The for's implicit barrier separates
 				// consecutive levels (a level's blocks may be
 				// read by the next one).
+				if (timing) {
+#pragma omp master
+					level_ms[t] =
+					    (omp_get_wtime() - t0) * 1e3;
+				}
 			}
+		}
+		if (timing) {
+			std::vector<std::size_t> counts(max_level);
+			for (std::size_t t = 0; t < max_level; ++t)
+				counts[t] = build_nodes[t].size();
+			std::fprintf(stderr,
+			             "== build() level timings (threads=%d)\n",
+			             threads);
+			double total = 0;
+			for (std::size_t t = 0; t < max_level; ++t) {
+				std::fprintf(stderr, "  level %-3zu %8.3f ms  (%zu "
+				                     "blocks)\n",
+				             t, level_ms[t], counts[t]);
+				total += level_ms[t];
+			}
+			std::fprintf(stderr, "  total %8.3f ms\n", total);
 		}
 	}
 
@@ -382,6 +426,27 @@ private:
 		if (lL >= hL)
 			return mat; // final band empty: every crossing exceeds k
 		const auto [l0, h0] = window(v, 0);
+		if (label.size() == 1) {
+			const char c = label[0];
+			for (std::size_t a = std::max(lo_u, l0);
+			     a < std::min(hi_u, h0); ++a) {
+				if (a >= lo_v && a < hi_v)
+					mat(a - lo_u, a - lo_v) = cost_model.del();
+				int sub = cost_model.mismatch;
+				const std::size_t end =
+				    std::min(hi_v, a + static_cast<std::size_t>(k) + 2);
+				for (std::size_t b = a + 1; b < end; ++b) {
+					if (query[b - 1] == c)
+						sub = cost_model.match;
+					if (b >= lo_v)
+						mat(a - lo_u, b - lo_v) =
+						    static_cast<int>((b - a - 1) *
+						                         cost_model.ins() +
+						                     sub);
+				}
+			}
+			return mat;
+		}
 		// DP row over [l0, hL); band j of the label occupies
 		// window(v, j), and row L's band is exactly [lo_v, hi_v).
 		std::vector<long> f(hL - l0);
@@ -506,7 +571,8 @@ private:
 	std::vector<std::vector<std::optional<node_id>>> up;
 	/// up_mat[u][t] is the DistMatrix ed(u, 2^t, a, b) for every (u, t)
 	/// touched by queries and built by the last build() call; untouched
-	/// slots stay empty.
+	/// slots stay empty. mark() sizes each node's vector to the top of
+	/// its touched prefix, so build() fills slots in place.
 	std::vector<std::vector<DistMatrix>> up_mat;
 	/// touched[u][t] (mark-time) flags chain blocks the dry run marked;
 	/// consumed into the per-level build lists by mark().

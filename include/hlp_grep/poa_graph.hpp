@@ -916,6 +916,11 @@ private:
 	 * with outgoing edges, the edge with the highest count becomes HEAVY
 	 * (exactly one per node); ties are broken by the largest destination
 	 * node id. All other outgoing edges stay LIGHT.
+	 *
+	 * Only the main trunk is heavy: an edge becomes HEAVY only when its
+	 * weight reaches @p trunk (dict.size() / 2), i.e. at least half the
+	 * dictionary walks it. Nodes whose best edge is below the threshold
+	 * keep no heavy edge at all, so their chains end there.
 	 */
 	void mark_heavy_edges() {
 		std::vector<std::size_t> weight(next_edge_id, 0);
@@ -924,6 +929,7 @@ private:
 				weight[find_edge(out_edges[path[i - 1]], path[i])
 				           ->edge_id]++;
 
+		const std::size_t trunk = paths.size() / 2;
 		for (std::size_t u = 0; u < out_edges.size(); ++u) {
 			auto &edges = out_edges[u];
 			Edge *heavy = nullptr;
@@ -934,8 +940,10 @@ private:
 				     e.neighbor > heavy->neighbor))
 					heavy = &e;
 			}
-			if (heavy)
+			if (heavy && weight[heavy->edge_id] >= trunk)
 				heavy->type = EdgeType::HEAVY;
+			else
+				heavy = nullptr;
 			nodes[u].heavy_neighbour =
 			    heavy ? std::optional<node_id>(heavy->neighbor)
 			          : std::nullopt;
