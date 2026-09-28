@@ -119,3 +119,23 @@ the format is described in [tests/testcases/README.md](tests/testcases/README.md
 Both accept a mix of testcase files and folders containing `*.txt` files.
 The ctest suite also runs unit tests for `DistMatrix` and the POA graph.
 The `tests/testcases/manual` suite covers the implemented `Solver::query()`.
+
+## Performance flags
+
+All default to off so default builds stay portable; enable them explicitly
+when benchmarking on a fixed machine:
+
+- `-DHLP_GREP_MARCH=ON`: `-march=native` (GNU/Clang) for all `hlp_grep`
+  consumers (unlocks AVX-512 etc. on this machine).
+- `-DHLP_GREP_LTO=ON`: `-flto` at compile and link time.
+- `-DHLP_GREP_PGO=GENERATE|USE`: profile-guided optimization. Two-phase
+  workflow against a representative workload (the same flags must match in
+  both phases; keep `HLP_GREP_MARCH/LTO` identical):
+  ```bash
+  cmake -S . -B build-pgo -DCMAKE_BUILD_TYPE=Release -DHLP_GREP_MARCH=ON \
+    -DHLP_GREP_LTO=ON -DHLP_GREP_PGO=GENERATE
+  cmake --build build-pgo
+  build-pgo/tests/bench --method hlp_grep <representative-testcase>
+  cmake -S . -B build-pgo -DHLP_GREP_PGO=USE   # same dir, reuse .gcda
+  cmake --build build-pgo
+  ```
