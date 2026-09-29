@@ -67,6 +67,17 @@ void check_equal(const DistMatrix &got, const DistMatrix &want,
 }
 
 void test_product() {
+	// Products preserve the outer position ranges while composing adjacent
+	// ranges on the shared axis.
+	const DistMatrix ranged_a(2, 3, 0, {5, 7}, {10, 13});
+	const DistMatrix ranged_b(3, 2, 0, {10, 13}, {20, 22});
+	const DistMatrix ranged_out =
+	    DistMatrix::min_plus_product(ranged_a, ranged_b);
+	check(ranged_out.row_range() == std::make_pair<std::size_t, std::size_t>(5, 7),
+	      "product did not preserve row range");
+	check(ranged_out.col_range() == std::make_pair<std::size_t, std::size_t>(20, 22),
+	      "product did not preserve column range");
+
 	// Rectangular 1xN shapes (1 output row): direct, always exact.
 	const DistMatrix ra = make(1, 3, {"501"});
 	const DistMatrix rb = make(3, 2, {"12", "34", "56"});
@@ -209,6 +220,18 @@ void test_apply() {
 	        {0, DistMatrix::INF, 1, DistMatrix::INF, 0});
 	check(sf[0] == 0, "apply INF: entry 0 wrong");
 	check(sf[5] == 1, "apply INF: entry 5 wrong");
+
+	const std::vector<int> full_suffix = stair.min_plus_apply(
+	    {DistMatrix::INF, DistMatrix::INF, 1, DistMatrix::INF, 0});
+	const std::vector<int> clipped_suffix =
+	    stair.min_plus_apply({1, DistMatrix::INF, 0}, {2, 5});
+	check(clipped_suffix == full_suffix,
+	      "apply clipped suffix: values differ from full-row application");
+	const std::vector<int> empty_suffix =
+	    stair.min_plus_apply({}, {5, 5});
+	check(std::all_of(empty_suffix.begin(), empty_suffix.end(),
+	                   [](int value) { return value == DistMatrix::INF; }),
+	      "apply empty suffix: output is not all-INF");
 
 	// Zero columns take the early return as well.
 	const DistMatrix wide(2, 0);

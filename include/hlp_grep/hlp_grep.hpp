@@ -16,6 +16,7 @@
 #include <hlp_grep/result.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <string>
 #include <utility>
@@ -109,6 +110,7 @@ private:
 	struct QueryState {
 		POAGraph::node_id node;
 		std::vector<int> row;
+		std::pair<std::size_t, std::size_t> pos_range;
 	};
 
 	/** Lexicographic order over the canonical path-operation tokens. */
@@ -229,32 +231,46 @@ private:
 			while (stack.size() > common)
 				stack.pop_back();
 
-			if (stack.empty())
-				stack.push_back({cp.start, initial_row(cp.start, query, k)});
+			if (stack.empty()) {
+				std::vector<int> row = initial_row(cp.start, query, k);
+				auto pos_range = lifter.window(cp.start);
+				lifter.clip_row(row, pos_range);
+				stack.push_back(
+				    {cp.start, std::move(row), pos_range});
+			}
 
 			std::size_t step_index = stack.size() - 1;
-			bool dead = *std::min_element(stack.back().row.begin(),
-			                              stack.back().row.end()) > k;
+			bool dead = stack.back().row.empty();
 			while (!dead && step_index < cp.steps.size()) {
 				const auto &step = cp.steps[step_index];
-				POAGraph::node_id cur = stack.back().node;
-				std::vector<int> row = stack.back().row;
+				const QueryState &state = stack.back();
+				POAGraph::node_id cur = state.node;
+				const auto full_range = lifter.window(cur);
+				assert(state.pos_range.first >= full_range.first &&
+				       state.pos_range.second == full_range.second);
+				assert(state.row.size() ==
+				       state.pos_range.second - state.pos_range.first);
+				QueryState next_state = state;
 				if (step.type == POAGraph::EdgeType::HEAVY) {
 					if (step.length == 1) {
-						const auto next = *graph.node(cur).heavy_neighbour;
-						row = lifter.step(cur, next, row);
-						cur = next;
+						const auto destination =
+						    *graph.node(cur).heavy_neighbour;
+						lifter.step(cur, destination, next_state.row,
+						            next_state.pos_range);
+						next_state.node = destination;
 					} else {
-						cur = lifter.jump(cur, step.length, row);
+						next_state.node = lifter.jump(
+						    cur, step.length, next_state.row,
+						    next_state.pos_range);
 					}
 				} else {
-					row = lifter.step(cur, step.next, row);
-					cur = step.next;
+					lifter.step(cur, step.next, next_state.row,
+					            next_state.pos_range);
+					next_state.node = step.next;
 				}
-				stack.push_back({cur, std::move(row)});
+				stack.push_back(std::move(next_state));
 				++step_index;
-				dead = *std::min_element(stack.back().row.begin(),
-				                         stack.back().row.end()) > k;
+				dead = stack.back().row.empty();
 			}
 			if (!dead)
 				dist[id] = stack.back().row.back();

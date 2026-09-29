@@ -210,28 +210,27 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 		}
 
 	// Replay Solver::query for every query on a decomposed-then-built
-	// lifter, tracking which (u, bit) tables each jump applies (jump
-	// applies the bits of st.length in order, walking the chain).
+	// lifter, tracking which (u, bit) tables each pre-split heavy block uses.
 	std::size_t jumps = 0, applied = 0;
 	std::vector<std::size_t> used_by_level(max_level, 0);
 	std::set<UT> used_union;
 	BinaryLifter lifter(graph);
-	{
-		std::vector<POAGraph::CompressedPath> cps;
-		cps.reserve(tc.dict.size());
-		for (std::size_t i = 0; i < tc.dict.size(); ++i)
-			cps.push_back(graph.compressed_path(i));
-		lifter.decompose(cps);
-	}
+	std::vector<POAGraph::CompressedPath> cps;
+	cps.reserve(tc.dict.size());
+	for (std::size_t i = 0; i < tc.dict.size(); ++i)
+		cps.push_back(graph.compressed_path(i));
+	lifter.decompose(cps);
 	for (const auto &[k, query] : tc.queries) {
 		lifter.build(query, k);
 		const long m = static_cast<long>(query.size());
 		for (std::size_t i = 0; i < tc.dict.size(); ++i) {
 			if (std::abs(static_cast<long>(tc.dict[i].size()) - m) > k)
 				continue;
-			const auto &cp = graph.compressed_path(i);
+			const auto &cp = cps[i];
 			std::vector<int> row = initial_row(graph, tc.cost, cp.start,
 			                                   query, k);
+			auto pos_range = lifter.window(cp.start);
+			lifter.clip_row(row, pos_range);
 			POAGraph::node_id cur = cp.start;
 			for (const auto &st : cp.steps) {
 				if (st.type == POAGraph::EdgeType::HEAVY) {
@@ -243,13 +242,13 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 						if (used_union.emplace(cur, bit).second)
 							used_by_level[bit]++;
 					}
-					cur = lifter.jump(cur, st.length, row);
+					cur = lifter.jump(cur, st.length, row, pos_range);
 					jumps++;
 				} else {
-					row = lifter.step(cur, st.next, row);
+					lifter.step(cur, st.next, row, pos_range);
 					cur = st.next;
 				}
-				if (*std::min_element(row.begin(), row.end()) > k)
+				if (row.empty())
 					break;
 			}
 		}

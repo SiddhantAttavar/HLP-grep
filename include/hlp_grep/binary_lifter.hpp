@@ -257,18 +257,14 @@ public:
 	 *        the identity) and advances the caller's DP row across the
 	 *        jumped chain.
 	 *
-	 * @p cost must hold one entry per allowed query position of the
-	 * start node — its after-label window (see window()). It is advanced
-	 * with DistMatrix::min_plus_apply
-	 * over precomputed power-of-two chain blocks chosen greedily: at each
-	 * node v with `rem` steps left, the block size is
-	 * 2^min(ctz(heavy_length(v)), floor(log2(rem))) — the smaller of the
-	 * lowest set bit of the node's heavy length and the highest set bit
-	 * of the remaining step count. The first term guarantees the block
-	 * was precomputed (level t exists exactly when 2^t divides the
-	 * heavy length), the second keeps the walked total at l; the blocks
-	 * apply in path order. Afterwards @p cost holds one entry per
-	 * allowed position of the reached node. In effect, after the call
+	 * @p cost and @p pos_range hold the start node's DP row, possibly
+	 * clipped to a suffix of its after-label window. They are advanced
+	 * with one DistMatrix::min_plus_apply over the precomputed power-of-two
+	 * block. decompose() has already split path runs so each call's length
+	 * is a power of two and the corresponding level exists at @p u.
+	 * Afterwards @p cost holds one entry per
+	 * allowed position of the reached node, then clipped to the first
+	 * position whose cost is at most k. In effect, after the call
 	 *   cost(b) = min_a cost_in(a) + ed(u, l, a, b)
 	 * for the chain [u, u^1, ..., u^l] (each heavy edge crossing its
 	 * destination node's full label). Cells no transition realizes carry
@@ -277,47 +273,46 @@ public:
 	 *
 	 * @param u    Node to start from.
 	 * @param l    Number of heavy steps to walk.
-	 * @param cost DP row of the start node; replaced by the advanced row
+	 * @param cost DP row of the start node; replaced by the clipped row
 	 *             of the reached node.
+	 * @param pos_range Position range represented by @p cost; replaced by
+	 *                  the clipped range of the reached node.
 	 * @return The node l heavy steps from u.
 	 * @throws std::out_of_range if u is not a valid node id or the heavy
 	 *         chain ends before l steps.
-	 * @throws std::invalid_argument if cost.size() does not match the
-	 *         start node's window.
+	 * @throws std::invalid_argument if the row does not match a suffix of
+	 *         the start node's window or l is not a power-of-two block.
 	 */
-	node_id jump(node_id u, int l, std::vector<int> &cost) const {
+	node_id jump(node_id u, int l, std::vector<int> &cost,
+	             std::pair<std::size_t, std::size_t> &pos_range) const {
 		if (u >= up.size())
 			throw std::out_of_range("BinaryLifter::jump: invalid node id");
-		node_id v = u;
+		validate_row(u, cost, pos_range);
+		if (l < 0)
+			throw std::invalid_argument("BinaryLifter::jump: negative length");
 		if (l == 0)
 			return u;
-		std::vector<int> row(cost);
-		std::size_t rem = static_cast<std::size_t>(l);
-		while (rem > 0) {
-			if (!graph.node(v).heavy_neighbour.has_value())
-				throw std::out_of_range(
-				    "BinaryLifter::jump: heavy chain too short");
-			// Block size 2^level: the smaller of the lowest set bit of
-			// the node's heavy length (guarantees the block exists) and
-			// the highest set bit of the remaining step count (keeps the
-			// walked total at l).
-			const std::size_t level =
-			    std::min(static_cast<unsigned long long>(
-			                 __builtin_ctzll(
-			                     graph.node(v).heavy_length)),
-			             static_cast<unsigned long long>(
-			                 63 - __builtin_clzll(rem)));
-			if (level >= max_level || !up[v][level].has_value())
-				throw std::out_of_range(
-				    "BinaryLifter::jump: heavy chain too short");
-			if (up_mat[v][level].num_cols() == 0)
-				throw std::out_of_range(
-				    "BinaryLifter::jump: chain block was not "
-				    "marked/built");
-			row = up_mat[v][level].min_plus_apply(row);
-			v = *up[v][level];
-			rem -= std::size_t{1} << level;
-		}
+		const std::size_t block = static_cast<std::size_t>(l);
+		if ((block & (block - 1)) != 0)
+			throw std::invalid_argument(
+			    "BinaryLifter::jump: length is not a power of two");
+		if (!graph.node(u).heavy_neighbour.has_value())
+			throw std::out_of_range(
+			    "BinaryLifter::jump: heavy chain too short");
+		const std::size_t level = 63 - __builtin_clzll(block);
+		if (level >= max_level || !up[u][level].has_value())
+			throw std::out_of_range(
+			    "BinaryLifter::jump: heavy chain too short");
+		if (level >= up_mat[u].size() ||
+		    up_mat[u][level].num_cols() == 0)
+			throw std::out_of_range(
+			    "BinaryLifter::jump: chain block was not marked/built");
+		const DistMatrix &mat = up_mat[u][level];
+		std::vector<int> row = mat.min_plus_apply(cost, pos_range);
+		const node_id v = *up[u][level];
+		pos_range = mat.col_range();
+		assert(pos_range == window(v));
+		clip_row(row, pos_range);
 		cost = std::move(row);
 		return v;
 	}
@@ -327,9 +322,10 @@ public:
 	 *        edge transition plus v's whole label directly to the input
 	 *        row and returns the advanced row.
 	 *
-	 * @p cost holds the allowed query positions at u (its after-label
-	 * window, see window()); the returned row holds those at v. The row
-	 * is computed by a semiglobal ED DP that superposes all source
+	 * @p cost and @p pos_range hold the allowed query positions at u,
+	 * possibly clipped to a suffix; on return they hold v's row clipped
+	 * to a suffix as well. The row is computed by a semiglobal ED DP that
+	 * superposes all source
 	 * positions: row 0 seeds the source costs within the entry band
 	 * window(v, 0) — sources below it die, since every continuation
 	 * leaves all bands — chained left to right with insertions, and
@@ -348,53 +344,92 @@ public:
 	 *
 	 * @param u    Source node of the edge.
 	 * @param v    Destination node of the edge.
-	 * @param cost DP row of u; must hold one entry per position of u's
-	 *             window.
-	 * @return The DP row at v, one entry per position of v's window.
-	 * @throws std::invalid_argument if cost.size() does not match u's
-	 *         window.
+	 * @param cost DP row of u; replaced by the clipped DP row at v.
+	 * @param pos_range Position range represented by @p cost; replaced by
+	 *                  the clipped range at v.
+	 * @throws std::invalid_argument if the row does not match a suffix of
+	 *         u's window.
 	 * @pre There is an edge (u, v) in the graph; not verified here.
 	 */
-	std::vector<int> step(node_id u, node_id v,
-	                      const std::vector<int> &cost) const {
-		const auto [lo_u, hi_u] = window(u);
+	void step(node_id u, node_id v, std::vector<int> &cost,
+	          std::pair<std::size_t, std::size_t> &pos_range) const {
+		const std::size_t hi_u = window(u).second;
 		const auto [lo_v, hi_v] = window(v);
-		if (cost.size() != static_cast<std::size_t>(hi_u - lo_u))
-			throw std::invalid_argument(
-			    "BinaryLifter::step: cost size does not match u's window");
+		validate_row(u, cost, pos_range);
 		const std::string &label = graph.seq(v);
 		std::vector<int> out(static_cast<std::size_t>(hi_v - lo_v),
 		                     DistMatrix::INF);
 		const auto [lL, hL] = window(v, static_cast<long>(label.size()));
-		if (lL >= hL)
-			return out; // final band empty: every crossing exceeds k
-		const auto [l0, h0] = window(v, 0);
-		std::vector<long> f(static_cast<std::size_t>(hL - l0),
-		                    DistMatrix::INF);
-		// Row 0: the source row clipped to the entry band, then chained
-		// with insertions at v. Sources outside [l0, h0) die: below the
-		// band every continuation leaves all bands, above it they start
-		// past the query (possible only for clamped all-INF rows).
-		for (std::size_t b = std::max(l0, lo_u); b < std::min(h0, hi_u); ++b)
-			f[b - l0] = cost[b - lo_u];
-		for (std::size_t b = l0 + 1; b < h0; ++b) {
-			const long prev = f[b - 1 - l0];
-			if (prev >= DistMatrix::INF)
-				continue;
-			long cur = prev + cost_model.ins();
-			if (cur > DistMatrix::INF)
-				cur = DistMatrix::INF;
-			if (cur < f[b - l0])
-				f[b - l0] = cur;
+		if (lL < hL) {
+			const auto [l0, h0] = window(v, 0);
+			std::vector<long> f(static_cast<std::size_t>(hL - l0),
+			                    DistMatrix::INF);
+			// Row 0: seed only the retained source suffix, then chain
+			// insertions at v. Omitted source states are all >k, so their
+			// continuations cannot contribute a <=k result.
+			for (std::size_t b = std::max(l0, pos_range.first);
+			     b < std::min(h0, hi_u); ++b)
+				f[b - l0] = cost[b - pos_range.first];
+			for (std::size_t b = l0 + 1; b < h0; ++b) {
+				const long prev = f[b - 1 - l0];
+				if (prev >= DistMatrix::INF)
+					continue;
+				long cur = prev + cost_model.ins();
+				if (cur > DistMatrix::INF)
+					cur = DistMatrix::INF;
+				if (cur < f[b - l0])
+					f[b - l0] = cur;
+			}
+			sweep_label(v, f, l0);
+			for (std::size_t b = lo_v; b < hi_v; ++b)
+				out[static_cast<std::size_t>(b - lo_v)] =
+				    static_cast<int>(f[b - l0]);
 		}
-		sweep_label(v, f, l0);
-		for (std::size_t b = lo_v; b < hi_v; ++b)
-			out[static_cast<std::size_t>(b - lo_v)] =
-			    static_cast<int>(f[b - l0]);
-		return out;
+		pos_range = {lo_v, hi_v};
+		clip_row(out, pos_range);
+		cost = std::move(out);
+	}
+
+	/** Half-open query-position window represented by a node's DP row. */
+	std::pair<std::size_t, std::size_t> window(node_id u) const {
+		const auto [lo, hi] = window(u, graph.seq(u).size());
+		return {lo, std::max(hi, lo + 1)};
+	}
+
+	/** Removes the leading row cells whose costs exceed the current threshold. */
+	void clip_row(std::vector<int> &row,
+	              std::pair<std::size_t, std::size_t> &pos_range) const {
+		if (pos_range.second < pos_range.first ||
+		    row.size() != pos_range.second - pos_range.first)
+			throw std::invalid_argument(
+			    "BinaryLifter::clip_row: row/range size mismatch");
+		std::size_t removed = 0;
+		while (removed < row.size() && row[removed] > k)
+			++removed;
+		if (removed == row.size()) {
+			row.clear();
+			pos_range.first = pos_range.second;
+			return;
+		}
+		if (removed > 0) {
+			row.erase(row.begin(), row.begin() + removed);
+			pos_range.first += removed;
+		}
 	}
 
 private:
+	void validate_row(
+	    node_id u, const std::vector<int> &row,
+	    const std::pair<std::size_t, std::size_t> &pos_range) const {
+		const auto full_range = window(u);
+		if (pos_range.first < full_range.first ||
+		    pos_range.second != full_range.second ||
+		    pos_range.first > pos_range.second ||
+		    row.size() != pos_range.second - pos_range.first)
+			throw std::invalid_argument(
+			    "BinaryLifter: row does not match a suffix of the node window");
+	}
+
 	/**
 	 * @brief The DistMatrix of the heavy edge (u, v): the transition
 	 *        across the edge followed by v's whole label, i.e.
@@ -424,8 +459,8 @@ private:
 		const auto [lo_v, hi_v] = window(v);
 		const std::string &label = graph.seq(v);
 		DistMatrix mat(static_cast<std::size_t>(hi_u - lo_u),
-		               static_cast<std::size_t>(hi_v - lo_v),
-		               DistMatrix::INF);
+		               static_cast<std::size_t>(hi_v - lo_v), DistMatrix::INF,
+		               {lo_u, hi_u}, {lo_v, hi_v});
 		const auto [lL, hL] = window(v, label.size());
 		if (lL >= hL)
 			return mat; // final band empty: every crossing exceeds k
@@ -511,24 +546,6 @@ private:
 				diag = up;
 			}
 		}
-	}
-
-	/**
-	 * @brief Half-open [lo, hi) window of query positions allowed at a
-	 *        node under the stored query context: the after-label band
-	 *        window(u, |label|) (see the offset overload), with the
-	 *        lower end clamped to a non-empty range. The upper end
-	 *        includes position |query| (all query characters consumed),
-	 *        which Solver::query reads as the final row's last entry for
-	 *        any path matched within k.
-	 *
-	 * The non-empty clamp keeps matrix dimensions positive for nodes
-	 * whose feasible band lies entirely outside [0, |query|]: their rows
-	 * carry valid (large) transition values only.
-	 */
-	std::pair<std::size_t, std::size_t> window(node_id u) const {
-		const auto [lo, hi] = window(u, graph.seq(u).size());
-		return {lo, std::max(hi, lo + 1)};
 	}
 
 	/**

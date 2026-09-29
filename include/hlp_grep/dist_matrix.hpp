@@ -12,9 +12,11 @@
 #pragma once
 #include <hlp_grep/cost_model.hpp>
 
+#include <cassert>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace hlp_grep {
@@ -37,13 +39,44 @@ public:
 	 * @param fill Initial value for every entry (defaults to 0).
 	 */
 	DistMatrix(std::size_t rows, std::size_t cols, int fill = 0)
-	    : rows(rows), cols(cols), data(rows * cols, fill) {}
+	    : DistMatrix(rows, cols, fill, {0, rows}, {0, cols}) {}
+
+	/**
+	 * @brief Constructs a matrix with explicit query-position ranges.
+	 *
+	 * @param rows Number of rows.
+	 * @param cols Number of columns.
+	 * @param fill Initial value for every entry.
+	 * @param row_range Half-open query-position range represented by rows.
+	 * @param col_range Half-open query-position range represented by columns.
+	 */
+	DistMatrix(std::size_t rows, std::size_t cols, int fill,
+	           std::pair<std::size_t, std::size_t> row_range,
+	           std::pair<std::size_t, std::size_t> col_range)
+	    : rows(rows), cols(cols), row_range_value(row_range),
+	      col_range_value(col_range),
+	      data(rows * cols, fill) {
+		assert(row_range.second >= row_range.first &&
+		       row_range.second - row_range.first == rows);
+		assert(col_range.second >= col_range.first &&
+		       col_range.second - col_range.first == cols);
+	}
 
 	/// Number of rows.
 	std::size_t num_rows() const { return rows; }
 
 	/// Number of columns.
 	std::size_t num_cols() const { return cols; }
+
+	/// Half-open query-position range represented by matrix rows.
+	std::pair<std::size_t, std::size_t> row_range() const {
+		return row_range_value;
+	}
+
+	/// Half-open query-position range represented by matrix columns.
+	std::pair<std::size_t, std::size_t> col_range() const {
+		return col_range_value;
+	}
 
 	/**
 	 * @brief Mutable access to entry (i, j).
@@ -101,8 +134,10 @@ public:
 		if (a.cols == 0)
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_product: empty inner dimension");
+		assert(a.col_range() == b.row_range() &&
+		       "DistMatrix::min_plus_product: position range mismatch");
 
-		DistMatrix out(a.rows, b.cols);
+		DistMatrix out(a.rows, b.cols, 0, a.row_range(), b.col_range());
 		if (a.rows == 0 || b.cols == 0)
 			return out;
 		argmin_sweep(a, b, out);
@@ -129,17 +164,47 @@ public:
 	 *         (an empty row vector leaves the result undefined).
 	 */
 	std::vector<int> min_plus_apply(const std::vector<int> &vec) const {
-		if (vec.size() != rows)
-			throw std::invalid_argument(
-			    "DistMatrix::min_plus_apply: dimension mismatch");
+		return min_plus_apply(vec, row_range_value);
+	}
+
+	/**
+	 * @brief Applies this matrix to a suffix of its row-position range.
+	 *
+	 * The first element of @p vec corresponds to input_range.first. Any
+	 * earlier matrix rows are excluded; the range must end at this matrix's
+	 * row_range().second. This lets callers omit source states already known
+	 * to exceed their threshold.
+	 *
+	 * @param vec Costs for the suffix of matrix rows.
+	 * @param input_range Query-position range represented by @p vec.
+	 * @return One entry per matrix column.
+	 * @throws std::invalid_argument if the input range is not a matrix-row
+	 *         suffix or the vector length does not match that suffix.
+	 */
+	std::vector<int> min_plus_apply(
+	    const std::vector<int> &vec,
+	    std::pair<std::size_t, std::size_t> input_range) const {
 		if (rows == 0)
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_apply: empty row vector");
+		if (input_range.first < row_range_value.first ||
+		    input_range.second != row_range_value.second ||
+		    input_range.first > input_range.second)
+			throw std::invalid_argument(
+			    "DistMatrix::min_plus_apply: invalid input position range");
+		const std::size_t offset = input_range.first - row_range_value.first;
+		const std::size_t expected = row_range_value.second - input_range.first;
+		if (vec.size() != expected)
+			throw std::invalid_argument(
+			    "DistMatrix::min_plus_apply: dimension mismatch");
 
-		std::vector<int> out(cols);
+		std::vector<int> out(cols, INF);
 		if (cols == 0)
 			return out;
-		argmin_row(&vec[0], *this, &out[0], 0, cols - 1, 0, rows - 1);
+		if (vec.empty())
+			return out;
+		argmin_row(vec.data(), *this, out.data(), 0, cols - 1,
+		           offset, rows - 1, nullptr, offset);
 		return out;
 	}
 
@@ -307,20 +372,22 @@ private:
 	 * @param k_hi Last candidate row of the argmin range (inclusive).
 	 * @param found Optional buffer of length b.cols — when set, receives
 	 *        the leftmost argmin of each solved column (indexed by j).
+	 * @param a_offset Candidate-row index represented by arow[0].
 	 */
 	static void argmin_row(const int *arow, const DistMatrix &b, int *orow,
 	                       std::size_t j_lo, std::size_t j_hi,
 	                       std::size_t k_lo, std::size_t k_hi,
-	                       std::vector<std::size_t> *found = nullptr) {
+	                       std::vector<std::size_t> *found = nullptr,
+	                       std::size_t a_offset = 0) {
 		if (j_lo > j_hi)
 			return;
 		const std::size_t j_mid = (j_lo + j_hi) / 2;
 		std::size_t best_k = k_lo;
-		int best = arow[k_lo] + b.data[k_lo * b.cols + j_mid];
+		int best = arow[k_lo - a_offset] + b.data[k_lo * b.cols + j_mid];
 		if (best > INF)
 			best = INF;
 		for (std::size_t k = k_lo + 1; k <= k_hi; ++k) {
-			int cand = arow[k] + b.data[k * b.cols + j_mid];
+			int cand = arow[k - a_offset] + b.data[k * b.cols + j_mid];
 			if (cand > INF)
 				cand = INF;
 			if (cand < best) {
@@ -336,14 +403,17 @@ private:
 			(*found)[j_mid] = best < INF ? best_k : k_hi;
 		if (j_mid > j_lo)
 			argmin_row(arow, b, orow, j_lo, j_mid - 1, k_lo, best_k,
-			           found);
+			           found, a_offset);
 		if (j_mid < j_hi)
 			argmin_row(arow, b, orow, j_mid + 1, j_hi, best_k, k_hi,
-			           found);
+			           found, a_offset);
 	}
 
 	std::size_t rows;      ///< Number of rows.
 	std::size_t cols;      ///< Number of columns.
+	/// Half-open query-position ranges represented by rows and columns.
+	std::pair<std::size_t, std::size_t> row_range_value;
+	std::pair<std::size_t, std::size_t> col_range_value;
 	std::vector<int> data; ///< Flat row-major storage.
 };
 
