@@ -38,10 +38,10 @@ namespace hlp_grep {
  * markers.
  *
  * The lifter is built in two stages. The constructor builds only the
- * query-independent node table; mark() then walks the dictionary's
- * compressed paths to record which (node, level) chain blocks queries can
- * need, and build(query, k) materializes only those blocks for one
- * (query, k) pair.
+ * query-independent node table; decompose() expands the dictionary's
+ * compressed heavy runs into the exact blocks used by jump() and records
+ * which (node, level) chain blocks queries can need. build(query, k)
+ * materializes only those blocks for one (query, k) pair.
  */
 class BinaryLifter {
 public:
@@ -58,7 +58,7 @@ public:
 	 * up[u][t] = up[up[u][t - 1]][t - 1] whenever up[u][t - 1] is set, so
 	 * no topological order is needed.
 	 *
-	 * The chain tables are NOT built here: mark() records which blocks
+	 * The chain tables are NOT built here: decompose() records which blocks
 	 * queries touch and build(query, k) materializes exactly those. jump
 	 * and step must not be called before build().
 	 *
@@ -86,58 +86,62 @@ public:
 	}
 
 	/**
-	 * @brief Dry-runs the dictionary's compressed paths to record which
-	 *        (node, level) chain blocks queries touch.
+	 * @brief Decomposes heavy runs in the paths and records which (node,
+	 *        level) chain blocks queries touch.
 	 *
-	 * Every path is walked exactly as Solver::query's scoring loop
-	 * walks it, but without DP rows: light edges only move the walk
-	 * cursor, and each heavy jump is expanded arithmetically over the up
-	 * table — the greedy block choice (level = the smaller of the
-	 * lowest set bit of heavy_length(v) and the highest set bit of the
-	 * remaining step count) is purely chain-structure arithmetic, so
-	 * the marked set is the same for every (query, k). Scoring aborts
-	 * rows whose minimum exceeds k; the dry run cannot evaluate that,
-	 * so it marks the abort-free superset for the dictionary. The
+	 * Each HEAVY step is replaced in-place by the greedy blocks jump()
+	 * applies: at node v with rem steps left, the level is the smaller of
+	 * the lowest set bit of heavy_length(v) and the highest set bit of rem.
+	 * This depends only on the graph/path structure, so the decomposition
+	 * and touched set are query-independent. Scoring can abort rows whose
+	 * minimum exceeds k; decompose() cannot evaluate that, so it records
+	 * the abort-free superset for the dictionary. The
 	 * dependency closure is included: block (u, t) needs (u, t - 1) and
 	 * (*up[u][t - 1], t - 1), recursively down to level 0, so the
 	 * per-level build lists contain exactly the blocks the products
-	 * read. mark() must run before build(); it is idempotent via a
-	 * fresh touched table per call. mark() also pre-sizes up_mat: node
+	 * read. decompose() must run before build(); it can be called again
+	 * because already decomposed power-of-two steps are fixed points. It
+	 * also pre-sizes up_mat: node
 	 * u's matrix vector holds levels 0 .. its largest touched level, so
 	 * build() fills slots in place instead of re-assigning the whole
 	 * structure per query.
 	 *
-	 * @param paths Compressed paths, one per dictionary sequence.
+	 * @param paths Compressed paths, one per dictionary sequence; modified
+	 *              in place to split heavy runs into jump blocks.
 	 */
-	void mark(const std::vector<POAGraph::CompressedPath> &paths) {
+	void decompose(std::vector<POAGraph::CompressedPath> &paths) {
 		const std::size_t n = graph.num_nodes();
 		touched.assign(n, std::vector<char>(max_level, 0));
-		for (const auto &cp : paths) {
+		for (auto &cp : paths) {
 			node_id cur = cp.start;
+			std::vector<POAGraph::CompressedEdge> decomposed;
+			decomposed.reserve(cp.steps.size());
 			for (const auto &st : cp.steps) {
 				if (st.type == POAGraph::EdgeType::HEAVY) {
-					// Expand the jump arithmetically, marking
-					// the greedy block sequence; the cursor
-					// mirrors the runtime walk.
-					node_id v = cur;
 					std::size_t rem = st.length;
 					while (rem > 0) {
 						const std::size_t level =
 						    std::min(
 						        static_cast<unsigned long long>(
 						            __builtin_ctzll(graph.node(
-						                v).heavy_length)),
+						                cur).heavy_length)),
 						        static_cast<unsigned long long>(
 						            63 - __builtin_clzll(rem)));
-						touched[v][level] = true;
-						v = *up[v][level];
-						rem -= std::size_t{1} << level;
+						const std::size_t block = std::size_t{1} << level;
+						POAGraph::CompressedEdge block_step;
+						block_step.type = POAGraph::EdgeType::HEAVY;
+						block_step.length = static_cast<int>(block);
+						decomposed.push_back(block_step);
+						touched[cur][level] = true;
+						cur = *up[cur][level];
+						rem -= block;
 					}
-					cur = v;
 				} else {
+					decomposed.push_back(st);
 					cur = st.next;
 				}
 			}
+			cp.steps = std::move(decomposed);
 		}
 		// Dependency closure: (u, t) needs (u, t - 1) and its chain
 		// midpoint's (t - 1) block. One sweep per level from the top
@@ -160,7 +164,7 @@ public:
 		// the closure, each node's touched levels form a prefix of
 		// 0..its largest touched level; one vector per node sized to
 		// the top of that prefix. build() then fills the slots in
-		// place, and build() may not run without mark().
+		// place, and build() may not run without decompose().
 		up_mat.assign(n, {});
 		for (std::size_t u = 0; u < n; ++u) {
 			std::size_t last = 0;
@@ -176,12 +180,12 @@ public:
 	/**
 	 * @brief Materializes the chain tables for one (query, k) pair.
 	 *
-	 * Only the blocks marked by mark() are built — level 0 holds the
+	 * Only the blocks marked by decompose() are built — level 0 holds the
 	 * per-edge blocks of the touched heavy outgoing edges (the edge
 	 * transition plus the destination node's label), and each higher
 	 * level is the min-plus product of two adjacent level (t - 1) blocks
 	 * sharing a chain midpoint. Untouched (u, t) slots stay empty.
-	 * Must be called after mark() (which pre-sizes up_mat) and before
+	 * Must be called after decompose() (which pre-sizes up_mat) and before
 	 * jump()/step()/window() reads; rebuilds every marked slot
 	 * unconditionally on every call.
 	 *
@@ -571,11 +575,11 @@ private:
 	std::vector<std::vector<std::optional<node_id>>> up;
 	/// up_mat[u][t] is the DistMatrix ed(u, 2^t, a, b) for every (u, t)
 	/// touched by queries and built by the last build() call; untouched
-	/// slots stay empty. mark() sizes each node's vector to the top of
+	/// slots stay empty. decompose() sizes each node's vector to the top of
 	/// its touched prefix, so build() fills slots in place.
 	std::vector<std::vector<DistMatrix>> up_mat;
 	/// touched[u][t] (mark-time) flags chain blocks the dry run marked;
-	/// consumed into the per-level build lists by mark().
+	/// consumed into the per-level build lists by decompose().
 	std::vector<std::vector<char>> touched;
 	/// Per-level (ascending node order) list of blocks build() builds.
 	std::vector<std::vector<std::size_t>> build_nodes;

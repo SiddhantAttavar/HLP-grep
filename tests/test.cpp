@@ -130,6 +130,69 @@ void test_testcase(const fs::path &file, const Testcase &tc,
 	          << tc.queries.size() << " queries)\n";
 }
 
+void test_query_prefix_sharing() {
+	const std::vector<std::string> dict{
+	    "ACGT", "ACGA", "A", "ACGC", "ACGTA", "ACTT", "TCGT", "ACGT"};
+	const Solver solver(dict);
+	const auto results = solver.query("ACGT", 1);
+	if (!std::is_sorted(results.begin(), results.end(),
+	                    [](const Result &a, const Result &b) {
+		                    return a.id < b.id;
+	                    })) {
+		std::cerr << "prefix-sharing: result ids are not sorted\n";
+		std::exit(1);
+	}
+	const std::vector<Result> expected{
+	    {0, 0}, {1, 1}, {3, 1}, {4, 1}, {5, 1}, {6, 1}, {7, 0}};
+	if (results.size() != expected.size()) {
+		std::cerr << "prefix-sharing: expected " << expected.size()
+		          << " matches, got " << results.size() << '\n';
+		std::exit(1);
+	}
+	for (std::size_t i = 0; i < expected.size(); ++i)
+		if (results[i].id != expected[i].id ||
+		    results[i].dist != expected[i].dist) {
+			std::cerr << "prefix-sharing: wrong result at position " << i << '\n';
+			std::exit(1);
+		}
+
+	const Solver with_empty({"", "AC"});
+	const auto empty_results = with_empty.query("A", 1);
+	if (empty_results.size() != 2 || empty_results[0].id != 0 ||
+	    empty_results[0].dist != 1 || empty_results[1].id != 1 ||
+	    empty_results[1].dist != 1) {
+		std::cerr << "prefix-sharing: empty-path scoring failed\n";
+		std::exit(1);
+	}
+	std::cout << "PASS query-prefix-sharing\n";
+}
+
+void test_lifter_decompose() {
+	const std::vector<std::string> dict(4, "ACGTACGTACGT");
+	const POAGraph graph(dict, DEFAULT_COST_MODEL, false);
+	std::vector<POAGraph::CompressedPath> paths;
+	for (std::size_t i = 0; i < dict.size(); ++i)
+		paths.push_back(graph.compressed_path(i));
+	if (paths[0].steps.size() != 1 ||
+	    paths[0].steps[0].type != POAGraph::EdgeType::HEAVY ||
+	    paths[0].steps[0].length != 11) {
+		std::cerr << "decompose: expected one 11-edge heavy run before split\n";
+		std::exit(1);
+	}
+
+	BinaryLifter lifter(graph);
+	lifter.decompose(paths);
+	for (const auto &path : paths) {
+		if (path.steps.size() != 3 ||
+		    path.steps[0].length != 1 || path.steps[1].length != 2 ||
+		    path.steps[2].length != 8) {
+			std::cerr << "decompose: length-11 chain was not split as 1+2+8\n";
+			std::exit(1);
+		}
+	}
+	std::cout << "PASS lifter-decompose\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -139,6 +202,8 @@ int main(int argc, char **argv) {
 	}
 
 	const auto files = collect_files(argc, argv);
+	test_query_prefix_sharing();
+	test_lifter_decompose();
 	if (files.empty()) {
 		std::cout << "no testcase files found, nothing to do\n";
 		return 0;

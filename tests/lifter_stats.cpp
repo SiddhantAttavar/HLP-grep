@@ -209,7 +209,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 			allocated_cells += window_width(u) * window_width(ahead(u, steps));
 		}
 
-	// Replay Solver::query for every query on a marked-then-built
+	// Replay Solver::query for every query on a decomposed-then-built
 	// lifter, tracking which (u, bit) tables each jump applies (jump
 	// applies the bits of st.length in order, walking the chain).
 	std::size_t jumps = 0, applied = 0;
@@ -221,7 +221,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 		cps.reserve(tc.dict.size());
 		for (std::size_t i = 0; i < tc.dict.size(); ++i)
 			cps.push_back(graph.compressed_path(i));
-		lifter.mark(cps);
+		lifter.decompose(cps);
 	}
 	for (const auto &[k, query] : tc.queries) {
 		lifter.build(query, k);

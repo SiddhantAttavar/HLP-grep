@@ -46,8 +46,9 @@ public:
 	 *             outlive the solver.
 	 * @param compact_nodes Whether to merge single-in/single-out node runs
 	 *             into multi-character nodes after graph construction.
-	 * @param num_threads Worker threads for the per-query BinaryLifter
-	 *             chain table build; 0 means use the hardware concurrency.
+	 * @param num_threads Worker threads for per-query chain-table building
+	 *             and path scoring; 0 means use the OpenMP maximum for scoring
+	 *             (the chain-table build caps automatic parallelism at 8).
 	 */
 	explicit Solver(std::vector<std::string> dict,
 	                const CostModel &cost = DEFAULT_COST_MODEL,
@@ -57,7 +58,8 @@ public:
 	      graph(this->dict, this->cost, compact_nodes),
 	      lifter(this->graph, num_threads) {
 		build_compressed_paths();
-		lifter.mark(compressed_paths);
+		lifter.decompose(compressed_paths);
+		sort_compressed_paths();
 	}
 
 	/**
@@ -65,13 +67,15 @@ public:
 	 *        query.
 	 *
 	 * Rebuilds the per-query chain tables of the pre-marked BinaryLifter
-	 * (build(query, k) over the blocks mark() touched — the touched set is
+	 * (build(query, k) over the blocks decompose() touched — the touched set is
 	 * query-independent, so every query fills the same blocks), then scores
-	 * every dictionary sequence's compressed path: the DP row starts at
-	 * the path's start node and each compressed step advances it across a
-	 * heavy chain (jump) or a single light edge (step). The last entry of
-	 * the final row is the edit distance between the sequence's path and
-	 * the query; it is reported when it does not exceed k.
+	 * the length-filtered compressed paths in lexicographic order, divided
+	 * into contiguous batches scored in parallel. Each batch keeps its own
+	 * stack of DP rows for shared prefixes and computes only each path's
+	 * unmatched suffix across heavy blocks (jump) or light edges (step).
+	 * Prefixes at batch boundaries are recomputed. The last entry of the
+	 * final row is the edit distance between the sequence's path and the
+	 * query; it is reported when it does not exceed k.
 	 *
 	 * Scoring aborts a path early once every entry of its DP row exceeds
 	 * k: with nonnegative operation costs each transition only adds cost,
@@ -92,78 +96,184 @@ public:
 	 *         ascending order.
 	 */
 	std::vector<Result> query(const std::string &query, int k) const {
-		std::vector<Result> results;
 		if (dict.empty())
-			return results;
-		const long m = static_cast<long>(query.size());
-		lifter.build(query, k);
-		// Every path is scored independently: each iteration reads const
-		// graph/lifter state and its own compressed path, and writes only
-		// its own slot of dist.
-		std::vector<int> dist(dict.size(), DistMatrix::INF);
-#pragma omp parallel for schedule(dynamic)
-		for (std::size_t i = 0; i < dict.size(); ++i) {
-			if (std::abs(static_cast<long>(dict[i].size()) - m) > k)
-				continue;
-			const auto &cp = compressed_paths[i];
-			std::vector<int> row = initial_row(cp.start, query, k);
-			POAGraph::node_id cur = cp.start;
-			for (const auto &st : cp.steps) {
-				if (st.type == POAGraph::EdgeType::HEAVY) {
-					cur = lifter.jump(cur, st.length, row);
-				} else {
-					row = lifter.step(cur, st.next, row);
-					cur = st.next;
-				}
-				if (*std::min_element(row.begin(), row.end()) > k)
-					break;
-			}
-			dist[i] = row.back();
-		}
-		for (std::size_t i = 0; i < dict.size(); ++i)
-			if (dist[i] <= k)
-				results.push_back({i, dist[i]});
-		return results;
-	}
-
-public:
-	/** Debug hook: build()/scoring split (temporary). */
-	void lifter_build(const std::string &query, int k) const {
-		lifter.build(query, k);
-	}
-	/** Debug hook: scoring only, skipping the build (temporary). */
-	std::vector<Result> query_rows(const std::string &query, int k) const {
-		std::vector<Result> results;
-		if (dict.empty())
-			return results;
-		const long m = static_cast<long>(query.size());
-		std::vector<int> dist(dict.size(), DistMatrix::INF);
-#pragma omp parallel for schedule(dynamic)
-		for (std::size_t i = 0; i < dict.size(); ++i) {
-			if (std::abs(static_cast<long>(dict[i].size()) - m) > k)
-				continue;
-			const auto &cp = compressed_paths[i];
-			std::vector<int> row = initial_row(cp.start, query, k);
-			POAGraph::node_id cur = cp.start;
-			for (const auto &st : cp.steps) {
-				if (st.type == POAGraph::EdgeType::HEAVY) {
-					cur = lifter.jump(cur, st.length, row);
-				} else {
-					row = lifter.step(cur, st.next, row);
-					cur = st.next;
-				}
-				if (*std::min_element(row.begin(), row.end()) > k)
-					break;
-			}
-			dist[i] = row.back();
-		}
-		for (std::size_t i = 0; i < dict.size(); ++i)
-			if (dist[i] <= k)
-				results.push_back({i, dist[i]});
-		return results;
+			return {};
+		const std::vector<std::size_t> eligible = eligible_paths(query.size(), k);
+		if (!eligible.empty())
+			lifter.build(query, k);
+		return score_paths(query, k, eligible);
 	}
 
 private:
+	/** A reusable DP row at a prefix boundary of a sorted path. */
+	struct QueryState {
+		POAGraph::node_id node;
+		std::vector<int> row;
+	};
+
+	/** Lexicographic order over the canonical path-operation tokens. */
+	bool path_less(std::size_t lhs, std::size_t rhs) const {
+		const auto &a = compressed_paths[lhs];
+		const auto &b = compressed_paths[rhs];
+		if (a.start != b.start)
+			return a.start < b.start;
+		const std::size_t common = std::min(a.steps.size(), b.steps.size());
+		for (std::size_t i = 0; i < common; ++i) {
+			const auto &x = a.steps[i];
+			const auto &y = b.steps[i];
+			if (x.type != y.type)
+				return static_cast<unsigned char>(x.type) <
+				       static_cast<unsigned char>(y.type);
+			if (x.type == POAGraph::EdgeType::HEAVY) {
+				if (x.length != y.length)
+					return x.length < y.length;
+			} else if (x.next != y.next) {
+				return x.next < y.next;
+			}
+		}
+		if (a.steps.size() != b.steps.size())
+			return a.steps.size() < b.steps.size();
+		return lhs < rhs;
+	}
+
+	/** Number of saved states shared by two canonical path prefixes. */
+	static std::size_t common_prefix_states(
+	    const POAGraph::CompressedPath &a,
+	    const POAGraph::CompressedPath &b) {
+		if (a.start != b.start)
+			return 0;
+		std::size_t common = 0;
+		while (common < a.steps.size() && common < b.steps.size()) {
+			const auto &x = a.steps[common];
+			const auto &y = b.steps[common];
+			if (x.type != y.type)
+				break;
+			if (x.type == POAGraph::EdgeType::HEAVY) {
+				if (x.length != y.length)
+					break;
+			} else if (x.next != y.next) {
+				break;
+			}
+			++common;
+		}
+		// State zero is the row after the starting node's label.
+		return common + 1;
+	}
+
+	/** Filters by the length lower bound while preserving sorted path order. */
+	std::vector<std::size_t> eligible_paths(std::size_t query_length,
+	                                        int k) const {
+		std::vector<std::size_t> eligible;
+		eligible.reserve(sorted_path_ids.size());
+		const long m = static_cast<long>(query_length);
+		for (const std::size_t id : sorted_path_ids)
+			if (std::abs(static_cast<long>(dict[id].size()) - m) <= k)
+				eligible.push_back(id);
+		return eligible;
+	}
+
+	/** Scores contiguous batches in parallel, preserving prefix sharing per batch. */
+	std::vector<Result> score_paths(
+	    const std::string &query, int k,
+	    const std::vector<std::size_t> &eligible) const {
+		std::vector<int> dist(dict.size(), DistMatrix::INF);
+		const long m = static_cast<long>(query.size());
+		for (std::size_t id = 0; id < dict.size(); ++id)
+			if (dict[id].empty() &&
+			    std::abs(static_cast<long>(dict[id].size()) - m) <= k) {
+				const long empty_distance = m * cost.ins();
+				dist[id] = static_cast<int>(
+				    std::min(empty_distance,
+				             static_cast<long>(DistMatrix::INF)));
+			}
+		if (!eligible.empty()) {
+			const std::size_t thread_count = static_cast<std::size_t>(
+			    num_threads == 0 ? omp_get_max_threads() : num_threads);
+			const std::size_t batch_count =
+			    thread_count > eligible.size() / 4
+			        ? eligible.size()
+			        : std::min(eligible.size(), thread_count * 4);
+			const std::size_t batch_size = eligible.size() / batch_count;
+			const std::size_t larger_batches = eligible.size() % batch_count;
+			const std::size_t active_threads =
+			    std::min(thread_count, batch_count);
+#pragma omp parallel for schedule(dynamic) num_threads(active_threads)
+			for (std::size_t batch = 0; batch < batch_count; ++batch) {
+				const std::size_t begin =
+				    batch * batch_size + std::min(batch, larger_batches);
+				const std::size_t end =
+				    begin + batch_size + (batch < larger_batches ? 1 : 0);
+				score_batch(query, k, eligible, begin, end, dist);
+			}
+		}
+
+		return collect_results(dist, k);
+	}
+
+	/** Scores one contiguous range, sharing DP states only within the batch. */
+	void score_batch(const std::string &query, int k,
+	                 const std::vector<std::size_t> &eligible,
+	                 std::size_t begin, std::size_t end,
+	                 std::vector<int> &dist) const {
+		std::vector<QueryState> stack;
+		const POAGraph::CompressedPath *previous = nullptr;
+
+		for (std::size_t i = begin; i < end; ++i) {
+			const std::size_t id = eligible[i];
+			const auto &cp = compressed_paths[id];
+			std::size_t common =
+			    previous ? common_prefix_states(*previous, cp) : 0;
+			// An earlier path may have stopped after its row became
+			// impossible, so only states actually present can be reused.
+			common = std::min(common, stack.size());
+			while (stack.size() > common)
+				stack.pop_back();
+
+			if (stack.empty())
+				stack.push_back({cp.start, initial_row(cp.start, query, k)});
+
+			std::size_t step_index = stack.size() - 1;
+			bool dead = *std::min_element(stack.back().row.begin(),
+			                              stack.back().row.end()) > k;
+			while (!dead && step_index < cp.steps.size()) {
+				const auto &step = cp.steps[step_index];
+				POAGraph::node_id cur = stack.back().node;
+				std::vector<int> row = stack.back().row;
+				if (step.type == POAGraph::EdgeType::HEAVY) {
+					if (step.length == 1) {
+						const auto next = *graph.node(cur).heavy_neighbour;
+						row = lifter.step(cur, next, row);
+						cur = next;
+					} else {
+						cur = lifter.jump(cur, step.length, row);
+					}
+				} else {
+					row = lifter.step(cur, step.next, row);
+					cur = step.next;
+				}
+				stack.push_back({cur, std::move(row)});
+				++step_index;
+				dead = *std::min_element(stack.back().row.begin(),
+				                         stack.back().row.end()) > k;
+			}
+			if (!dead)
+				dist[id] = stack.back().row.back();
+			previous = &cp;
+		}
+	}
+
+	/** Returns result records in dictionary-id order. */
+	std::vector<Result> collect_results(const std::vector<int> &dist,
+	                                    int k) const {
+		std::vector<Result> results;
+		// Iterate dictionary ids in increasing order, independent of batch
+		// completion order, so the public result order is deterministic.
+		for (std::size_t id = 0; id < dict.size(); ++id)
+			if (dist[id] <= k)
+				results.push_back({id, dist[id]});
+		return results;
+	}
+
 	/**
 	 * @brief Initial DP row at the start node of a compressed path.
 	 *
@@ -257,18 +367,37 @@ private:
 	/// Worker threads for the per-query BinaryLifter build (0 = auto).
 	std::size_t num_threads = 0;
 	POAGraph graph;                ///< POA graph built from the dictionary.
-	/// Query-independent lifter: up table + touched-block marks filled
+	/// Query-independent lifter: up table + decomposed-block set filled
 	/// at construction; build(current_query, k) runs per query() call.
 	mutable BinaryLifter lifter;
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
+	/// Dictionary ids in lexicographic compressed-path order.
+	std::vector<std::size_t> sorted_path_ids;
 
-	/** Builds the compressed representation of every dictionary path. */
+	/** Builds the merged compressed representation of every dictionary path. */
 	void build_compressed_paths() {
 		compressed_paths.clear();
 		compressed_paths.reserve(dict.size());
+		for (std::size_t i = 0; i < dict.size(); ++i) {
+			if (dict[i].empty())
+				compressed_paths.emplace_back();
+			else
+				compressed_paths.push_back(graph.compressed_path(i));
+		}
+	}
+
+	/** Sorts nonempty dictionary paths after decompose() rewrites their steps. */
+	void sort_compressed_paths() {
+		sorted_path_ids.clear();
+		sorted_path_ids.reserve(dict.size());
 		for (std::size_t i = 0; i < dict.size(); ++i)
-			compressed_paths.push_back(graph.compressed_path(i));
+			if (!dict[i].empty())
+				sorted_path_ids.push_back(i);
+		std::sort(sorted_path_ids.begin(), sorted_path_ids.end(),
+		          [this](std::size_t a, std::size_t b) {
+			          return path_less(a, b);
+		          });
 	}
 };
 
