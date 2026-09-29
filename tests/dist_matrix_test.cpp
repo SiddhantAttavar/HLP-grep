@@ -78,6 +78,26 @@ void test_product() {
 	check(ranged_out.col_range() == std::make_pair<std::size_t, std::size_t>(20, 22),
 	      "product did not preserve column range");
 
+	// A saturated midpoint has no usable argmin to constrain either side.
+	// The true minimum for column 1 is at candidate row 1, despite the
+	// saturated midpoint at column 2.
+	DistMatrix saturated_vec(1, 5, DistMatrix::INF);
+	saturated_vec(0, 0) = DistMatrix::INF - 1;
+	saturated_vec(0, 1) = DistMatrix::INF - 1;
+	saturated_vec(0, 4) = DistMatrix::INF - 2;
+	DistMatrix position_costs(5, 5, DistMatrix::INF);
+	for (std::size_t i = 0; i < 5; ++i)
+		for (std::size_t j = 0; j < 5; ++j)
+			position_costs(i, j) = static_cast<int>(i > j ? i - j : j - i);
+	const DistMatrix saturated_product =
+	    DistMatrix::min_plus_product(saturated_vec, position_costs);
+	check_equal(saturated_product,
+	            make_values(1, 5,
+	                        {{DistMatrix::INF - 1, DistMatrix::INF - 1,
+	                          DistMatrix::INF, DistMatrix::INF - 1,
+	                          DistMatrix::INF - 2}}),
+	            "saturated midpoint keeps full recursive argmin bounds");
+
 	// Rectangular 1xN shapes (1 output row): direct, always exact.
 	const DistMatrix ra = make(1, 3, {"501"});
 	const DistMatrix rb = make(3, 2, {"12", "34", "56"});

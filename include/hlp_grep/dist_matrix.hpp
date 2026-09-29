@@ -396,16 +396,19 @@ private:
 			}
 		}
 		orow[j_mid] = best;
-		// A saturated cell has no meaningful argmin; the loose k_hi
-		// bound keeps the staircase valid for callers of this row as an
-		// upper bound.
+		const bool has_argmin = best < INF;
+		// A saturated cell has no meaningful argmin. Store the loose upper
+		// bound for callers, and retain the full candidate range on both
+		// recursive sides instead of narrowing around the arbitrary best_k.
 		if (found)
-			(*found)[j_mid] = best < INF ? best_k : k_hi;
+			(*found)[j_mid] = has_argmin ? best_k : k_hi;
+		const std::size_t left_k_hi = has_argmin ? best_k : k_hi;
+		const std::size_t right_k_lo = has_argmin ? best_k : k_lo;
 		if (j_mid > j_lo)
-			argmin_row(arow, b, orow, j_lo, j_mid - 1, k_lo, best_k,
+			argmin_row(arow, b, orow, j_lo, j_mid - 1, k_lo, left_k_hi,
 			           found, a_offset);
 		if (j_mid < j_hi)
-			argmin_row(arow, b, orow, j_mid + 1, j_hi, best_k, k_hi,
+			argmin_row(arow, b, orow, j_mid + 1, j_hi, right_k_lo, k_hi,
 			           found, a_offset);
 	}
 
