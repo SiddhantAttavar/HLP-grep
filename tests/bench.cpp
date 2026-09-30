@@ -5,7 +5,11 @@
  *        JSON file.
  *
  * Usage: bench --method hlp_grep [--method naive ...] <testcase-file>
- *              [--out out.json]
+ *              [--out out.json] [--index graph.hlpg]
+ *
+ * The hlp_grep method accepts a prebuilt index file (written by `save`)
+ * via --index: the solver is reconstructed from it without building the
+ * dictionary, and the reported build time is zero.
  *
  * Each measured method runs in its own forked child process; the parent
  * recovers the child's rusage (ru_maxrss = peak RSS of the whole run, parse
@@ -41,6 +45,7 @@ extern "C" {
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <iomanip>
 #include <numeric>
 #include <sstream>
@@ -130,27 +135,51 @@ std::vector<Result> from_dt_patricia(
 }
 #endif
 
+/** Answers every testcase query with an hlp_grep solver and reports it. */
+void report_hlp_queries(int fd, const Solver &solver, const Testcase &tc) {
+	for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+		const auto [k, query] = tc.queries[i];
+		const auto b = std::chrono::steady_clock::now();
+		const auto results = solver.query(query, k);
+		const auto e = std::chrono::steady_clock::now();
+		report_query(fd, i, k, results, b, e);
+	}
+}
+
+/** Loads a prebuilt index file or exits the child on failure. */
+Solver load_hlp_index(const std::string &index_file, const Testcase &tc) {
+	try {
+		return Solver::load_graph(index_file, tc.cost);
+	} catch (const std::exception &e) {
+		std::cerr << "cannot load index file " << index_file << ": "
+		          << e.what() << '\n';
+		::_exit(1);
+	}
+}
+
 /**
  * @brief Runs the selected method and streams per-query records to @p fd.
  *
  * First line: `BUILD <build_ms>`; then one `QUERY <index> <k> <ms> <hash>
- * <matches>` line per query, in testcase order.
+ * <matches>` line per query, in testcase order. When @p index_file is set,
+ * the hlp_grep method reconstructs its solver from that prebuilt index
+ * (written by `save`) instead of building the dictionary, and reports a
+ * zero build time like the index-free methods.
  */
 void run_method(int fd, const std::string &method, const Testcase &tc,
-                bool compact_nodes) {
+                bool compact_nodes, const std::string &index_file) {
 	if (method == "hlp_grep") {
-		const auto build_b = std::chrono::steady_clock::now();
-		const Solver solver(tc.dict, tc.cost, compact_nodes);
-		const auto build_e = std::chrono::steady_clock::now();
-		write_all(fd, "BUILD " + std::to_string(elapsed_ms(build_b, build_e)) +
-		                  "\n");
-
-		for (std::size_t i = 0; i < tc.queries.size(); ++i) {
-			const auto [k, query] = tc.queries[i];
-			const auto b = std::chrono::steady_clock::now();
-			const auto results = solver.query(query, k);
-			const auto e = std::chrono::steady_clock::now();
-			report_query(fd, i, k, results, b, e);
+		if (index_file.empty()) {
+			const auto build_b = std::chrono::steady_clock::now();
+			const Solver solver(tc.dict, tc.cost, compact_nodes);
+			const auto build_e = std::chrono::steady_clock::now();
+			write_all(fd, "BUILD " + std::to_string(elapsed_ms(build_b, build_e)) +
+			                  "\n");
+			report_hlp_queries(fd, solver, tc);
+		} else {
+			const Solver solver = load_hlp_index(index_file, tc);
+			write_all(fd, "BUILD 0\n");
+			report_hlp_queries(fd, solver, tc);
 		}
 #ifdef HLP_GREP_WITH_WFA2
 	} else if (method == "wfa") {
@@ -295,8 +324,9 @@ void run_method(int fd, const std::string &method, const Testcase &tc,
  *         Reports failure on stderr and returns nullopt on any error.
  */
 std::optional<MethodRun> measure_method(const std::string &method,
-                                        const Testcase &tc,
-                                        bool compact_nodes) {
+                                         const Testcase &tc,
+                                         bool compact_nodes,
+                                         const std::string &index_file) {
 	int pipefd[2];
 	if (pipe(pipefd) != 0) {
 		std::cerr << "pipe() failed\n";
@@ -309,7 +339,8 @@ std::optional<MethodRun> measure_method(const std::string &method,
 	}
 	if (pid == 0) {
 		close(pipefd[0]);
-		run_method(pipefd[1], method, tc, compact_nodes); // never returns
+		run_method(pipefd[1], method, tc, compact_nodes,
+		           index_file); // never returns
 	}
 	close(pipefd[1]);
 
@@ -374,7 +405,8 @@ std::optional<MethodRun> measure_method(const std::string &method,
 [[noreturn]] void usage(const char *argv0) {
 	std::cerr << "usage: " << argv0
 	          << " --method hlp_grep [--method naive|wfa|dt_patricia ...]"
-	          << " <testcase-file> [--out out.json] [--no-compact]\n";
+	          << " <testcase-file> [--out out.json] [--no-compact]"
+	          << " [--index graph.hlpg]\n";
 	std::exit(1);
 }
 
@@ -410,7 +442,7 @@ bool supported_alphabet(const Testcase &tc) {
 
 int main(int argc, char **argv) {
 	std::vector<std::string> method_names;
-	std::string testcase, out_path;
+	std::string testcase, out_path, index_file;
 	bool compact_nodes = true;
 	for (int i = 1; i < argc; ++i) {
 		const std::string arg = argv[i];
@@ -422,6 +454,10 @@ int main(int argc, char **argv) {
 			if (i + 1 >= argc)
 				usage(argv[0]);
 			out_path = argv[++i];
+		} else if (arg == "--index") {
+			if (i + 1 >= argc)
+				usage(argv[0]);
+			index_file = argv[++i];
 		} else if (arg == "--no-compact") {
 			compact_nodes = false; // POAGraph run compaction off
 		} else if (!arg.empty() && arg[0] != '-' && testcase.empty()) {
@@ -478,6 +514,26 @@ int main(int argc, char **argv) {
 
 	const Testcase tc = parse_testcase(file);
 
+	// A prebuilt index (written by `save`) only feeds the hlp_grep method:
+	// it reconstructs the solver without building the dictionary, so the
+	// reported build time is zero.
+	if (!index_file.empty()) {
+		const bool wants_hlp =
+		    std::find(method_names.begin(), method_names.end(),
+		              "hlp_grep") != method_names.end();
+		if (!wants_hlp) {
+			std::cerr << "--index applies only to --method hlp_grep\n";
+			return 1;
+		}
+		if (!fs::is_regular_file(fs::path(index_file))) {
+			std::cerr << "not an index file: " << index_file << '\n';
+			return 1;
+		}
+		if (!compact_nodes)
+			std::cerr << "note: --no-compact has no effect with --index "
+			          << "(compaction is stored in the index file)\n";
+	}
+
 	// WFA2 and DT-Patricia (as used here) implement the unit-cost
 	// Levenshtein distance only.
 	const bool wants_uniform = std::find(method_names.begin(),
@@ -503,7 +559,7 @@ int main(int argc, char **argv) {
 
 	std::vector<MethodRun> runs;
 	for (const auto &method : method_names) {
-		auto run = measure_method(method, tc, compact_nodes);
+		auto run = measure_method(method, tc, compact_nodes, index_file);
 		if (!run)
 			return 1;
 		runs.push_back(std::move(*run));

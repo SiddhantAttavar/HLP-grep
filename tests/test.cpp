@@ -156,9 +156,21 @@ void test_query_prefix_sharing() {
 			std::cerr << "prefix-sharing: wrong result at position " << i << '\n';
 			std::exit(1);
 		}
-	const std::string cache_file = "/tmp/opencode/hlp-grep-roundtrip.graph";
-	solver.save_graph(cache_file);
-	const Solver loaded = Solver::load_graph(cache_file);
+	std::error_code ec;
+	const fs::path cache_file =
+	    fs::temp_directory_path(ec) / "hlp-grep-roundtrip.hlpg";
+	if (ec) {
+		std::cerr << "persistence: no temp directory: " << ec.message()
+		          << '\n';
+		std::exit(1);
+	}
+	try {
+		solver.save_graph(cache_file.string());
+	} catch (const std::exception &e) {
+		std::cerr << "persistence: save failed: " << e.what() << '\n';
+		std::exit(1);
+	}
+	const Solver loaded = Solver::load_graph(cache_file.string());
 	const auto loaded_results = loaded.query("ACGT", 1);
 	if (loaded_results.size() != results.size()) {
 		std::cerr << "persistence: loaded solver returned different result count\n";

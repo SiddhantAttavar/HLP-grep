@@ -100,6 +100,14 @@ build/tests/save <testcase>.txt --out index.hlpg
 build/tests/load <testcase>.txt index.hlpg --out <testcase>.sol
 ```
 
+`bench` can also run the `hlp_grep` method from a prebuilt index: with
+`--index`, the dictionary build is skipped and the reported build time is
+zero, isolating query-time comparisons:
+
+```sh
+build/tests/bench --method hlp_grep <testcase>.txt --index index.hlpg
+```
+
 Output:
 
 ```text
