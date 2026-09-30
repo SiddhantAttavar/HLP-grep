@@ -310,9 +310,15 @@ public:
 	 * After |label| sweeps the row holds, at each b,
 	 *   out(b) = min_a cost(a) + ed(u, v, a, b)
 	 * — the exact min over all entry positions of the same transition
-	 * edge_matrix() materializes, without building the matrix, in
-	 * O(|label| * (spread + 2k) + |cost|) time. Row |label|'s band is
-	 * exactly v's window, so the output reads the swept cells directly.
+	 * edge_matrix() materializes, without building the matrix.
+	 * Only the reachable span is swept: retained sources lie in
+	 * [s_lo, s_hi) with costs within k, and reaching (j, b) from a
+	 * costs at least b - a - j (loose ins = 1 form), so bands are
+	 * clamped to [s_lo, s_hi + j + (k - cmin)) and the output to
+	 * [s_lo, s_hi + |label| + (k - cmin)). Cells outside can only
+	 * exceed k and are left INF for clip_row to drop. Single-character
+	 * labels use a one-pass fast path over the same span instead of
+	 * the generic sweep.
 	 *
 	 * @param u    Source node of the edge.
 	 * @param v    Destination node of the edge.
@@ -327,37 +333,42 @@ public:
 	          std::pair<std::size_t, std::size_t> &pos_range) const {
 		const auto [lo_v, hi_v] = window(v);
 		validate_row(u, cost, pos_range);
-		const std::size_t hi_u = pos_range.second;
 		const std::string &label = graph.seq(v);
-		std::vector<int> out(static_cast<std::size_t>(hi_v - lo_v),
-		                     DistMatrix::INF);
+		const std::size_t s_lo = pos_range.first;
+		const std::size_t s_hi = pos_range.second;
+		// Reachable span for outputs within k: reaching (j, b) from a
+		// costs at least b - a - j (loose ins = 1 form), so with the
+		// minimum retained source cost cmin only positions below
+		// s_hi + j + (k - cmin) can stay within k. Positions below
+		// s_lo are unreachable (b >= a always holds).
+		long budget = -1;
+		if (!cost.empty())
+			budget = static_cast<long>(k) -
+			         static_cast<long>(
+			             *std::min_element(cost.begin(), cost.end()));
+		const long reach_cap = static_cast<long>(s_hi) + budget;
+		std::vector<int> out;
+		std::pair<std::size_t, std::size_t> out_range{lo_v, lo_v};
 		const auto [lL, hL] = window(v, static_cast<long>(label.size()));
-		if (lL < hL) {
-			const auto [l0, h0] = window(v, 0);
-			std::vector<long> f(static_cast<std::size_t>(hL - l0),
-			                    DistMatrix::INF);
-			// Row 0: seed only the retained source range, then chain
-			// insertions at v. Omitted source states are all >k, so their
-			// continuations cannot contribute a <=k result.
-			for (std::size_t b = std::max(l0, pos_range.first);
-			     b < std::min(h0, hi_u); ++b)
-				f[b - l0] = cost[b - pos_range.first];
-			for (std::size_t b = l0 + 1; b < h0; ++b) {
-				const long prev = f[b - 1 - l0];
-				if (prev >= DistMatrix::INF)
-					continue;
-				long cur = prev + cost_model.ins();
-				if (cur > DistMatrix::INF)
-					cur = DistMatrix::INF;
-				if (cur < f[b - l0])
-					f[b - l0] = cur;
+		if (budget >= 0 && lL < hL) {
+			const long out_bound =
+			    reach_cap + static_cast<long>(label.size());
+			const std::size_t o_lo = std::max(lo_v, s_lo);
+			const std::size_t o_hi =
+			    std::min(hi_v, out_bound > 0
+			                          ? static_cast<std::size_t>(out_bound)
+			                          : std::size_t{0});
+			if (o_lo < o_hi) {
+				out_range = {o_lo, o_hi};
+				if (label.size() == 1)
+					step_single(v, label[0], cost, s_lo, s_hi,
+					            budget, o_lo, o_hi, out);
+				else
+					step_sweep(v, label, cost, s_lo, s_hi,
+					           reach_cap, o_lo, o_hi, out);
 			}
-			sweep_label(v, f, l0);
-			for (std::size_t b = lo_v; b < hi_v; ++b)
-				out[static_cast<std::size_t>(b - lo_v)] =
-				    static_cast<int>(f[b - l0]);
 		}
-		pos_range = {lo_v, hi_v};
+		pos_range = out_range;
 		clip_row(out, pos_range);
 		cost = std::move(out);
 	}
@@ -398,6 +409,92 @@ public:
 	}
 
 private:
+	/** Generic multi-character transition over the reachable span. */
+	void step_sweep(node_id v, const std::string &label,
+	                const std::vector<int> &cost, std::size_t s_lo,
+	                std::size_t s_hi, long reach_cap, std::size_t o_lo,
+	                std::size_t o_hi, std::vector<int> &out) const {
+		const auto [l0, h0] = window(v, 0);
+		const auto [lL, hL] = window(v, label.size());
+		std::vector<long> f(static_cast<std::size_t>(hL - l0),
+		                    DistMatrix::INF);
+		const std::size_t e_lo = std::max(l0, s_lo);
+		const std::size_t e_hi =
+		    std::min(h0, static_cast<std::size_t>(reach_cap));
+		// Row 0: seed only the retained source range, then chain
+		// insertions at v. Omitted source states are all >k, so their
+		// continuations cannot contribute a <=k result.
+		for (std::size_t b = std::max(l0, s_lo);
+		     b < std::min(h0, s_hi); ++b)
+			f[b - l0] = cost[b - s_lo];
+		for (std::size_t b = e_lo + 1; b < e_hi; ++b) {
+			const long prev = f[b - 1 - l0];
+			if (prev >= DistMatrix::INF)
+				continue;
+			long cur = prev + cost_model.ins();
+			if (cur > DistMatrix::INF)
+				cur = DistMatrix::INF;
+			if (cur < f[b - l0])
+				f[b - l0] = cur;
+		}
+		sweep_label(v, f, l0, false, s_lo, reach_cap);
+		out.assign(static_cast<std::size_t>(o_hi - o_lo),
+		           DistMatrix::INF);
+		for (std::size_t b = o_lo; b < o_hi; ++b)
+			out[static_cast<std::size_t>(b - o_lo)] =
+			    static_cast<int>(f[b - l0]);
+	}
+
+	/** One-pass transition for single-character labels. */
+	void step_single(node_id v, char c, const std::vector<int> &cost,
+	                 std::size_t s_lo, std::size_t s_hi, long budget,
+	                 std::size_t o_lo, std::size_t o_hi,
+	                 std::vector<int> &out) const {
+		const auto [l0, h0] = window(v, 0);
+		const long e_bound = static_cast<long>(s_hi) + budget;
+		const std::size_t e_lo = std::max(l0, s_lo);
+		const std::size_t e_hi =
+		    std::min(h0, e_bound > 0 ? static_cast<std::size_t>(e_bound)
+		                             : std::size_t{0});
+		std::vector<long> f0(e_hi > e_lo ? e_hi - e_lo : std::size_t{0},
+		                     DistMatrix::INF);
+		for (std::size_t b = std::max(l0, s_lo);
+		     b < std::min(h0, s_hi); ++b)
+			f0[b - e_lo] = cost[b - s_lo];
+		for (std::size_t b = e_lo + 1; b < e_hi; ++b) {
+			const long prev = f0[b - 1 - e_lo];
+			if (prev >= DistMatrix::INF)
+				continue;
+			long cur = prev + cost_model.ins();
+			if (cur > DistMatrix::INF)
+				cur = DistMatrix::INF;
+			if (cur < f0[b - e_lo])
+				f0[b - e_lo] = cur;
+		}
+		const int del_c = cost_model.del();
+		const int ins_c = cost_model.ins();
+		out.assign(static_cast<std::size_t>(o_hi - o_lo),
+		           DistMatrix::INF);
+		long cur = DistMatrix::INF; // f(1, b - 1): below-span at o_lo
+		for (std::size_t b = o_lo; b < o_hi; ++b) {
+			cur += ins_c;
+			const long up =
+			    (b >= e_lo && b < e_hi) ? f0[b - e_lo] : DistMatrix::INF;
+			cur = std::min(cur, up + del_c);
+			// Diagonal reads query[b - 1]; b == 0 has no diagonal
+			// source (and avoids the out-of-bounds read).
+			if (b > 0 && b - 1 >= e_lo && b - 1 < e_hi) {
+				const long diag = f0[b - 1 - e_lo];
+				if (diag < DistMatrix::INF)
+					cur = std::min(
+					    cur, diag +
+					             cost_model.consume(c, query[b - 1]));
+			}
+			cur = std::min(cur, static_cast<long>(DistMatrix::INF));
+			out[b - o_lo] = static_cast<int>(cur);
+		}
+	}
+
 	void validate_row(
 	    node_id u, const std::vector<int> &row,
 	    const std::pair<std::size_t, std::size_t> &pos_range) const {
@@ -497,9 +594,13 @@ private:
 	 * band is exactly the node window [window(v).lo, window(v).hi).
 	 * Cells a band never covers stay INF; they are below-band states
 	 * whose continuations all exceed the threshold k.
+	 * When reach_cap >= 0, each character band is additionally clamped to
+	 * [reach_lo, reach_cap + j): positions outside cannot stay within k
+	 * given the retained source range (loose ins = 1 form).
 	 */
 	void sweep_label(node_id v, std::vector<long> &f, std::size_t l0,
-			  bool single_source = false) const {
+			  bool single_source = false, std::size_t reach_lo = 0,
+			  long reach_cap = -1) const {
 		std::size_t a = l0;
 		while (a - l0 < f.size() && f[a - l0] == DistMatrix::INF) a++;
 		if (a - l0 == f.size()) return;
@@ -509,6 +610,13 @@ private:
 			if (single_source) {
 				lj = std::max(lj, a);
 				hj = std::min(hj, a + j + k + 1);
+			} else if (reach_cap >= 0) {
+				lj = std::max(lj, reach_lo);
+				const long capped =
+				    reach_cap + static_cast<long>(j);
+				hj = std::min(hj, capped > 0
+				                      ? static_cast<std::size_t>(capped)
+				                      : std::size_t{0});
 			}
 			const char c = label[j - 1];
 			// f(j - 1, lj - 1): the band bottom's diagonal source; INF
