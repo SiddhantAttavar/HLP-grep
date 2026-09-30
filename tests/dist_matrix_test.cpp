@@ -273,43 +273,16 @@ void test_apply() {
 }
 
 void test_errors() {
-	const DistMatrix a(2, 3);
-	const DistMatrix b(2, 2);
-	bool threw = false;
-	try {
-		DistMatrix::min_plus_product(a, b);
-	} catch (const std::invalid_argument &) {
-		threw = true;
-	}
-	check(threw, "errors: product dimension mismatch not thrown");
-
-	const DistMatrix e(2, 0);
-	const DistMatrix f(0, 2);
-	threw = false;
-	try {
-		DistMatrix::min_plus_product(e, f);
-	} catch (const std::invalid_argument &) {
-		threw = true;
-	}
-	check(threw, "errors: empty inner dimension not thrown");
-
-	const DistMatrix m(3, 2);
-	threw = false;
-	try {
-		m.min_plus_apply({0, 0});
-	} catch (const std::invalid_argument &) {
-		threw = true;
-	}
-	check(threw, "errors: apply dimension mismatch not thrown");
-
+	// Dimension and range contracts are debug-only asserts now; only
+	// the defined degenerate behaviours are checked here.
 	const DistMatrix z(0, 2);
-	threw = false;
-	try {
-		z.min_plus_apply({});
-	} catch (const std::invalid_argument &) {
-		threw = true;
-	}
-	check(threw, "errors: apply empty row vector not thrown");
+	const std::vector<int> zg = z.min_plus_apply({});
+	check(zg.size() == 2 &&
+	          std::all_of(zg.begin(), zg.end(),
+	                      [](int value) {
+		                      return value == DistMatrix::INF;
+	                      }),
+	      "errors: apply on zero-row matrix is not all-INF");
 }
 
 void test_cost_model() {

@@ -47,13 +47,17 @@ extern "C" {
 #include <cstring>
 #include <exception>
 #include <iomanip>
+#include <memory>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <cctype>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -156,6 +160,183 @@ Solver load_hlp_index(const std::string &index_file, const Testcase &tc) {
 		::_exit(1);
 	}
 }
+
+/**
+ * @brief In-memory B^ed-tree gram-count index (SIGMOD 2010, Zhang et al.).
+ *
+ * bed-tree (https://github.com/ZhangZhenjie/bed-tree) is a disk-based B+
+ * tree executable without a reusable library API, so bench reimplements
+ * its gram-count order range query natively: a q-gram inverted index over
+ * the dictionary with exact count-filter pruning and exact verification
+ * via edit_distance. A single edit destroys at most BED_Q q-grams, so a
+ * dictionary sequence within distance k of the query shares at least
+ * |grams(query)| - k * BED_Q distinct q-grams with it; anything below
+ * that count (or failing the |len(query) - len(s)| <= k length filter)
+ * cannot match. Unit-cost model only (validated in main).
+ */
+class BedTreeIndex {
+public:
+	explicit BedTreeIndex(const std::vector<std::string> &dict) {
+		for (std::size_t i = 0; i < dict.size(); ++i) {
+			if (dict[i].size() < BED_Q)
+				continue; // too short to carry a q-gram: verified directly
+			std::unordered_set<std::string> seen;
+			for (std::size_t p = 0; p + BED_Q <= dict[i].size(); ++p)
+				seen.insert(dict[i].substr(p, BED_Q));
+			for (const auto &g : seen)
+				postings[g].push_back(i); // ids ascending: already sorted
+		}
+	}
+
+	std::vector<Result> query(const std::vector<std::string> &dict,
+	                          const CostModel &cost, const std::string &alphabet,
+	                          const std::string &query_str, int k) const {
+		const auto [c_min, g_min] = model_mins(cost, alphabet);
+		// Distinct query q-grams; an empty set (short query) disables the
+		// count filter and every length-passing sequence is verified.
+		std::unordered_set<std::string> qgrams;
+		if (query_str.size() >= BED_Q)
+			for (std::size_t p = 0; p + BED_Q <= query_str.size(); ++p)
+				qgrams.insert(query_str.substr(p, BED_Q));
+		const long need =
+		    static_cast<long>(qgrams.size()) - static_cast<long>(k) * BED_Q;
+
+		std::vector<int> counts(dict.size(), 0);
+		std::vector<std::size_t> touched;
+		touched.reserve(dict.size());
+		for (const auto &g : qgrams) {
+			const auto it = postings.find(g);
+			if (it == postings.end())
+				continue;
+			for (const std::size_t id : it->second) {
+				if (counts[id] == 0)
+					touched.push_back(id);
+				++counts[id];
+			}
+		}
+
+		std::vector<Result> results;
+		for (std::size_t i = 0; i < dict.size(); ++i) {
+			if (std::labs(static_cast<long>(dict[i].size()) -
+			              static_cast<long>(query_str.size())) > k)
+				continue;
+			if (counts[i] < need)
+				continue; // count filter: shares too few q-grams
+			const int dist =
+			    edit_distance(query_str, dict[i], cost, k, c_min, g_min);
+			if (dist <= k)
+				results.push_back({i, dist});
+		}
+		return results; // ascending ids: already sorted
+	}
+
+private:
+	static constexpr std::size_t BED_Q = 3; ///< q-gram length.
+	/// q-gram -> sorted ids of dictionary sequences containing it.
+	std::unordered_map<std::string, std::vector<std::size_t>> postings;
+};
+
+/**
+ * @brief Vantage-point tree for exact threshold edit distance search.
+ *
+ * vpsearch (https://github.com/enthought/vpsearch) ships as Python/Cython
+ * on top of parasail alignment scores, which cannot plug into this C++
+ * benchmark; bench reimplements its core algorithm natively over the
+ * Levenshtein edit distance instead: the tree is built by picking a
+ * vantage point per node (fixed-seed RNG, as in vpsearch's default
+ * RandomState) and splitting the remaining points at the median distance
+ * mu, and range queries prune with the triangle inequality (inside iff
+ * d <= mu + k, outside iff d >= mu - k). Internal vantage distances use
+ * the exact (uncapped) edit distance, since pruning needs true values;
+ * matches are reported with d <= k. Exact for any metric cost model;
+ * bench restricts it to the unit-cost model (validated in main).
+ */
+class VpSearchTree {
+public:
+	VpSearchTree(const std::vector<std::string> &dict, const CostModel &cost,
+	             const std::string &alphabet)
+	    : dict(dict), cost(cost), alphabet(alphabet), rng(VP_SEED) {
+		std::vector<std::size_t> ids(dict.size());
+		std::iota(ids.begin(), ids.end(), 0);
+		root = build(std::move(ids));
+	}
+
+	std::vector<Result> query(const std::string &query_str, int k) const {
+		std::vector<Result> results;
+		std::vector<const Node *> stack;
+		if (root)
+			stack.push_back(root.get());
+		while (!stack.empty()) {
+			const Node *node = stack.back();
+			stack.pop_back();
+			const int d = exact(query_str, dict[node->id]);
+			if (d <= k)
+				results.push_back({node->id, d});
+			if (node->inside && d <= node->mu + k)
+				stack.push_back(node->inside.get());
+			if (node->outside && d >= node->mu - k)
+				stack.push_back(node->outside.get());
+		}
+		std::sort(results.begin(), results.end(),
+		          [](const Result &a, const Result &b) { return a.id < b.id; });
+		return results;
+	}
+
+private:
+	struct Node {
+		std::size_t id; ///< Dictionary index of the vantage point.
+		int mu = 0;     ///< Median distance from the vantage point.
+		std::unique_ptr<Node> inside, outside;
+	};
+
+	static constexpr std::uint32_t VP_SEED = 0x8d278e75; ///< Fixed RNG seed.
+
+	/** Exact (uncapped) edit distance: k = |a| + |b| exceeds any alignment. */
+	int exact(const std::string &a, const std::string &b) const {
+		const auto [c_min, g_min] = model_mins(cost, alphabet);
+		const int cap =
+		    static_cast<int>(a.size() + b.size()); // exact upper bound
+		return edit_distance(a, b, cost, cap, c_min, g_min);
+	}
+
+	std::unique_ptr<Node> build(std::vector<std::size_t> ids) {
+		if (ids.empty())
+			return nullptr;
+		std::uniform_int_distribution<std::size_t> pick(0, ids.size() - 1);
+		const std::size_t vantage = ids[pick(rng)];
+		ids.erase(std::remove(ids.begin(), ids.end(), vantage), ids.end());
+		auto node = std::make_unique<Node>();
+		node->id = vantage;
+		if (ids.empty())
+			return node;
+		std::vector<int> dists;
+		dists.reserve(ids.size());
+		for (const std::size_t id : ids)
+			dists.push_back(exact(dict[vantage], dict[id]));
+		std::vector<int> order = dists; // median without disturbing ids order
+		const std::size_t mid = order.size() / 2;
+		std::nth_element(order.begin(), order.begin() + mid, order.end());
+		node->mu = order[mid];
+		std::vector<std::size_t> inner, outer;
+		inner.reserve(mid);
+		outer.reserve(ids.size() - mid);
+		for (std::size_t i = 0; i < ids.size(); ++i) {
+			if (dists[i] < node->mu)
+				inner.push_back(ids[i]);
+			else
+				outer.push_back(ids[i]);
+		}
+		node->inside = build(std::move(inner));
+		node->outside = build(std::move(outer));
+		return node;
+	}
+
+	const std::vector<std::string> &dict;
+	const CostModel &cost;
+	const std::string &alphabet;
+	std::mt19937 rng;
+	std::unique_ptr<Node> root;
+};
 
 /**
  * @brief Runs the selected method and streams per-query records to @p fd.
@@ -300,6 +481,43 @@ void run_method(int fd, const std::string &method, const Testcase &tc,
 			}
 		}
 #endif
+	} else if (method == "bed_tree") {
+		// B^ed-tree gram-count range query (see BedTreeIndex): the q-gram
+		// inverted index is the method's build cost; each query applies
+		// the length and count filters and verifies survivors exactly.
+		// Unit-cost model validated in the parent process.
+		const auto build_b = std::chrono::steady_clock::now();
+		const BedTreeIndex index(tc.dict);
+		const auto build_e = std::chrono::steady_clock::now();
+		write_all(fd, "BUILD " +
+		                  std::to_string(elapsed_ms(build_b, build_e)) + "\n");
+
+		for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+			const auto [k, query] = tc.queries[i];
+			const auto b = std::chrono::steady_clock::now();
+			const auto results =
+			    index.query(tc.dict, tc.cost, tc.alphabet, query, k);
+			const auto e = std::chrono::steady_clock::now();
+			report_query(fd, i, k, results, b, e);
+		}
+	} else if (method == "vpsearch") {
+		// Vantage-point tree range search (see VpSearchTree): the tree is
+		// the method's build cost; queries prune with the triangle
+		// inequality and report exact distances. Unit-cost model
+		// validated in the parent process.
+		const auto build_b = std::chrono::steady_clock::now();
+		const VpSearchTree tree(tc.dict, tc.cost, tc.alphabet);
+		const auto build_e = std::chrono::steady_clock::now();
+		write_all(fd, "BUILD " +
+		                  std::to_string(elapsed_ms(build_b, build_e)) + "\n");
+
+		for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+			const auto [k, query] = tc.queries[i];
+			const auto b = std::chrono::steady_clock::now();
+			const auto results = tree.query(query, k);
+			const auto e = std::chrono::steady_clock::now();
+			report_query(fd, i, k, results, b, e);
+		}
 	} else { // naive: no index to build.
 		write_all(fd, "BUILD 0\n");
 
@@ -404,7 +622,7 @@ std::optional<MethodRun> measure_method(const std::string &method,
 
 [[noreturn]] void usage(const char *argv0) {
 	std::cerr << "usage: " << argv0
-	          << " --method hlp_grep [--method naive|wfa|dt_patricia ...]"
+	          << " --method hlp_grep [--method naive|wfa|dt_patricia|bed_tree|vpsearch ...]"
 	          << " <testcase-file> [--out out.json] [--no-compact]"
 	          << " [--index graph.hlpg]\n";
 	std::exit(1);
@@ -473,7 +691,8 @@ int main(int argc, char **argv) {
 	}
 	for (const auto &method : method_names) {
 		if (method != "hlp_grep" && method != "naive" && method != "wfa" &&
-		    method != "dt_patricia") {
+		    method != "dt_patricia" && method != "bed_tree" &&
+		    method != "vpsearch") {
 			std::cerr << "unknown method: '" << method << "'\n";
 			usage(argv[0]);
 		}
@@ -534,22 +753,22 @@ int main(int argc, char **argv) {
 			          << "(compaction is stored in the index file)\n";
 	}
 
-	// WFA2 and DT-Patricia (as used here) implement the unit-cost
-	// Levenshtein distance only.
-	const bool wants_uniform = std::find(method_names.begin(),
-	                                     method_names.end(), "wfa")
-	                               != method_names.end()
-	                           || std::find(method_names.begin(),
-	                                        method_names.end(), "dt_patricia")
-	                                  != method_names.end();
+	// WFA2, DT-Patricia, BED-tree and VP-search as used here implement
+	// the unit-cost Levenshtein distance only.
+	const auto wants = [&](const char *m) {
+		return std::find(method_names.begin(), method_names.end(), m) !=
+		       method_names.end();
+	};
+	const bool wants_uniform =
+	    wants("wfa") || wants("dt_patricia") || wants("bed_tree") || wants("vpsearch");
 	if (wants_uniform && !unit_cost_model(tc)) {
-		std::cerr << "method(s) 'wfa'/'dt_patricia' require a unit-cost "
-		          << "model (match 0, ins/del/mismatch 1) but " << file
-		          << " uses a different cost model\n";
+		std::cerr << "method(s) 'wfa'/'dt_patricia'/'bed_tree'/'vpsearch' "
+		          << "require a unit-cost model (match 0, ins/del/mismatch 1) "
+		          << "but " << file << " uses a different cost model\n";
 		return 1;
 	}
 #ifdef HLP_GREP_WITH_DT_PATRICIA
-	if (wants_uniform && !supported_alphabet(tc)) {
+	if ((wants("wfa") || wants("dt_patricia")) && !supported_alphabet(tc)) {
 		std::cerr << "method(s) 'wfa'/'dt_patricia' require an alphabet "
 		          << "of DNA (ACGT) or protein (20 letters) characters; "
 		          << "testcase alphabet is '" << tc.alphabet << "'\n";

@@ -295,12 +295,6 @@ public:
 				const auto &step = cp.steps[step_index];
 				const QueryState &state = stack.back();
 				POAGraph::node_id cur = state.node;
-				const auto full_range = lifter.window(cur);
-				assert(state.pos_range.first >= full_range.first &&
-				       state.pos_range.second <= full_range.second &&
-				       state.pos_range.first <= state.pos_range.second);
-				assert(state.row.size() ==
-				       state.pos_range.second - state.pos_range.first);
 				QueryState next_state = state;
 				if (step.type == POAGraph::EdgeType::HEAVY) {
 					if (step.length == 1) {

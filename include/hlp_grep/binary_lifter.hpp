@@ -17,9 +17,9 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -250,35 +250,23 @@ public:
 	 * @param pos_range Position range represented by @p cost; replaced by
 	 *                  the clipped range of the reached node.
 	 * @return The node l heavy steps from u.
-	 * @throws std::out_of_range if u is not a valid node id or the heavy
-	 *         chain ends before l steps.
-	 * @throws std::invalid_argument if the row does not match a subrange of
-	 *         the start node's window or l is not a power-of-two block.
+	 * @pre u is a valid node id, the row matches a subrange of u's
+	 *      window, l is a power-of-two block recorded by decompose(),
+	 *      and the block was materialized by build().
 	 */
 	node_id jump(node_id u, int l, std::vector<int> &cost,
 	             std::pair<std::size_t, std::size_t> &pos_range) const {
-		if (u >= up.size())
-			throw std::out_of_range("BinaryLifter::jump: invalid node id");
-		validate_row(u, cost, pos_range);
-		if (l < 0)
-			throw std::invalid_argument("BinaryLifter::jump: negative length");
+		assert(u < up.size());
+		assert_row(u, cost, pos_range);
 		if (l == 0)
 			return u;
+		assert(l > 0);
 		const std::size_t block = static_cast<std::size_t>(l);
-		if ((block & (block - 1)) != 0)
-			throw std::invalid_argument(
-			    "BinaryLifter::jump: length is not a power of two");
-		if (!graph.node(u).heavy_neighbour.has_value())
-			throw std::out_of_range(
-			    "BinaryLifter::jump: heavy chain too short");
+		assert((block & (block - 1)) == 0);
 		const std::size_t level = 63 - __builtin_clzll(block);
-		if (level >= max_level || !up[u][level].has_value())
-			throw std::out_of_range(
-			    "BinaryLifter::jump: heavy chain too short");
-		if (level >= up_mat[u].size() ||
-		    up_mat[u][level].num_cols() == 0)
-			throw std::out_of_range(
-			    "BinaryLifter::jump: chain block was not marked/built");
+		assert(level < max_level && up[u][level].has_value());
+		assert(level < up_mat[u].size() &&
+		       up_mat[u][level].num_cols() > 0);
 		const DistMatrix &mat = up_mat[u][level];
 		std::vector<int> row = mat.min_plus_apply(cost, pos_range);
 		const node_id v = *up[u][level];
@@ -325,14 +313,18 @@ public:
 	 * @param cost DP row of u; replaced by the clipped DP row at v.
 	 * @param pos_range Position range represented by @p cost; replaced by
 	 *                  the clipped range at v.
-	 * @throws std::invalid_argument if the row does not match a subrange of
-	 *         u's window.
-	 * @pre There is an edge (u, v) in the graph; not verified here.
+	 * @pre The row matches a subrange of u's window, and there is an
+	 *      edge (u, v) in the graph (not verified here).
 	 */
 	void step(node_id u, node_id v, std::vector<int> &cost,
 	          std::pair<std::size_t, std::size_t> &pos_range) const {
 		const auto [lo_v, hi_v] = window(v);
-		validate_row(u, cost, pos_range);
+		assert_row(u, cost, pos_range);
+		if (cost.empty()) {
+			pos_range = {hi_v, hi_v};
+			cost.clear();
+			return;
+		}
 		const std::string &label = graph.seq(v);
 		const std::size_t s_lo = pos_range.first;
 		const std::size_t s_hi = pos_range.second;
@@ -341,11 +333,10 @@ public:
 		// minimum retained source cost cmin only positions below
 		// s_hi + j + (k - cmin) can stay within k. Positions below
 		// s_lo are unreachable (b >= a always holds).
-		long budget = -1;
-		if (!cost.empty())
-			budget = static_cast<long>(k) -
-			         static_cast<long>(
-			             *std::min_element(cost.begin(), cost.end()));
+		const long budget =
+		    static_cast<long>(k) -
+		    static_cast<long>(
+		        *std::min_element(cost.begin(), cost.end()));
 		const long reach_cap = static_cast<long>(s_hi) + budget;
 		std::vector<int> out;
 		std::pair<std::size_t, std::size_t> out_range{lo_v, lo_v};
@@ -353,19 +344,21 @@ public:
 		if (budget >= 0 && lL < hL) {
 			const long out_bound =
 			    reach_cap + static_cast<long>(label.size());
+			assert(out_bound >= 0);
 			const std::size_t o_lo = std::max(lo_v, s_lo);
 			const std::size_t o_hi =
-			    std::min(hi_v, out_bound > 0
-			                          ? static_cast<std::size_t>(out_bound)
-			                          : std::size_t{0});
+			    std::min(hi_v, static_cast<std::size_t>(out_bound));
 			if (o_lo < o_hi) {
 				out_range = {o_lo, o_hi};
+				const auto [l0, h0] = window(v, 0);
 				if (label.size() == 1)
 					step_single(v, label[0], cost, s_lo, s_hi,
-					            budget, o_lo, o_hi, out);
+					            reach_cap, l0, h0, o_lo, o_hi,
+					            out);
 				else
 					step_sweep(v, label, cost, s_lo, s_hi,
-					           reach_cap, o_lo, o_hi, out);
+					           reach_cap, l0, h0, hL, o_lo,
+					           o_hi, out);
 			}
 		}
 		pos_range = out_range;
@@ -386,10 +379,7 @@ public:
 	 */
 	void clip_row(std::vector<int> &row,
 	              std::pair<std::size_t, std::size_t> &pos_range) const {
-		if (pos_range.second < pos_range.first ||
-		    row.size() != pos_range.second - pos_range.first)
-			throw std::invalid_argument(
-			    "BinaryLifter::clip_row: row/range size mismatch");
+		assert(row.size() == pos_range.second - pos_range.first);
 		const std::size_t old_lo = pos_range.first;
 		std::size_t first = 0;
 		std::size_t last = row.size();
@@ -412,10 +402,10 @@ private:
 	/** Generic multi-character transition over the reachable span. */
 	void step_sweep(node_id v, const std::string &label,
 	                const std::vector<int> &cost, std::size_t s_lo,
-	                std::size_t s_hi, long reach_cap, std::size_t o_lo,
+	                std::size_t s_hi, long reach_cap, std::size_t l0,
+	                std::size_t h0, std::size_t hL, std::size_t o_lo,
 	                std::size_t o_hi, std::vector<int> &out) const {
-		const auto [l0, h0] = window(v, 0);
-		const auto [lL, hL] = window(v, label.size());
+		assert(reach_cap >= 0);
 		std::vector<long> f(static_cast<std::size_t>(hL - l0),
 		                    DistMatrix::INF);
 		const std::size_t e_lo = std::max(l0, s_lo);
@@ -447,15 +437,13 @@ private:
 
 	/** One-pass transition for single-character labels. */
 	void step_single(node_id v, char c, const std::vector<int> &cost,
-	                 std::size_t s_lo, std::size_t s_hi, long budget,
-	                 std::size_t o_lo, std::size_t o_hi,
-	                 std::vector<int> &out) const {
-		const auto [l0, h0] = window(v, 0);
-		const long e_bound = static_cast<long>(s_hi) + budget;
+	                 std::size_t s_lo, std::size_t s_hi, long reach_cap,
+	                 std::size_t l0, std::size_t h0, std::size_t o_lo,
+	                 std::size_t o_hi, std::vector<int> &out) const {
+		assert(reach_cap >= 0);
 		const std::size_t e_lo = std::max(l0, s_lo);
 		const std::size_t e_hi =
-		    std::min(h0, e_bound > 0 ? static_cast<std::size_t>(e_bound)
-		                             : std::size_t{0});
+		    std::min(h0, static_cast<std::size_t>(reach_cap));
 		std::vector<long> f0(e_hi > e_lo ? e_hi - e_lo : std::size_t{0},
 		                     DistMatrix::INF);
 		for (std::size_t b = std::max(l0, s_lo);
@@ -495,16 +483,15 @@ private:
 		}
 	}
 
-	void validate_row(
+	/** Debug-only check that a row matches a subrange of a node window. */
+	void assert_row(
 	    node_id u, const std::vector<int> &row,
 	    const std::pair<std::size_t, std::size_t> &pos_range) const {
 		const auto full_range = window(u);
-		if (pos_range.first < full_range.first ||
-		    pos_range.second > full_range.second ||
-		    pos_range.first > pos_range.second ||
-		    row.size() != pos_range.second - pos_range.first)
-			throw std::invalid_argument(
-			    "BinaryLifter: row does not match a subrange of the node window");
+		assert(pos_range.first >= full_range.first &&
+		       pos_range.second <= full_range.second &&
+		       pos_range.first <= pos_range.second &&
+		       row.size() == pos_range.second - pos_range.first);
 	}
 
 	/**
@@ -614,9 +601,8 @@ private:
 				lj = std::max(lj, reach_lo);
 				const long capped =
 				    reach_cap + static_cast<long>(j);
-				hj = std::min(hj, capped > 0
-				                      ? static_cast<std::size_t>(capped)
-				                      : std::size_t{0});
+				assert(capped >= 0);
+				hj = std::min(hj, static_cast<std::size_t>(capped));
 			}
 			const char c = label[j - 1];
 			// f(j - 1, lj - 1): the band bottom's diagonal source; INF

@@ -15,7 +15,6 @@
 #include <cassert>
 #include <cstddef>
 #include <limits>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -116,29 +115,24 @@ public:
 	 * candidate scan in [opt(a, b - 1), opt(a + 1, b)] therefore
 	 * telescopes: rows a are processed in decreasing order, columns in
 	 * increasing order, for O(a.rows * a.cols) cell operations instead
-	 * of the cubic scan. The monotone-argmin behaviour of every single
+	 * of the cubic scan (plus the divide-and-conquer solve of the
+	 * bottom row). The monotone-argmin behaviour of every single
 	 * output row (opt(a, b - 1) <= opt(a, b)) is what the divide-and-
 	 * conquer of min_plus_apply relies on as well.
 	 *
 	 * @param a Left factor; entries must not exceed INF.
 	 * @param b Right factor; entries must not exceed INF.
 	 * @return The min-plus product a (x) b.
-	 * @throws std::invalid_argument if a.cols != b.rows or a.cols == 0
-	 *         (an empty inner dimension leaves the product undefined).
+	 * @pre a.cols == b.rows with a.cols > 0, and the shared position
+	 *      ranges agree (a.col_range() == b.row_range()).
 	 */
 	static DistMatrix min_plus_product(const DistMatrix &a,
 	                                   const DistMatrix &b) {
-		if (a.cols != b.rows)
-			throw std::invalid_argument(
-			    "DistMatrix::min_plus_product: dimension mismatch");
-		if (a.cols == 0)
-			throw std::invalid_argument(
-			    "DistMatrix::min_plus_product: empty inner dimension");
-		assert(a.col_range() == b.row_range() &&
-		       "DistMatrix::min_plus_product: position range mismatch");
+		assert(a.cols == b.rows && a.cols > 0);
+		assert(a.col_range() == b.row_range());
 
 		DistMatrix out(a.rows, b.cols, 0, a.row_range(), b.col_range());
-		if (a.rows == 0 || b.cols == 0)
+		if (b.cols == 0)
 			return out;
 		argmin_sweep(a, b, out);
 		return out;
@@ -155,13 +149,13 @@ public:
 	 * leftmost argmins of vec(i) + (*this)(i, j) are monotone in j (the
 	 * same non-crossing shortest-path argument as
 	 * min_plus_product): the result is found with divide-and-conquer in
-	 * O(rows + cols) argmin steps instead of the full rows x cols scan.
+	 * O((rows + cols) log cols) argmin steps instead of the full
+	 * rows x cols scan.
 	 *
 	 * @param vec Row vector of costs, one per row of this matrix; entries
 	 *            must not exceed INF.
 	 * @return The resulting row vector, one entry per column.
-	 * @throws std::invalid_argument if vec.size() != rows or rows == 0
-	 *         (an empty row vector leaves the result undefined).
+	 * @pre vec.size() == rows.
 	 */
 	std::vector<int> min_plus_apply(const std::vector<int> &vec) const {
 		return min_plus_apply(vec, row_range_value);
@@ -177,25 +171,18 @@ public:
 	 * @param vec Costs for the selected contiguous range of matrix rows.
 	 * @param input_range Query-position range represented by @p vec.
 	 * @return One entry per matrix column.
-	 * @throws std::invalid_argument if the input range is outside the matrix
-	 *         row range or the vector length does not match it.
+	 * @pre input_range lies within the matrix row range and vec.size()
+	 *      matches its width.
 	 */
 	std::vector<int> min_plus_apply(
 	    const std::vector<int> &vec,
 	    std::pair<std::size_t, std::size_t> input_range) const {
-		if (rows == 0)
-			throw std::invalid_argument(
-			    "DistMatrix::min_plus_apply: empty row vector");
-		if (input_range.first < row_range_value.first ||
-		    input_range.second > row_range_value.second ||
-		    input_range.first > input_range.second)
-			throw std::invalid_argument(
-			    "DistMatrix::min_plus_apply: invalid input position range");
+		assert(input_range.first >= row_range_value.first &&
+		       input_range.second <= row_range_value.second &&
+		       input_range.first <= input_range.second);
 		const std::size_t offset = input_range.first - row_range_value.first;
 		const std::size_t expected = input_range.second - input_range.first;
-		if (vec.size() != expected)
-			throw std::invalid_argument(
-			    "DistMatrix::min_plus_apply: dimension mismatch");
+		assert(vec.size() == expected);
 
 		std::vector<int> out(cols, INF);
 		if (cols == 0)
@@ -301,8 +288,8 @@ private:
 			// with the row's first finite candidate at ff, every
 			// candidate's first finite landing is the suffix
 			// minimum from ff, so columns below that are INF
-			// outright.
-			const std::size_t thr = ff < B ? smin_ff2[ff] : F;
+			// outright (smin_ff2[B] == F covers all-INF rows).
+			const std::size_t thr = smin_ff2[ff];
 			if (ra + 1 == E) {
 				// Bottom row: solve with the divide-and-conquer
 				// and capture its leftmost argmins, seeded at the
@@ -372,14 +359,14 @@ private:
 	 * @param found Optional buffer of length b.cols — when set, receives
 	 *        the leftmost argmin of each solved column (indexed by j).
 	 * @param a_offset Candidate-row index represented by arow[0].
+	 * @pre j_lo <= j_hi and k_lo <= k_hi.
 	 */
 	static void argmin_row(const int *arow, const DistMatrix &b, int *orow,
 	                       std::size_t j_lo, std::size_t j_hi,
 	                       std::size_t k_lo, std::size_t k_hi,
 	                       std::vector<std::size_t> *found = nullptr,
 	                       std::size_t a_offset = 0) {
-		if (j_lo > j_hi)
-			return;
+		assert(j_lo <= j_hi && k_lo <= k_hi);
 		const std::size_t j_mid = (j_lo + j_hi) / 2;
 		std::size_t best_k = k_lo;
 		int best = arow[k_lo - a_offset] + b.data[k_lo * b.cols + j_mid];
