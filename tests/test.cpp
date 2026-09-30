@@ -158,7 +158,7 @@ void test_query_prefix_sharing() {
 		}
 	const std::string cache_file = "/tmp/opencode/hlp-grep-roundtrip.graph";
 	solver.save_graph(cache_file);
-	const Solver loaded(Solver::LoadGraphTag{}, cache_file);
+	const Solver loaded = Solver::load_graph(cache_file);
 	const auto loaded_results = loaded.query("ACGT", 1);
 	if (loaded_results.size() != results.size()) {
 		std::cerr << "persistence: loaded solver returned different result count\n";

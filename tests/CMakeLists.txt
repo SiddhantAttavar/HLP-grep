@@ -1,6 +1,12 @@
 add_executable(solve naive_solver.cpp)
 target_link_libraries(solve PRIVATE hlp_grep::hlp_grep)
 
+add_executable(save save.cpp)
+target_link_libraries(save PRIVATE hlp_grep::hlp_grep)
+
+add_executable(load load.cpp)
+target_link_libraries(load PRIVATE hlp_grep::hlp_grep)
+
 option(HLP_GREP_WITH_WFA2 "Enable the WFA2-lib method in bench (needs third_party/WFA2-lib)" ON)
 option(HLP_GREP_WITH_DT_PATRICIA "Enable the DT-Patricia method in bench (needs third_party/DT-Patricia)" ON)
 

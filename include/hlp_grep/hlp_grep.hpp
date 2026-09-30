@@ -37,7 +37,6 @@ namespace hlp_grep {
  */
 class Solver {
 public:
-	struct LoadGraphTag {};
 	/**
 	 * @brief Constructs the solver over the given sequence dictionary.
 	 *
@@ -62,14 +61,26 @@ public:
 		initialize_paths();
 	}
 
-	/** Constructs a solver from a previously saved POAGraph cache. */
-	Solver(LoadGraphTag, const std::string &graph_file,
-	                const CostModel &cost = DEFAULT_COST_MODEL,
-	                std::size_t num_threads = 0)
-	    : cost(cost), num_threads(num_threads),
-	      graph(POAGraph::load_file(graph_file, cost)),
-	      lifter(graph, num_threads) {
-		initialize_paths();
+	/**
+	 * @brief Loads a solver from a previously saved POAGraph file.
+	 *
+	 * Skips the dictionary build step: the graph (nodes, edges, paths,
+	 * topological order, heavy-chain metadata) is read from @p graph_file
+	 * instead of being rebuilt from dictionary sequences. The supplied
+	 * cost model must match the one stored in the file. Solver query
+	 * helpers are reconstructed from the loaded graph, while
+	 * query-specific tables are still built per query() call.
+	 *
+	 * @param graph_file Path to a file written by save_graph().
+	 * @param cost Cost model the graph was saved with; must outlive the
+	 *             solver.
+	 * @param num_threads Worker threads, as in the dictionary constructor.
+	 */
+	static Solver load_graph(const std::string &graph_file,
+	                         const CostModel &cost = DEFAULT_COST_MODEL,
+	                         std::size_t num_threads = 0) {
+		return Solver(POAGraph::load_file(graph_file, cost), cost,
+		              num_threads);
 	}
 
 	/** Saves the complete graph structure used by this solver. */
@@ -78,6 +89,14 @@ public:
 	}
 
 private:
+	/** Builds solver state around an already-built graph (load path). */
+	explicit Solver(POAGraph graph, const CostModel &cost,
+	                std::size_t num_threads)
+	    : cost(cost), num_threads(num_threads), graph(std::move(graph)),
+	      lifter(this->graph, num_threads) {
+		initialize_paths();
+	}
+
 	void initialize_paths() {
 		if (dict.empty() && graph.num_sequences() != 0) {
 			dict.reserve(graph.num_sequences());

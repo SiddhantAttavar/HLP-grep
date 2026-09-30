@@ -73,14 +73,14 @@ int main() {
 ### Save and load the graph
 
 `Solver::save_graph()` writes the finalized POA graph, including node labels,
-edges, paths, topological order, and heavy-chain metadata. Load it with the
-tagged constructor to avoid rebuilding the graph from the dictionary:
+edges, paths, topological order, and heavy-chain metadata. `Solver::load_graph()`
+reconstructs a solver from that file without rebuilding the dictionary:
 
 ```cpp
 hlp_grep::Solver first(dict);
 first.save_graph("index.hlpg");
 
-hlp_grep::Solver cached(hlp_grep::Solver::LoadGraphTag{}, "index.hlpg");
+hlp_grep::Solver cached = hlp_grep::Solver::load_graph("index.hlpg");
 auto matches = cached.query(query, k);
 ```
 
@@ -89,6 +89,16 @@ with a different model fails. Solver query helpers are reconstructed from
 the saved graph, while query-specific tables are still built for each query.
 `POAGraph` also provides `save_file()`, `load_file()`, and stream-based
 `save()`/`load()` methods for graph-only use.
+
+The `save` and `load` helpers apply this to testcase files: `save` builds
+the graph for a testcase dictionary and writes the `.hlpg` file, while
+`load` answers the testcase queries from the saved graph (skipping the
+dictionary build) and writes the `.sol` solution file:
+
+```sh
+build/tests/save <testcase>.txt --out index.hlpg
+build/tests/load <testcase>.txt index.hlpg --out <testcase>.sol
+```
 
 Output:
 
