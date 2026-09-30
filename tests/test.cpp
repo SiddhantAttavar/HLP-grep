@@ -164,6 +164,20 @@ void test_query_prefix_sharing() {
 		std::cerr << "prefix-sharing: empty-path scoring failed\n";
 		std::exit(1);
 	}
+
+	const CostModel weighted(2, 2, 0, 1);
+	const Solver weighted_solver({"AA"}, weighted, false);
+	const auto over_threshold = weighted_solver.query("AAAA", 2);
+	if (!over_threshold.empty()) {
+		std::cerr << "prefix-sharing: trailing clipped cells changed the query-end score\n";
+		std::exit(1);
+	}
+	const auto within_threshold = weighted_solver.query("AAA", 2);
+	if (within_threshold.size() != 1 || within_threshold[0].id != 0 ||
+	    within_threshold[0].dist != 2) {
+		std::cerr << "prefix-sharing: two-sided row clipping lost an endpoint match\n";
+		std::exit(1);
+	}
 	std::cout << "PASS query-prefix-sharing\n";
 }
 
@@ -193,6 +207,30 @@ void test_lifter_decompose() {
 	std::cout << "PASS lifter-decompose\n";
 }
 
+void test_clip_row_two_sided() {
+	const POAGraph graph({"A"});
+	BinaryLifter lifter(graph, 1);
+	std::vector<POAGraph::CompressedPath> paths{graph.compressed_path(0)};
+	lifter.decompose(paths);
+	lifter.build("ACGT", 1);
+
+	auto range = lifter.window(paths[0].start);
+	const auto original_range = range;
+	std::vector<int> row(range.second - range.first, 2);
+	if (row.size() < 3) {
+		std::cerr << "clip-row: test window is too narrow\n";
+		std::exit(1);
+	}
+	row[1] = 1;
+	lifter.clip_row(row, range);
+	if (row != std::vector<int>{1} || range.first != original_range.first + 1 ||
+	    range.second != original_range.first + 2) {
+		std::cerr << "clip-row: did not trim both sides of the row\n";
+		std::exit(1);
+	}
+	std::cout << "PASS clip-row-two-sided\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -204,6 +242,7 @@ int main(int argc, char **argv) {
 	const auto files = collect_files(argc, argv);
 	test_query_prefix_sharing();
 	test_lifter_decompose();
+	test_clip_row_two_sided();
 	if (files.empty()) {
 		std::cout << "no testcase files found, nothing to do\n";
 		return 0;

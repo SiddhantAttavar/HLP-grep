@@ -168,18 +168,17 @@ public:
 	}
 
 	/**
-	 * @brief Applies this matrix to a suffix of its row-position range.
+	 * @brief Applies this matrix to a contiguous subrange of its row range.
 	 *
-	 * The first element of @p vec corresponds to input_range.first. Any
-	 * earlier matrix rows are excluded; the range must end at this matrix's
-	 * row_range().second. This lets callers omit source states already known
-	 * to exceed their threshold.
+	 * The first element of @p vec corresponds to input_range.first. Rows
+	 * outside the input range are excluded. This lets callers omit source
+	 * states already known to exceed their threshold.
 	 *
-	 * @param vec Costs for the suffix of matrix rows.
+	 * @param vec Costs for the selected contiguous range of matrix rows.
 	 * @param input_range Query-position range represented by @p vec.
 	 * @return One entry per matrix column.
-	 * @throws std::invalid_argument if the input range is not a matrix-row
-	 *         suffix or the vector length does not match that suffix.
+	 * @throws std::invalid_argument if the input range is outside the matrix
+	 *         row range or the vector length does not match it.
 	 */
 	std::vector<int> min_plus_apply(
 	    const std::vector<int> &vec,
@@ -188,12 +187,12 @@ public:
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_apply: empty row vector");
 		if (input_range.first < row_range_value.first ||
-		    input_range.second != row_range_value.second ||
+		    input_range.second > row_range_value.second ||
 		    input_range.first > input_range.second)
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_apply: invalid input position range");
 		const std::size_t offset = input_range.first - row_range_value.first;
-		const std::size_t expected = row_range_value.second - input_range.first;
+		const std::size_t expected = input_range.second - input_range.first;
 		if (vec.size() != expected)
 			throw std::invalid_argument(
 			    "DistMatrix::min_plus_apply: dimension mismatch");
@@ -204,7 +203,7 @@ public:
 		if (vec.empty())
 			return out;
 		argmin_row(vec.data(), *this, out.data(), 0, cols - 1,
-		           offset, rows - 1, nullptr, offset);
+		           offset, offset + vec.size() - 1, nullptr, offset);
 		return out;
 	}
 

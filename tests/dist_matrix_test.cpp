@@ -247,6 +247,19 @@ void test_apply() {
 	    stair.min_plus_apply({1, DistMatrix::INF, 0}, {2, 5});
 	check(clipped_suffix == full_suffix,
 	      "apply clipped suffix: values differ from full-row application");
+	const std::vector<int> clipped_interval =
+	    stair.min_plus_apply({2, 0}, {1, 3});
+	std::vector<int> interval_brute(stair.num_cols(), DistMatrix::INF);
+	for (std::size_t i = 1; i < 3; ++i)
+		for (std::size_t j = 0; j < stair.num_cols(); ++j) {
+			const int cell = stair(i, j);
+			if (cell >= DistMatrix::INF)
+				continue;
+			const int candidate = (i == 1 ? 2 : 0) + cell;
+			interval_brute[j] = std::min(interval_brute[j], candidate);
+		}
+	check(clipped_interval == interval_brute,
+	      "apply clipped interval: values differ from brute-force result");
 	const std::vector<int> empty_suffix =
 	    stair.min_plus_apply({}, {5, 5});
 	check(std::all_of(empty_suffix.begin(), empty_suffix.end(),

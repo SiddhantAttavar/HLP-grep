@@ -18,8 +18,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -198,16 +196,11 @@ public:
 		const int threads = static_cast<int>(
 		    num_threads == 0 ? std::min(omp_get_max_threads(), 8)
 		                     : num_threads);
-		const char *timing_env = std::getenv("HLP_GREP_LEVEL_TIMING");
-		const bool timing = timing_env && *timing_env != '0';
-		// Per-level times collected by the master for env HLP_GREP_LEVEL_TIMING.
-		std::vector<double> level_ms(max_level);
 		this->query = query;
 		this->k = k;
 #pragma omp parallel num_threads(threads)
 		{
 			for (std::size_t t = 0; t < max_level; ++t) {
-				const double t0 = omp_get_wtime();
 #pragma omp for schedule(static)
 				for (std::size_t idx = 0;
 				     idx < build_nodes[t].size(); ++idx) {
@@ -227,28 +220,7 @@ public:
 				// The for's implicit barrier separates
 				// consecutive levels (a level's blocks may be
 				// read by the next one).
-				if (timing) {
-#pragma omp master
-					level_ms[t] =
-					    (omp_get_wtime() - t0) * 1e3;
-				}
 			}
-		}
-		if (timing) {
-			std::vector<std::size_t> counts(max_level);
-			for (std::size_t t = 0; t < max_level; ++t)
-				counts[t] = build_nodes[t].size();
-			std::fprintf(stderr,
-			             "== build() level timings (threads=%d)\n",
-			             threads);
-			double total = 0;
-			for (std::size_t t = 0; t < max_level; ++t) {
-				std::fprintf(stderr, "  level %-3zu %8.3f ms  (%zu "
-				                     "blocks)\n",
-				             t, level_ms[t], counts[t]);
-				total += level_ms[t];
-			}
-			std::fprintf(stderr, "  total %8.3f ms\n", total);
 		}
 	}
 
@@ -258,13 +230,13 @@ public:
 	 *        jumped chain.
 	 *
 	 * @p cost and @p pos_range hold the start node's DP row, possibly
-	 * clipped to a suffix of its after-label window. They are advanced
-	 * with one DistMatrix::min_plus_apply over the precomputed power-of-two
+	 * clipped to a contiguous subrange of its after-label window. They are
+	 * advanced with one DistMatrix::min_plus_apply over the precomputed power-of-two
 	 * block. decompose() has already split path runs so each call's length
 	 * is a power of two and the corresponding level exists at @p u.
-	 * Afterwards @p cost holds one entry per
-	 * allowed position of the reached node, then clipped to the first
-	 * position whose cost is at most k. In effect, after the call
+	 * Afterwards @p cost holds one entry per allowed position of the reached
+	 * node, then clipped to the contiguous span between the first and last
+	 * positions whose costs are at most k. In effect, after the call
 	 *   cost(b) = min_a cost_in(a) + ed(u, l, a, b)
 	 * for the chain [u, u^1, ..., u^l] (each heavy edge crossing its
 	 * destination node's full label). Cells no transition realizes carry
@@ -280,7 +252,7 @@ public:
 	 * @return The node l heavy steps from u.
 	 * @throws std::out_of_range if u is not a valid node id or the heavy
 	 *         chain ends before l steps.
-	 * @throws std::invalid_argument if the row does not match a suffix of
+	 * @throws std::invalid_argument if the row does not match a subrange of
 	 *         the start node's window or l is not a power-of-two block.
 	 */
 	node_id jump(node_id u, int l, std::vector<int> &cost,
@@ -323,8 +295,8 @@ public:
 	 *        row and returns the advanced row.
 	 *
 	 * @p cost and @p pos_range hold the allowed query positions at u,
-	 * possibly clipped to a suffix; on return they hold v's row clipped
-	 * to a suffix as well. The row is computed by a semiglobal ED DP that
+	 * possibly clipped to a contiguous subrange; on return they hold v's row
+	 * clipped to a subrange as well. The row is computed by a semiglobal ED DP that
 	 * superposes all source
 	 * positions: row 0 seeds the source costs within the entry band
 	 * window(v, 0) — sources below it die, since every continuation
@@ -347,15 +319,15 @@ public:
 	 * @param cost DP row of u; replaced by the clipped DP row at v.
 	 * @param pos_range Position range represented by @p cost; replaced by
 	 *                  the clipped range at v.
-	 * @throws std::invalid_argument if the row does not match a suffix of
+	 * @throws std::invalid_argument if the row does not match a subrange of
 	 *         u's window.
 	 * @pre There is an edge (u, v) in the graph; not verified here.
 	 */
 	void step(node_id u, node_id v, std::vector<int> &cost,
 	          std::pair<std::size_t, std::size_t> &pos_range) const {
-		const std::size_t hi_u = window(u).second;
 		const auto [lo_v, hi_v] = window(v);
 		validate_row(u, cost, pos_range);
+		const std::size_t hi_u = pos_range.second;
 		const std::string &label = graph.seq(v);
 		std::vector<int> out(static_cast<std::size_t>(hi_v - lo_v),
 		                     DistMatrix::INF);
@@ -364,7 +336,7 @@ public:
 			const auto [l0, h0] = window(v, 0);
 			std::vector<long> f(static_cast<std::size_t>(hL - l0),
 			                    DistMatrix::INF);
-			// Row 0: seed only the retained source suffix, then chain
+			// Row 0: seed only the retained source range, then chain
 			// insertions at v. Omitted source states are all >k, so their
 			// continuations cannot contribute a <=k result.
 			for (std::size_t b = std::max(l0, pos_range.first);
@@ -396,25 +368,33 @@ public:
 		return {lo, std::max(hi, lo + 1)};
 	}
 
-	/** Removes the leading row cells whose costs exceed the current threshold. */
+	/** Removes leading and trailing row cells above the current threshold.
+	 * Remaining query positions form a contiguous range; later transitions
+	 * only advance query positions, so discarded endpoints cannot contribute
+	 * to a future result within k.
+	 */
 	void clip_row(std::vector<int> &row,
 	              std::pair<std::size_t, std::size_t> &pos_range) const {
 		if (pos_range.second < pos_range.first ||
 		    row.size() != pos_range.second - pos_range.first)
 			throw std::invalid_argument(
 			    "BinaryLifter::clip_row: row/range size mismatch");
-		std::size_t removed = 0;
-		while (removed < row.size() && row[removed] > k)
-			++removed;
-		if (removed == row.size()) {
+		const std::size_t old_lo = pos_range.first;
+		std::size_t first = 0;
+		std::size_t last = row.size();
+		while (first < last && row[first] > k)
+			++first;
+		while (last > first && row[last - 1] > k)
+			--last;
+		if (first == last) {
 			row.clear();
 			pos_range.first = pos_range.second;
 			return;
 		}
-		if (removed > 0) {
-			row.erase(row.begin(), row.begin() + removed);
-			pos_range.first += removed;
-		}
+		if (first > 0)
+			std::move(row.begin() + first, row.begin() + last, row.begin());
+		row.resize(last - first);
+		pos_range = {old_lo + first, old_lo + last};
 	}
 
 private:
@@ -423,11 +403,11 @@ private:
 	    const std::pair<std::size_t, std::size_t> &pos_range) const {
 		const auto full_range = window(u);
 		if (pos_range.first < full_range.first ||
-		    pos_range.second != full_range.second ||
+		    pos_range.second > full_range.second ||
 		    pos_range.first > pos_range.second ||
 		    row.size() != pos_range.second - pos_range.first)
 			throw std::invalid_argument(
-			    "BinaryLifter: row does not match a suffix of the node window");
+			    "BinaryLifter: row does not match a subrange of the node window");
 	}
 
 	/**

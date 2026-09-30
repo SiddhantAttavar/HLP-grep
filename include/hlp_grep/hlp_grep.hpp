@@ -74,9 +74,9 @@ public:
 	 * into contiguous batches scored in parallel. Each batch keeps its own
 	 * stack of DP rows for shared prefixes and computes only each path's
 	 * unmatched suffix across heavy blocks (jump) or light edges (step).
-	 * Prefixes at batch boundaries are recomputed. The last entry of the
-	 * final row is the edit distance between the sequence's path and the
-	 * query; it is reported when it does not exceed k.
+	 * Prefixes at batch boundaries are recomputed. The final row's entry at
+	 * query position |query| is the edit distance between the sequence's path
+	 * and the query; it is reported when retained and no greater than k.
 	 *
 	 * Scoring aborts a path early once every entry of its DP row exceeds
 	 * k: with nonnegative operation costs each transition only adds cost,
@@ -247,7 +247,8 @@ private:
 				POAGraph::node_id cur = state.node;
 				const auto full_range = lifter.window(cur);
 				assert(state.pos_range.first >= full_range.first &&
-				       state.pos_range.second == full_range.second);
+				       state.pos_range.second <= full_range.second &&
+				       state.pos_range.first <= state.pos_range.second);
 				assert(state.row.size() ==
 				       state.pos_range.second - state.pos_range.first);
 				QueryState next_state = state;
@@ -272,8 +273,14 @@ private:
 				++step_index;
 				dead = stack.back().row.empty();
 			}
-			if (!dead)
-				dist[id] = stack.back().row.back();
+			if (!dead) {
+				const QueryState &final_state = stack.back();
+				const std::size_t query_end = query.size();
+				if (query_end >= final_state.pos_range.first &&
+				    query_end < final_state.pos_range.second)
+					dist[id] = final_state.row[
+					    query_end - final_state.pos_range.first];
+			}
 			previous = &cp;
 		}
 	}
