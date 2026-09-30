@@ -9,6 +9,8 @@ target_link_libraries(load PRIVATE hlp_grep::hlp_grep)
 
 option(HLP_GREP_WITH_WFA2 "Enable the WFA2-lib method in bench (needs third_party/WFA2-lib)" ON)
 option(HLP_GREP_WITH_DT_PATRICIA "Enable the DT-Patricia method in bench (needs third_party/DT-Patricia)" ON)
+option(HLP_GREP_WITH_BED_TREE "Enable the BED-tree method in bench (needs third_party/bed-tree)" ON)
+option(HLP_GREP_WITH_HSTREE "Enable the hstree method in bench (needs third_party/Similarity-Search-and-Join)" ON)
 
 add_executable(test_hlp_grep test.cpp)
 target_link_libraries(test_hlp_grep PRIVATE hlp_grep::hlp_grep)
@@ -46,6 +48,48 @@ if(HLP_GREP_WITH_DT_PATRICIA AND EXISTS ${HLP_GREP_DT_PATRICIA_DIR}/CMakeLists.t
 	                 EXCLUDE_FROM_ALL)
 	target_compile_definitions(bench PRIVATE HLP_GREP_WITH_DT_PATRICIA)
 	target_link_libraries(bench PRIVATE dt_patricia::dt_patricia)
+endif()
+
+# Optional BED-tree backend (legacy C++ without its own CMake build): run
+# tests/scripts/setup_bed_tree.sh once to clone and patch
+# third_party/bed-tree. main.cpp is excluded; the library sources are
+# compiled straight into bench.
+	set(HLP_GREP_BED_TREE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/bed-tree)
+if(HLP_GREP_WITH_BED_TREE AND EXISTS ${HLP_GREP_BED_TREE_DIR}/src/SBPTree.cpp)
+	target_compile_definitions(bench PRIVATE HLP_GREP_WITH_BED_TREE)
+	target_include_directories(bench PRIVATE ${HLP_GREP_BED_TREE_DIR}/src)
+	target_sources(bench PRIVATE
+		${HLP_GREP_BED_TREE_DIR}/src/BufferManager.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/GramDictOrder.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/GramLocOrder.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/HashFunction.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/InvertedList.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/Node.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/NormGramDictOrder.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/Page.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/Queue.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/SBPTree.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/StrComp.cpp
+		${HLP_GREP_BED_TREE_DIR}/src/StrDictOrder.cpp
+	)
+endif()
+
+# Optional hstree backend (exact threshold search from
+# TsinghuaDatabaseGroup/Similarity-Search-and-Join, no CMake build of its
+# own): run tests/scripts/setup_hstree.sh once to clone and patch
+# third_party/Similarity-Search-and-Join. main.cc is excluded; the library
+# sources are compiled straight into bench.
+set(HLP_GREP_HSTREE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Similarity-Search-and-Join/hstree/src)
+if(HLP_GREP_WITH_HSTREE AND EXISTS ${HLP_GREP_HSTREE_DIR}/hstree.h)
+	target_compile_definitions(bench PRIVATE HLP_GREP_WITH_HSTREE)
+	target_include_directories(bench PRIVATE ${HLP_GREP_HSTREE_DIR})
+	target_sources(bench PRIVATE
+		${HLP_GREP_HSTREE_DIR}/free.cc
+		${HLP_GREP_HSTREE_DIR}/hsimSearch.cc
+		${HLP_GREP_HSTREE_DIR}/hstopk.cc
+		${HLP_GREP_HSTREE_DIR}/io.cc
+		${HLP_GREP_HSTREE_DIR}/prepare.cc
+	)
 endif()
 
 add_executable(graph_stats graph_stats.cpp)
