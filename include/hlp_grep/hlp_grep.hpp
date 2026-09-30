@@ -37,6 +37,7 @@ namespace hlp_grep {
  */
 class Solver {
 public:
+	struct LoadGraphTag {};
 	/**
 	 * @brief Constructs the solver over the given sequence dictionary.
 	 *
@@ -58,11 +59,41 @@ public:
 	    : dict(std::move(dict)), cost(cost), num_threads(num_threads),
 	      graph(this->dict, this->cost, compact_nodes),
 	      lifter(this->graph, num_threads) {
+		initialize_paths();
+	}
+
+	/** Constructs a solver from a previously saved POAGraph cache. */
+	Solver(LoadGraphTag, const std::string &graph_file,
+	                const CostModel &cost = DEFAULT_COST_MODEL,
+	                std::size_t num_threads = 0)
+	    : cost(cost), num_threads(num_threads),
+	      graph(POAGraph::load_file(graph_file, cost)),
+	      lifter(graph, num_threads) {
+		initialize_paths();
+	}
+
+	/** Saves the complete graph structure used by this solver. */
+	void save_graph(const std::string &filename) const {
+		graph.save_file(filename);
+	}
+
+private:
+	void initialize_paths() {
+		if (dict.empty() && graph.num_sequences() != 0) {
+			dict.reserve(graph.num_sequences());
+			for (std::size_t i = 0; i < graph.num_sequences(); ++i) {
+				std::string sequence;
+				for (POAGraph::node_id u : graph.path(i))
+					sequence += graph.seq(u);
+				dict.push_back(std::move(sequence));
+			}
+		}
 		build_compressed_paths();
 		lifter.decompose(compressed_paths);
 		sort_compressed_paths();
 	}
 
+public:
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the
 	 *        query.
@@ -105,7 +136,7 @@ public:
 		return score_paths(query, k, eligible);
 	}
 
-private:
+	// -- implementation --------------------------------------------------------
 	/** A reusable DP row at a prefix boundary of a sorted path. */
 	struct QueryState {
 		POAGraph::node_id node;

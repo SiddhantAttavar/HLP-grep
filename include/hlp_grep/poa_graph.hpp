@@ -13,8 +13,13 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <istream>
 #include <limits>
+#include <ostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,6 +46,12 @@ public:
 	 *        decomposition of sequence paths.
 	 */
 	enum class EdgeType : unsigned char { HEAVY, LIGHT };
+
+	struct Edge {
+		EdgeType type = EdgeType::LIGHT;
+		node_id neighbor = 0;
+		std::size_t edge_id = 0;
+	};
 
 	/**
 	 * @brief A step along a compressed sequence path.
@@ -109,6 +120,123 @@ public:
 	                  bool compact_nodes = true)
 	    : cost(cost) {
 		build(dict, compact_nodes);
+	}
+
+	/** Writes the complete finalized graph in a versioned binary format. */
+	void save(std::ostream &out) const {
+		static constexpr char MAGIC[8] = {'H', 'L', 'P', 'P', 'O', 'A', '1', '\0'};
+		out.write(MAGIC, sizeof(MAGIC));
+		write_u64(out, 1);
+		write_u64(out, static_cast<std::uint64_t>(cost.ins()));
+		write_u64(out, static_cast<std::uint64_t>(cost.del()));
+		write_u64(out, static_cast<std::uint64_t>(cost.match));
+		write_u64(out, static_cast<std::uint64_t>(cost.mismatch));
+		write_u64(out, nodes.size());
+		for (const Node &n : nodes) {
+			write_string(out, n.seq);
+			write_u64(out, n.pos_min);
+			write_u64(out, n.pos_max);
+			write_u64(out, n.heavy_neighbour ? *n.heavy_neighbour : START);
+			write_u64(out, n.heavy_length);
+		}
+		write_edges(out, out_edges);
+		write_edges(out, in_edges);
+		write_u64(out, next_edge_id);
+		write_u64(out, topo.size());
+		for (node_id u : topo)
+			write_u64(out, u);
+		write_u64(out, paths.size());
+		for (const auto &path : paths) {
+			write_u64(out, path.size());
+			for (node_id u : path)
+				write_u64(out, u);
+		}
+		if (!out)
+			throw std::runtime_error("POAGraph::save: write failed");
+	}
+
+	/** Loads and validates a graph; the supplied cost model must match the file. */
+	static POAGraph load(std::istream &in,
+	                     const CostModel &cost = DEFAULT_COST_MODEL) {
+		char magic[8]{};
+		in.read(magic, sizeof(magic));
+		static constexpr char EXPECTED[8] = {'H', 'L', 'P', 'P', 'O', 'A', '1', '\0'};
+		if (!in || !std::equal(magic, magic + sizeof(magic), EXPECTED))
+			throw std::runtime_error("POAGraph::load: invalid file signature");
+		if (read_u64(in) != 1)
+			throw std::runtime_error("POAGraph::load: unsupported version");
+		const auto ins = read_u64(in), del = read_u64(in);
+		const auto match = read_u64(in), mismatch = read_u64(in);
+		if (ins != static_cast<std::uint64_t>(cost.ins()) ||
+		    del != static_cast<std::uint64_t>(cost.del()) ||
+		    match != static_cast<std::uint64_t>(cost.match) ||
+		    mismatch != static_cast<std::uint64_t>(cost.mismatch))
+			throw std::runtime_error("POAGraph::load: cost model mismatch");
+		POAGraph graph(std::vector<std::string>{}, cost);
+		const std::size_t n = read_count(in, "nodes");
+		graph.nodes.reserve(n);
+		for (std::size_t i = 0; i < n; ++i) {
+			Node node;
+			node.seq = read_string(in);
+			node.pos_min = read_u64(in);
+			node.pos_max = read_u64(in);
+			const auto heavy = read_u64(in);
+			if (heavy != START) {
+				if (heavy >= n)
+					throw std::runtime_error("POAGraph::load: invalid heavy neighbour");
+				node.heavy_neighbour = static_cast<node_id>(heavy);
+			}
+			node.heavy_length = read_u64(in);
+			if (node.seq.empty())
+				throw std::runtime_error("POAGraph::load: empty node label");
+			graph.nodes.push_back(std::move(node));
+		}
+		graph.out_edges = read_edges(in, n);
+		graph.in_edges = read_edges(in, n);
+		graph.next_edge_id = read_count(in, "edge id");
+		const std::size_t topo_size = read_count(in, "topological order");
+		if (topo_size != n)
+			throw std::runtime_error("POAGraph::load: invalid topological order size");
+		graph.topo.resize(n);
+		std::vector<std::size_t> rank(n, START);
+		for (std::size_t i = 0; i < n; ++i) {
+			const auto u = read_u64(in);
+			if (u >= n || rank[u] != START)
+				throw std::runtime_error("POAGraph::load: invalid topological node");
+			graph.topo[i] = static_cast<node_id>(u);
+			rank[u] = i;
+		}
+		const std::size_t path_count = read_count(in, "paths");
+		graph.paths.reserve(path_count);
+		for (std::size_t i = 0; i < path_count; ++i) {
+			const std::size_t len = read_count(in, "path length");
+			std::vector<node_id> path;
+			path.reserve(len);
+			for (std::size_t j = 0; j < len; ++j) {
+				const auto u = read_u64(in);
+				if (u >= n)
+					throw std::runtime_error("POAGraph::load: invalid path node");
+				path.push_back(static_cast<node_id>(u));
+			}
+			graph.paths.push_back(std::move(path));
+		}
+		graph.validate_loaded(rank);
+		return graph;
+	}
+
+	static POAGraph load_file(const std::string &filename,
+	                          const CostModel &cost = DEFAULT_COST_MODEL) {
+		std::ifstream in(filename, std::ios::binary);
+		if (!in)
+			throw std::runtime_error("POAGraph::load_file: cannot open " + filename);
+		return load(in, cost);
+	}
+
+	void save_file(const std::string &filename) const {
+		std::ofstream out(filename, std::ios::binary | std::ios::trunc);
+		if (!out)
+			throw std::runtime_error("POAGraph::save_file: cannot open " + filename);
+		save(out);
 	}
 
 	/**
@@ -232,6 +360,107 @@ public:
 	}
 
 private:
+	static void write_u64(std::ostream &out, std::uint64_t value) {
+		for (unsigned i = 0; i < 8; ++i)
+			out.put(static_cast<char>((value >> (i * 8)) & 0xff));
+	}
+	static std::uint64_t read_u64(std::istream &in) {
+		std::uint64_t value = 0;
+		for (unsigned i = 0; i < 8; ++i) {
+			const int byte = in.get();
+			if (byte == std::char_traits<char>::eof())
+				throw std::runtime_error("POAGraph::load: truncated file");
+			value |= static_cast<std::uint64_t>(static_cast<unsigned char>(byte))
+			         << (i * 8);
+		}
+		return value;
+	}
+	static std::size_t read_count(std::istream &in, const char *what) {
+		const std::uint64_t value = read_u64(in);
+		if (value > std::numeric_limits<std::size_t>::max() || value > (1ULL << 32))
+			throw std::runtime_error(std::string("POAGraph::load: unreasonable ") + what);
+		return static_cast<std::size_t>(value);
+	}
+	static void write_string(std::ostream &out, const std::string &value) {
+		write_u64(out, value.size());
+		out.write(value.data(), static_cast<std::streamsize>(value.size()));
+	}
+	static std::string read_string(std::istream &in) {
+		const std::size_t size = read_count(in, "label length");
+		std::string value(size, '\0');
+		in.read(value.data(), static_cast<std::streamsize>(size));
+		if (!in)
+			throw std::runtime_error("POAGraph::load: truncated label");
+		return value;
+	}
+	template <class Lists>
+	static void write_edges(std::ostream &out, const Lists &lists) {
+		write_u64(out, lists.size());
+		for (const auto &list : lists) {
+			write_u64(out, list.size());
+			for (const Edge &edge : list) {
+				write_u64(out, static_cast<std::uint64_t>(edge.type));
+				write_u64(out, edge.neighbor);
+				write_u64(out, edge.edge_id);
+			}
+		}
+	}
+	static std::vector<std::vector<Edge>> read_edges(std::istream &in,
+	                                                std::size_t n) {
+		if (read_count(in, "edge-list count") != n)
+			throw std::runtime_error("POAGraph::load: edge-list count mismatch");
+		std::vector<std::vector<Edge>> lists(n);
+		for (auto &list : lists) {
+			const std::size_t size = read_count(in, "degree");
+			list.reserve(size);
+			for (std::size_t i = 0; i < size; ++i) {
+				const auto type = read_u64(in);
+				const auto neighbor = read_u64(in);
+				const auto edge_id = read_u64(in);
+				if (type > static_cast<std::uint64_t>(EdgeType::LIGHT) ||
+				    neighbor >= n || edge_id > std::numeric_limits<std::size_t>::max())
+					throw std::runtime_error("POAGraph::load: invalid edge");
+				list.push_back({static_cast<EdgeType>(type),
+				                static_cast<node_id>(neighbor),
+				                static_cast<std::size_t>(edge_id)});
+			}
+		}
+		return lists;
+	}
+	void validate_loaded(const std::vector<std::size_t> &rank) {
+		if (out_edges.size() != nodes.size() || in_edges.size() != nodes.size())
+			throw std::runtime_error("POAGraph::load: graph array size mismatch");
+		std::vector<unsigned char> seen(next_edge_id, 0);
+		for (node_id u = 0; u < nodes.size(); ++u) {
+			for (const Edge &e : out_edges[u]) {
+				if (rank[u] >= rank[e.neighbor] || e.edge_id >= next_edge_id || seen[e.edge_id]++)
+					throw std::runtime_error("POAGraph::load: invalid outgoing edge");
+			}
+		}
+		for (node_id u = 0; u < nodes.size(); ++u) {
+			std::optional<node_id> heavy;
+			for (const Edge &e : out_edges[u]) {
+				if (e.type == EdgeType::HEAVY) {
+					if (heavy)
+						throw std::runtime_error("POAGraph::load: multiple heavy edges");
+					heavy = e.neighbor;
+				}
+			}
+			if (nodes[u].heavy_neighbour != heavy)
+				throw std::runtime_error("POAGraph::load: heavy-neighbour mismatch");
+			const std::size_t expected = heavy ? 1 + nodes[*heavy].heavy_length : 0;
+			if (nodes[u].heavy_length != expected)
+				throw std::runtime_error("POAGraph::load: heavy-chain length mismatch");
+		}
+		for (const auto &path : paths)
+			for (std::size_t i = 1; i < path.size(); ++i)
+				if (!find_edge(out_edges[path[i - 1]], path[i]))
+					throw std::runtime_error("POAGraph::load: path contains missing edge");
+		for (unsigned char present : seen)
+			if (!present)
+				throw std::runtime_error("POAGraph::load: unused edge id");
+	}
+
 	/**
 	 * @brief One step of a sequence-to-graph alignment.
 	 */
@@ -267,12 +496,6 @@ private:
 	 *        records of the same edge). Visiting frequencies are temporary
 	 *        values and are not stored in the struct.
 	 */
-	struct Edge {
-		EdgeType type = EdgeType::LIGHT; ///< Heavy or light edge.
-		node_id neighbor = 0;            ///< Other end of the edge.
-		std::size_t edge_id = 0;         ///< Unique id assigned at creation.
-	};
-
 	/// Virtual start node; edges from it are implicit and cost nothing.
 	static constexpr node_id START = static_cast<node_id>(-1);
 
@@ -378,15 +601,21 @@ private:
 			}
 			new_nodes.push_back({std::move(label), START, START});
 			for (const Edge &e : in_edges[u])
-				if (!absorbed[e.neighbor])
+				if (!absorbed[e.neighbor]) {
+					const std::size_t id = next_edge_id++;
 					new_in[h].push_back(
-					    {EdgeType::LIGHT, new_id[e.neighbor],
-					     next_edge_id++});
+					    {EdgeType::LIGHT, new_id[e.neighbor], id});
+					new_out[new_id[e.neighbor]].push_back(
+					    {EdgeType::LIGHT, h, id});
+				}
 			for (const Edge &e : out_edges[run_end[u]])
-				if (!absorbed[e.neighbor])
+				if (!absorbed[e.neighbor]) {
+					const std::size_t id = next_edge_id++;
 					new_out[h].push_back(
-					    {EdgeType::LIGHT, new_id[e.neighbor],
-					     next_edge_id++});
+					    {EdgeType::LIGHT, new_id[e.neighbor], id});
+					new_in[new_id[e.neighbor]].push_back(
+					    {EdgeType::LIGHT, h, id});
+				}
 		}
 		nodes = std::move(new_nodes);
 		out_edges = std::move(new_out);

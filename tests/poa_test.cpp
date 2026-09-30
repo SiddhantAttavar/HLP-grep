@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -149,6 +150,35 @@ const std::vector<POAGraph::node_id> PATH_0123 = {0, 1, 2, 3};
 } // namespace
 
 int main() {
+	{
+		const std::vector<std::string> dict{"ACGT", "ACGA", "TCGT", ""};
+		const POAGraph original(dict);
+		std::stringstream cache(std::ios::in | std::ios::out | std::ios::binary);
+		original.save(cache);
+		cache.seekg(0);
+		const POAGraph loaded = POAGraph::load(cache);
+		check_paths(loaded, dict, "persistence round trip");
+		check(loaded.num_nodes() == original.num_nodes(),
+		      "persistence: node count changed");
+		for (std::size_t u = 0; u < original.num_nodes(); ++u) {
+			check(loaded.pos_range(u) == original.pos_range(u),
+			      "persistence: position range changed");
+			check(loaded.node(u).heavy_neighbour == original.node(u).heavy_neighbour,
+			      "persistence: heavy edge changed");
+			check(loaded.node(u).heavy_length == original.node(u).heavy_length,
+			      "persistence: heavy-chain length changed");
+		}
+		std::stringstream broken("bad", std::ios::in | std::ios::binary);
+		bool rejected = false;
+		try {
+			(void)POAGraph::load(broken);
+		} catch (const std::runtime_error &) {
+			rejected = true;
+		}
+		check(rejected, "persistence: malformed cache was accepted");
+		std::cout << "PASS persistence-round-trip\n";
+	}
+
 	// Substitution: shared prefix, one alternate path for the last base.
 	// The shared prefix ACG compacts into one node; the two last bases
 	// branch off it.

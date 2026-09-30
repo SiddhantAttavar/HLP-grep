@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -155,6 +156,21 @@ void test_query_prefix_sharing() {
 			std::cerr << "prefix-sharing: wrong result at position " << i << '\n';
 			std::exit(1);
 		}
+	const std::string cache_file = "/tmp/opencode/hlp-grep-roundtrip.graph";
+	solver.save_graph(cache_file);
+	const Solver loaded(Solver::LoadGraphTag{}, cache_file);
+	const auto loaded_results = loaded.query("ACGT", 1);
+	if (loaded_results.size() != results.size()) {
+		std::cerr << "persistence: loaded solver returned different result count\n";
+		std::exit(1);
+	}
+	for (std::size_t i = 0; i < results.size(); ++i)
+		if (loaded_results[i].id != results[i].id ||
+		    loaded_results[i].dist != results[i].dist) {
+			std::cerr << "persistence: loaded solver result differs\n";
+			std::exit(1);
+		}
+	std::filesystem::remove(cache_file);
 
 	const Solver with_empty({"", "AC"});
 	const auto empty_results = with_empty.query("A", 1);

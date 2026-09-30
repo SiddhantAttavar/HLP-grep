@@ -70,6 +70,26 @@ int main() {
 }
 ```
 
+### Save and load the graph
+
+`Solver::save_graph()` writes the finalized POA graph, including node labels,
+edges, paths, topological order, and heavy-chain metadata. Load it with the
+tagged constructor to avoid rebuilding the graph from the dictionary:
+
+```cpp
+hlp_grep::Solver first(dict);
+first.save_graph("index.hlpg");
+
+hlp_grep::Solver cached(hlp_grep::Solver::LoadGraphTag{}, "index.hlpg");
+auto matches = cached.query(query, k);
+```
+
+The cache is a versioned binary format and includes its cost model; loading
+with a different model fails. Solver query helpers are reconstructed from
+the saved graph, while query-specific tables are still built for each query.
+`POAGraph` also provides `save_file()`, `load_file()`, and stream-based
+`save()`/`load()` methods for graph-only use.
+
 Output:
 
 ```text
