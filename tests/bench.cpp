@@ -55,6 +55,14 @@ extern "C" {
 #include <hstree.h>
 #endif
 
+#ifdef HLP_GREP_WITH_EDLIB
+#include <edlib.h>
+#endif
+
+#ifdef HLP_GREP_WITH_PARASAIL
+#include <parasail.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -551,6 +559,97 @@ void run_method(int fd, const std::string &method, const Testcase &tc,
 			}
 		}
 #endif
+#ifdef HLP_GREP_WITH_EDLIB
+	} else if (method == "edlib") {
+		// Threshold edit distance search with edlib (Myers' bit-vector):
+		// align the query against every dictionary sequence in NW global
+		// mode and keep distances <= k (edlib reports -1 above the k
+		// bound). No index to build. Unit-cost model validated in the
+		// parent process.
+		write_all(fd, "BUILD 0\n");
+
+		EdlibAlignConfig config = edlibDefaultAlignConfig();
+		config.mode = EDLIB_MODE_NW;
+		config.task = EDLIB_TASK_DISTANCE;
+		for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+			const auto [k, query] = tc.queries[i];
+			const auto b = std::chrono::steady_clock::now();
+			config.k = k;
+			std::vector<Result> results;
+			for (std::size_t j = 0; j < tc.dict.size(); ++j) {
+				const std::string &seq = tc.dict[j];
+				if (std::abs(static_cast<long>(seq.size()) -
+				             static_cast<long>(query.size())) > k)
+					continue;
+				EdlibAlignResult result = edlibAlign(
+				    query.data(), static_cast<int>(query.size()),
+				    seq.data(), static_cast<int>(seq.size()), config);
+				if (result.status != EDLIB_STATUS_OK)
+					::_exit(1);
+				if (result.editDistance >= 0 && result.editDistance <= k)
+					results.push_back(
+					    {j, static_cast<int>(result.editDistance)});
+				edlibFreeAlignResult(result);
+			}
+			const auto e = std::chrono::steady_clock::now();
+			report_query(fd, i, k, results, b, e);
+		}
+#endif
+#ifdef HLP_GREP_WITH_PARASAIL
+	} else if (method == "parasail") {
+		// Threshold edit distance search with parasail's banded global
+		// alignment: the unit-cost matrix (match 0, mismatch -1) with
+		// affine gaps (open 1, extend 1, i.e. 1 per gapped base) turns
+		// the banded NW score into exactly -ed, and the band of
+		// half-width k keeps every alignment of cost <= k. No index to
+		// build. The banded routine rejects empty strings and k == 0, so
+		// those are answered directly (ed is the other length /
+		// equality). Unit-cost model validated in the parent process.
+		write_all(fd, "BUILD 0\n");
+
+		parasail_matrix_t *matrix = parasail_matrix_create(
+		    tc.alphabet.c_str(), 0, -1);
+		if (matrix == nullptr)
+			::_exit(1);
+		for (std::size_t i = 0; i < tc.queries.size(); ++i) {
+			const auto [k, query] = tc.queries[i];
+			const auto b = std::chrono::steady_clock::now();
+			std::vector<Result> results;
+			for (std::size_t j = 0; j < tc.dict.size(); ++j) {
+				const std::string &seq = tc.dict[j];
+				if (std::abs(static_cast<long>(seq.size()) -
+				             static_cast<long>(query.size())) > k)
+					continue;
+				if (query.empty() || seq.empty()) {
+					// ed is the non-empty length here (length filter
+					// above already guarantees it is <= k when one
+					// side is empty... unless both are empty: dist 0).
+					results.push_back(
+					    {j, static_cast<int>(std::max(query.size(),
+					                                  seq.size()))});
+					continue;
+				}
+				if (k == 0) {
+					if (query == seq)
+						results.push_back({j, 0});
+					continue;
+				}
+				parasail_result_t *result = parasail_nw_banded(
+				    query.data(), static_cast<int>(query.size()),
+				    seq.data(), static_cast<int>(seq.size()), 1, 1, k,
+				    matrix);
+				if (result == nullptr)
+					::_exit(1);
+				const int dist = -parasail_result_get_score(result);
+				parasail_result_free(result);
+				if (dist >= 0 && dist <= k)
+					results.push_back({j, dist});
+			}
+			const auto e = std::chrono::steady_clock::now();
+			report_query(fd, i, k, results, b, e);
+		}
+		parasail_matrix_free(matrix);
+#endif
 	} else { // naive: no index to build.
 		write_all(fd, "BUILD 0\n");
 
@@ -655,7 +754,7 @@ std::optional<MethodRun> measure_method(const std::string &method,
 
 [[noreturn]] void usage(const char *argv0) {
 	std::cerr << "usage: " << argv0
-	          << " --method hlp_grep [--method naive|wfa|dt_patricia|bed_tree|hstree ...]"
+	          << " --method hlp_grep [--method naive|wfa|dt_patricia|bed_tree|hstree|edlib|parasail ...]"
 	          << " <testcase-file> [--out out.json] [--no-compact]"
 	          << " [--index graph.hlpg]\n";
 	std::exit(1);
@@ -725,7 +824,8 @@ int main(int argc, char **argv) {
 	for (const auto &method : method_names) {
 		if (method != "hlp_grep" && method != "naive" && method != "wfa" &&
 		    method != "dt_patricia" && method != "bed_tree" &&
-		    method != "hstree") {
+		    method != "hstree" && method != "edlib" &&
+		    method != "parasail") {
 			std::cerr << "unknown method: '" << method << "'\n";
 			usage(argv[0]);
 		}
@@ -763,6 +863,24 @@ int main(int argc, char **argv) {
 		std::cerr << "method 'hstree' unavailable: bench was built "
 		          << "without hstree (tests/scripts/setup_hstree.sh "
 		          << "or cmake with -DHLP_GREP_WITH_HSTREE=OFF)\n";
+		return 1;
+	}
+#endif
+#ifndef HLP_GREP_WITH_EDLIB
+	if (std::find(method_names.begin(), method_names.end(), "edlib")
+	    != method_names.end()) {
+		std::cerr << "method 'edlib' unavailable: bench was built "
+		          << "without edlib (tests/scripts/setup_edlib.sh "
+		          << "or cmake with -DHLP_GREP_WITH_EDLIB=OFF)\n";
+		return 1;
+	}
+#endif
+#ifndef HLP_GREP_WITH_PARASAIL
+	if (std::find(method_names.begin(), method_names.end(), "parasail")
+	    != method_names.end()) {
+		std::cerr << "method 'parasail' unavailable: bench was built "
+		          << "without parasail (tests/scripts/setup_parasail.sh "
+		          << "or cmake with -DHLP_GREP_WITH_PARASAIL=OFF)\n";
 		return 1;
 	}
 #endif
@@ -804,18 +922,20 @@ int main(int argc, char **argv) {
 			          << "(compaction is stored in the index file)\n";
 	}
 
-	// WFA2, DT-Patricia, BED-tree and hstree as used here implement the
-	// unit-cost Levenshtein distance only.
+	// WFA2, DT-Patricia, BED-tree, hstree, edlib and parasail as used here
+	// implement the unit-cost Levenshtein distance only.
 	const auto wants = [&](const char *m) {
 		return std::find(method_names.begin(), method_names.end(), m) !=
 		       method_names.end();
 	};
 	const bool wants_uniform = wants("wfa") || wants("dt_patricia") ||
-	                           wants("bed_tree") || wants("hstree");
+	                           wants("bed_tree") || wants("hstree") ||
+	                           wants("edlib") || wants("parasail");
 	if (wants_uniform && !unit_cost_model(tc)) {
-		std::cerr << "method(s) 'wfa'/'dt_patricia'/'bed_tree'/'hstree' "
-		          << "require a unit-cost model (match 0, ins/del/mismatch 1) "
-		          << "but " << file << " uses a different cost model\n";
+		std::cerr << "method(s) 'wfa'/'dt_patricia'/'bed_tree'/'hstree'/"
+		          << "'edlib'/'parasail' require a unit-cost model (match 0, "
+		          << "ins/del/mismatch 1) but " << file
+		          << " uses a different cost model\n";
 		return 1;
 	}
 #ifdef HLP_GREP_WITH_DT_PATRICIA

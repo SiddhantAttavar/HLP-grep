@@ -11,6 +11,8 @@ option(HLP_GREP_WITH_WFA2 "Enable the WFA2-lib method in bench (needs third_part
 option(HLP_GREP_WITH_DT_PATRICIA "Enable the DT-Patricia method in bench (needs third_party/DT-Patricia)" ON)
 option(HLP_GREP_WITH_BED_TREE "Enable the BED-tree method in bench (needs third_party/bed-tree)" ON)
 option(HLP_GREP_WITH_HSTREE "Enable the hstree method in bench (needs third_party/Similarity-Search-and-Join)" ON)
+option(HLP_GREP_WITH_EDLIB "Enable the edlib method in bench (needs third_party/edlib)" ON)
+option(HLP_GREP_WITH_PARASAIL "Enable the parasail method in bench (needs third_party/parasail)" ON)
 
 add_executable(test_hlp_grep test.cpp)
 target_link_libraries(test_hlp_grep PRIVATE hlp_grep::hlp_grep)
@@ -90,6 +92,35 @@ if(HLP_GREP_WITH_HSTREE AND EXISTS ${HLP_GREP_HSTREE_DIR}/hstree.h)
 		${HLP_GREP_HSTREE_DIR}/io.cc
 		${HLP_GREP_HSTREE_DIR}/prepare.cc
 	)
+endif()
+
+# Optional edlib backend (exact bit-vector alignment library): run
+# tests/scripts/setup_edlib.sh once to clone third_party/edlib.
+# Examples, utilities and the test tree are switched off; only the
+# edlib::edlib library is consumed.
+set(HLP_GREP_EDLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/edlib)
+if(HLP_GREP_WITH_EDLIB AND EXISTS ${HLP_GREP_EDLIB_DIR}/CMakeLists.txt)
+	set(EDLIB_BUILD_EXAMPLES OFF)
+	set(EDLIB_BUILD_UTILITIES OFF)
+	set(EDLIB_ENABLE_INSTALL OFF)
+	set(BUILD_TESTING OFF)
+	add_subdirectory(${HLP_GREP_EDLIB_DIR}
+	                 ${CMAKE_BINARY_DIR}/third_party/edlib
+	                 EXCLUDE_FROM_ALL)
+	target_compile_definitions(bench PRIVATE HLP_GREP_WITH_EDLIB)
+	target_link_libraries(bench PRIVATE edlib::edlib)
+endif()
+
+# Optional parasail backend (SIMD pairwise alignment library): run
+# tests/scripts/setup_parasail.sh once to clone and patch
+# third_party/parasail.
+set(HLP_GREP_PARASAIL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/parasail)
+if(HLP_GREP_WITH_PARASAIL AND EXISTS ${HLP_GREP_PARASAIL_DIR}/CMakeLists.txt)
+	add_subdirectory(${HLP_GREP_PARASAIL_DIR}
+	                 ${CMAKE_BINARY_DIR}/third_party/parasail
+	                 EXCLUDE_FROM_ALL)
+	target_compile_definitions(bench PRIVATE HLP_GREP_WITH_PARASAIL)
+	target_link_libraries(bench PRIVATE parasail)
 endif()
 
 add_executable(graph_stats graph_stats.cpp)
