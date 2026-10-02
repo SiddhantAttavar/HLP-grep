@@ -211,7 +211,7 @@ public:
 						up_mat[u][t] =
 						    DistMatrix::min_plus_product(
 						        up_mat[u][t - 1],
-						        up_mat[v][t - 1], k);
+						        up_mat[v][t - 1]);
 					}
 				}
 				// The for's implicit barrier separates
@@ -264,7 +264,7 @@ public:
 		       up_mat[u][level].num_cols() > 0);
 		const DistMatrix &mat = up_mat[u][level];
 		std::vector<int> row =
-		    mat.min_plus_apply(cost, pos_range, k);
+		    mat.min_plus_apply(cost, pos_range);
 		const node_id v = *up[u][level];
 		pos_range = mat.col_range();
 		assert(pos_range == window(v));
@@ -473,12 +473,11 @@ private:
 				if (a >= lo_v)
 					mat(a - lo_u, a - lo_v) = cost_model.del();
 				int cur = 0, sub = cost_model.mismatch;
-				const std::size_t end =
-				    std::min(hi_v, a + static_cast<std::size_t>(k) + 2);
-				for (std::size_t b = a + 1; b < end; ++b) {
+				for (std::size_t b = a + 1; b < hi_v; ++b) {
 					if (query[b - 1] == c)
 						sub = cost_model.match;
-					mat(a - lo_u, b - lo_v) = cur + sub;
+					if (b >= lo_v)
+						mat(a - lo_u, b - lo_v) = cur + sub;
 					cur += cost_model.ins();
 				}
 			}
@@ -494,8 +493,8 @@ private:
 			for (std::size_t b = a + 1; b < h0; ++b)
 				f[b - l0] = f[b - l0 - 1] + cost_model.ins();
 			for (long i = 1; i <= label_len; ++i) {
-				const long li = std::max(static_cast<long>(l0), a + i - k);
-				const long hi_i = std::min(static_cast<long>(hL), a + i + k + 1);
+				const long li = std::max(a, static_cast<long>(l0) + i - k);
+				const long hi_i = std::min(hL, h0 + i);
 				if (li >= hi_i) {
 					std::fill(f.begin(), f.end(), DistMatrix::INF);
 					break;

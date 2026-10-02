@@ -122,10 +122,6 @@ public:
 	 *
 	 * @param a Left factor; entries must not exceed INF.
 	 * @param b Right factor; entries must not exceed INF.
-	 * @param k Threshold gating the argmin narrowing: columns whose
-	 *          minimum exceeds k retain full candidate ranges, since
-	 *          window-clamped tables need not satisfy the staircase
-	 *          there. Defaults to legacy unconstrained narrowing.
 	 * @return The min-plus product a (x) b.
 	 * @pre a.cols == b.rows with a.cols > 0, and the shared position
 	 *      ranges agree (a.col_range() == b.row_range()).
@@ -148,8 +144,7 @@ public:
 	 * bound for the row above.
 	 */
 	static DistMatrix min_plus_product(const DistMatrix &a,
-	                                   const DistMatrix &b,
-	                                   int k = INF - 1) {
+	                                   const DistMatrix &b) {
 		assert(a.cols == b.rows && a.cols > 0);
 		assert(a.col_range() == b.row_range());
 
@@ -184,7 +179,7 @@ public:
 		int *orow_last = &out.data[(E - 1) * F];
 		const std::size_t ff_last = ff1[E - 1];
 		dnc_row(arow_last, b, orow_last, 0, F - 1,
-			ff_last < B ? ff_last : 0, a.cols - 1, &opt_next, 0, k);
+			ff_last < B ? ff_last : 0, a.cols - 1, &opt_next, 0);
 
 		for (std::size_t ra = E - 1; ra-- > 0;) {
 			const int *arow = &a.data[ra * a.cols];
@@ -227,7 +222,7 @@ public:
 				// may have reordered it, so
 				// the row above keeps the
 				// full range too.
-				if (best <= k) {
+				if (best < INF) {
 					opt_cur[j] = best_k;
 					left = best_k;
 				}
@@ -256,15 +251,11 @@ public:
 	 *
 	 * @param vec Row vector of costs, one per row of this matrix; entries
 	 *            must not exceed INF.
-	 * @param k Threshold gating the argmin narrowing (see
-	 *          min_plus_product); defaults to legacy unconstrained
-	 *          narrowing.
 	 * @return The resulting row vector, one entry per column.
 	 * @pre vec.size() == rows.
 	 */
-	std::vector<int> min_plus_apply(const std::vector<int> &vec,
-	                                int k = INF - 1) const {
-		return min_plus_apply(vec, row_range_value, k);
+	std::vector<int> min_plus_apply(const std::vector<int> &vec) const {
+		return min_plus_apply(vec, row_range_value);
 	}
 
 	/**
@@ -276,17 +267,13 @@ public:
 	 *
 	 * @param vec Costs for the selected contiguous range of matrix rows.
 	 * @param input_range Query-position range represented by @p vec.
-	 * @param k Threshold gating the argmin narrowing (see
-	 *          min_plus_product); defaults to legacy unconstrained
-	 *          narrowing.
 	 * @return One entry per matrix column.
 	 * @pre input_range lies within the matrix row range and vec.size()
 	 *      matches its width.
 	 */
 	std::vector<int> min_plus_apply(
 	    const std::vector<int> &vec,
-	    std::pair<std::size_t, std::size_t> input_range,
-	    int k = INF - 1) const {
+	    std::pair<std::size_t, std::size_t> input_range) const {
 		assert(input_range.first >= row_range_value.first &&
 		       input_range.second <= row_range_value.second &&
 		       input_range.first <= input_range.second);
@@ -299,7 +286,7 @@ public:
 		if (vec.empty())
 			return out;
 		dnc_row(vec.data(), *this, out.data(), 0, cols - 1,
-		           offset, offset + vec.size() - 1, nullptr, offset, k);
+		           offset, offset + vec.size() - 1, nullptr, offset);
 		return out;
 	}
 
@@ -372,7 +359,7 @@ private:
 			}
 		}
 		orow[j_mid] = best;
-		const bool has_argmin = best <= k;
+		const bool has_argmin = best < INF;
 		// A saturated cell has no meaningful argmin. Store the loose upper
 		// bound for callers, and retain the full candidate range on both
 		// recursive sides instead of narrowing around the arbitrary best_k.
