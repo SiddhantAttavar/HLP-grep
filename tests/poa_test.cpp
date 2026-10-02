@@ -93,8 +93,7 @@ void check_compressed(const POAGraph &g, std::size_t seq,
                       const std::string &name) {
 	const auto p = g.path(seq);
 	const auto cp = g.compressed_path(seq);
-	check(!p.empty() && cp.start == p.front(),
-	      name + ": start node must be path front");
+	check(cp.start == p.front(), name + ": start node must be path front");
 	std::string spelled = g.seq(cp.start);
 	POAGraph::node_id cur = cp.start;
 	bool prev_was_heavy_end = false;
@@ -151,7 +150,7 @@ const std::vector<POAGraph::node_id> PATH_0123 = {0, 1, 2, 3};
 
 int main() {
 	{
-		const std::vector<std::string> dict{"ACGT", "ACGA", "TCGT", ""};
+		const std::vector<std::string> dict{"ACGT", "ACGA", "TCGT"};
 		const POAGraph original(dict);
 		std::stringstream cache(std::ios::in | std::ios::out | std::ios::binary);
 		original.save(cache);
@@ -243,13 +242,16 @@ int main() {
 		std::cout << "PASS weighted\n";
 	}
 
-	// Empty string dictionary entry: empty path, no extra nodes.
+	// Empty dictionary sequence: unsupported, rejected.
 	{
-		const std::vector<std::string> dict = {"", "ACGT"};
-		const POAGraph g(dict);
-		check(g.num_nodes() == 2, "empty-string: expected 2 nodes");
-		check(g.path(0).empty(), "empty-string: path 0 must be empty");
-		check_paths(g, dict, "empty-string");
+		bool rejected = false;
+		try {
+			const POAGraph g(std::vector<std::string>{"", "ACGT"});
+			(void)g;
+		} catch (const std::runtime_error &) {
+			rejected = true;
+		}
+		check(rejected, "empty-string: empty dictionary sequence was accepted");
 		std::cout << "PASS empty-string\n";
 	}
 
@@ -345,8 +347,7 @@ int main() {
 		// n steps, and every step covers at least one edge.
 		for (std::size_t s = 0; s < dict.size(); ++s) {
 			const auto &p = g.path(s);
-			check(g.compressed_path(s).steps.size() <=
-			              p.size() - (p.empty() ? 0 : 1),
+			check(g.compressed_path(s).steps.size() <= p.size() - 1,
 			      "compressed-path: too many steps");
 		}
 		for (std::size_t s = 0; s < dict.size(); ++s)
@@ -436,8 +437,6 @@ int main() {
 		std::vector<char> is_start(g.num_nodes(), 0), is_end(g.num_nodes(), 0);
 		for (std::size_t s = 0; s < dict.size(); ++s) {
 			const auto &p = g.path(s);
-			if (p.empty())
-				continue;
 			is_start[p.front()] = 1;
 			is_end[p.back()] = 1;
 		}

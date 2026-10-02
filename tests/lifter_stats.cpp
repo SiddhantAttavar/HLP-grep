@@ -40,60 +40,55 @@ namespace {
 
 using UT = std::pair<std::size_t, std::size_t>; // (node, level)
 
-/// Initial DP row for a path's start node; mirrors Solver::initial_row.
+/// Initial DP row for a path's start node; mirrors Solver::initial_state.
 std::vector<int> initial_row(const POAGraph &graph, const CostModel &cost,
                              POAGraph::node_id start,
-                             const std::string &query, int k) {
-	const auto [jmin, jmax] = graph.pos_range(start);
+                             const std::string &query, int k,
+                             std::pair<std::size_t, std::size_t> &pos_range) {
 	const long m = static_cast<long>(query.size());
 	const long mk = static_cast<long>(k);
 	const std::string &label = graph.seq(start);
 	const long label_len = static_cast<long>(label.size());
-	// After-label output window, kept non-empty; see Solver::initial_row.
-	const long lo = std::max(0L, static_cast<long>(jmin) + label_len - mk);
-	const long hL =
-	    std::min(m + 1, static_cast<long>(jmax) + label_len + mk + 1);
-	const long hi = std::max(hL, lo + 1);
-	std::vector<int> row(static_cast<std::size_t>(hi - lo),
+	// After-label output band; see Solver::initial_state.
+	const long lo = std::max(0L, label_len - mk);
+	const long hL = std::min(m + 1, label_len + mk + 1);
+	if (lo >= hL) {
+		pos_range = {static_cast<std::size_t>(lo),
+		             static_cast<std::size_t>(lo)};
+		return {};
+	}
+	pos_range = {static_cast<std::size_t>(lo),
+	             static_cast<std::size_t>(hL)};
+	std::vector<int> row(static_cast<std::size_t>(hL - lo),
 	                     DistMatrix::INF);
-	if (lo >= hL)
-		return row;
-	const long l0 = std::max(0L, static_cast<long>(jmin) - mk);
-	const long h0 = std::min(m + 1, static_cast<long>(jmax) + mk + 1);
 	// Semiglobal ED DP over the start node's label, each character swept
-	// over its own band; see Solver::initial_row and
-	// BinaryLifter::sweep_label.
-	std::vector<long> f(static_cast<std::size_t>(hL - l0), DistMatrix::INF);
+	// over its own band; see Solver::initial_state and
+	// BinaryLifter::sweep_label. Consecutive bands overlap, so no cell
+	// saturates at INF.
+	std::vector<long> f(static_cast<std::size_t>(hL), DistMatrix::INF);
 	f[0] = 0;
+	const long h0 = std::min(m + 1, mk + 1);
 	for (long b = 1; b < h0; ++b)
-		f[b - l0] = std::min(f[b - 1 - l0] + cost.ins(),
-		                     static_cast<long>(DistMatrix::INF));
+		f[b] = f[b - 1] + cost.ins();
 	for (long i = 1; i <= label_len; ++i) {
-		const long li = std::max(0L, static_cast<long>(jmin) + i - mk);
-		const long hi_i =
-		    std::min(m + 1, static_cast<long>(jmax) + i + mk + 1);
+		const long li = std::max(0L, i - mk);
+		const long hi_i = std::min(m + 1, i + mk + 1);
 		const char c = label[i - 1];
 		const int del_c = cost.del();
-		long diag = li - 1 >= l0 ? f[li - 1 - l0] : DistMatrix::INF;
+		long diag = li > 0 ? f[li - 1] : DistMatrix::INF;
 		long left = DistMatrix::INF;
 		for (long b = li; b < hi_i; ++b) {
-			const long up = f[b - l0];
-			long cur = up + del_c;
-			if (left < DistMatrix::INF)
-				cur = std::min(cur, left + cost.ins());
-			if (diag < DistMatrix::INF)
+			const long up = f[b];
+			long cur = std::min(up + del_c, left + cost.ins());
+			if (b > 0)
 				cur = std::min(cur,
 				               diag + cost.consume(c, query[b - 1]));
-			if (cur > DistMatrix::INF)
-				cur = DistMatrix::INF;
-			f[b - l0] = cur;
+			f[b] = cur;
 			left = cur;
 			diag = up;
 		}
 	}
-	for (long b = lo; b < hi; ++b)
-		row[static_cast<std::size_t>(b - lo)] =
-		    static_cast<int>(f[b - l0]);
+	std::copy(f.begin() + lo, f.begin() + hL, row.begin());
 	return row;
 }
 
@@ -227,9 +222,10 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 			if (std::abs(static_cast<long>(tc.dict[i].size()) - m) > k)
 				continue;
 			const auto &cp = cps[i];
-			std::vector<int> row = initial_row(graph, tc.cost, cp.start,
-			                                   query, k);
-			auto pos_range = lifter.window(cp.start);
+			std::pair<std::size_t, std::size_t> pos_range;
+			std::vector<int> row =
+			    initial_row(graph, tc.cost, cp.start, query, k,
+			                pos_range);
 			lifter.clip_row(row, pos_range);
 			POAGraph::node_id cur = cp.start;
 			for (const auto &st : cp.steps) {

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,6 +43,8 @@ public:
 	 *
 	 * @param dict Dictionary of DNA sequences to search. The position of each
 	 *             sequence in this vector defines the `id` reported in Result.
+	 *             Every sequence must be non-empty; an empty sequence is
+	 *             rejected with std::runtime_error by POAGraph.
 	 * @param cost Cost model defining the costs of the basic edit operations;
 	 *             defaults to the unit-cost model. The referenced model must
 	 *             outlive the solver.
@@ -88,31 +91,6 @@ public:
 		graph.save_file(filename);
 	}
 
-private:
-	/** Builds solver state around an already-built graph (load path). */
-	explicit Solver(POAGraph graph, const CostModel &cost,
-	                std::size_t num_threads)
-	    : cost(cost), num_threads(num_threads), graph(std::move(graph)),
-	      lifter(this->graph, num_threads) {
-		initialize_paths();
-	}
-
-	void initialize_paths() {
-		if (dict.empty() && graph.num_sequences() != 0) {
-			dict.reserve(graph.num_sequences());
-			for (std::size_t i = 0; i < graph.num_sequences(); ++i) {
-				std::string sequence;
-				for (POAGraph::node_id u : graph.path(i))
-					sequence += graph.seq(u);
-				dict.push_back(std::move(sequence));
-			}
-		}
-		build_compressed_paths();
-		lifter.decompose(compressed_paths);
-		sort_compressed_paths();
-	}
-
-public:
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the
 	 *        query.
@@ -155,7 +133,31 @@ public:
 		return score_paths(query, k, eligible);
 	}
 
-	// -- implementation --------------------------------------------------------
+private:
+	/** Builds solver state around an already-built graph (load path). */
+	explicit Solver(POAGraph graph, const CostModel &cost,
+	                std::size_t num_threads)
+	    : cost(cost), num_threads(num_threads), graph(std::move(graph)),
+	      lifter(this->graph, num_threads) {
+		initialize_paths();
+	}
+
+	void initialize_paths() {
+		if (dict.empty() && graph.num_sequences() != 0) {
+			dict.reserve(graph.num_sequences());
+			for (std::size_t i = 0; i < graph.num_sequences(); ++i) {
+				std::string sequence;
+				for (POAGraph::node_id u : graph.path(i))
+					sequence += graph.seq(u);
+				dict.push_back(std::move(sequence));
+			}
+		}
+		build_compressed_paths();
+		lifter.decompose(compressed_paths);
+		sort_compressed_paths();
+	}
+
+	// -- implementation ----------------------------------------------------
 	/** A reusable DP row at a prefix boundary of a sorted path. */
 	struct QueryState {
 		POAGraph::node_id node;
@@ -229,22 +231,11 @@ public:
 	    const std::string &query, int k,
 	    const std::vector<std::size_t> &eligible) const {
 		std::vector<int> dist(dict.size(), DistMatrix::INF);
-		const long m = static_cast<long>(query.size());
-		for (std::size_t id = 0; id < dict.size(); ++id)
-			if (dict[id].empty() &&
-			    std::abs(static_cast<long>(dict[id].size()) - m) <= k) {
-				const long empty_distance = m * cost.ins();
-				dist[id] = static_cast<int>(
-				    std::min(empty_distance,
-				             static_cast<long>(DistMatrix::INF)));
-			}
 		if (!eligible.empty()) {
 			const std::size_t thread_count = static_cast<std::size_t>(
 			    num_threads == 0 ? omp_get_max_threads() : num_threads);
 			const std::size_t batch_count =
-			    thread_count > eligible.size() / 4
-			        ? eligible.size()
-			        : std::min(eligible.size(), thread_count * 4);
+			    std::min(eligible.size(), thread_count * 4);
 			const std::size_t batch_size = eligible.size() / batch_count;
 			const std::size_t larger_batches = eligible.size() % batch_count;
 			const std::size_t active_threads =
@@ -281,13 +272,8 @@ public:
 			while (stack.size() > common)
 				stack.pop_back();
 
-			if (stack.empty()) {
-				std::vector<int> row = initial_row(cp.start, query, k);
-				auto pos_range = lifter.window(cp.start);
-				lifter.clip_row(row, pos_range);
-				stack.push_back(
-				    {cp.start, std::move(row), pos_range});
-			}
+			if (stack.empty())
+				stack.push_back(initial_state(cp.start, query, k));
 
 			std::size_t step_index = stack.size() - 1;
 			bool dead = stack.back().row.empty();
@@ -342,89 +328,88 @@ public:
 	}
 
 	/**
-	 * @brief Initial DP row at the start node of a compressed path.
+	 * @brief Initial DP state at the start node of a compressed path: the
+	 *        node's label aligned as a block, clipped like every other row.
 	 *
 	 * Row entries are the node's window positions: the number of query
 	 * characters consumed before the start node's label begins. The
 	 * label is aligned as a block against some query substring ending at
 	 * b (matches, substitutions, and internal deletions via the ED
 	 * recurrence below), with every earlier query character inserted.
-	 * The window must match BinaryLifter::window (the start node's label
-	 * is never crossed by an edge, so no matrix can produce this row).
+	 *
+	 * A start node sits at offset 0 of its path, so its position range is
+	 * (0, j_max) and only |label| matters: entering the block costs at
+	 * least one insertion per earlier query character, and reaching query
+	 * position b costs at least b - |label|. Sources therefore enter over
+	 * [0, min(m, k)] and the outputs kept are the after-label band
+	 * [max(0, |label| - k), min(m + 1, |label| + k + 1)) — a subrange of
+	 * BinaryLifter::window (the start node's label is never crossed by an
+	 * edge, so no matrix can produce this row). The band is empty when
+	 * |label| > m + k, leaving the state without a row.
 	 *
 	 * @param start First node of the compressed path.
 	 * @param query Query string (may be empty).
 	 * @param k     Edit distance threshold widening the window.
-	 * @return One entry per position of start's window.
+	 * @return The start node's DP row over the band it covers.
 	 */
-	std::vector<int> initial_row(POAGraph::node_id start,
-	                             const std::string &query, int k) const {
-		const auto [jmin, jmax] = graph.pos_range(start);
+	QueryState initial_state(POAGraph::node_id start,
+	                         const std::string &query, int k) const {
 		const long m = static_cast<long>(query.size());
 		const long mk = static_cast<long>(k);
 		const std::string &label = graph.seq(start);
 		const long label_len = static_cast<long>(label.size());
-		// After-label band of the start node: the output window, kept
-		// non-empty to match BinaryLifter::window (start nodes have
-		// jmin = 0, so this is [max(0, |label| - k), min(|query| + 1,
-		// jmax + |label| + k + 1))).
-		const long lo = std::max(0L, static_cast<long>(jmin) + label_len - mk);
-		const long hL =
-		    std::min(m + 1, static_cast<long>(jmax) + label_len + mk + 1);
-		const long hi = std::max(hL, lo + 1);
-		std::vector<int> row(static_cast<std::size_t>(hi - lo),
-		                     DistMatrix::INF);
+		const long lo = std::max(0L, label_len - mk);
+		const long hL = std::min(m + 1, label_len + mk + 1);
+		// The label is longer than the query by more than k, so no band
+		// position carries a cost within k and the state has no row.
+		if (lo >= hL)
+			return {start, {}, {static_cast<std::size_t>(lo),
+			                   static_cast<std::size_t>(lo)}};
+
+		QueryState state{start,
+		                 std::vector<int>(static_cast<std::size_t>(hL - lo),
+		                                   DistMatrix::INF),
+		                 {static_cast<std::size_t>(lo),
+		                  static_cast<std::size_t>(hL)}};
+
 		// Semiglobal DP over (label prefix, query prefix): f[i][b] is the
 		// min cost of consuming the first i label characters against a
 		// query substring ending at b. Row 0 is the pure insertion prefix
 		// from the virtual source at position 0; each label character
-		// sweeps over its own band [max(0, jmin + i - k), min(m + 1,
-		// jmax + i + k + 1)) — mirroring BinaryLifter::sweep_label — so
-		// the work stays O(|label| * (spread + 2k)). Entries saturate at
-		// INF; when the after-label band is empty every band is, and the
-		// row stays all-INF.
-		if (lo >= hL)
-			return row;
-		const long l0 = std::max(0L, static_cast<long>(jmin) - mk);
-		const long h0 = std::min(m + 1, static_cast<long>(jmax) + mk + 1);
-		std::vector<long> f(static_cast<std::size_t>(hL - l0),
+		// sweeps over its own band [max(0, i - k), min(m + 1, i + k + 1))
+		// — mirroring BinaryLifter::sweep_label — so the work stays
+		// O(|label| * k). Consecutive bands overlap, so every cell a band
+		// covers is reachable from the entry row: no entry saturates at
+		// INF.
+		std::vector<long> f(static_cast<std::size_t>(hL),
 		                    DistMatrix::INF);
-		// Virtual source at position 0 (start nodes have jmin = 0, so the
-		// seed sits at the entry band's bottom); chain insertions within
-		// the entry band [l0, h0).
+		const long h0 = std::min(m + 1, mk + 1);
 		f[0] = 0;
 		for (long b = 1; b < h0; ++b)
-			f[b - l0] = std::min(f[b - 1 - l0] + cost.ins(),
-			                     static_cast<long>(DistMatrix::INF));
+			f[b] = f[b - 1] + cost.ins();
 		for (long i = 1; i <= label_len; ++i) {
-			const long li =
-			    std::max(0L, static_cast<long>(jmin) + i - mk);
-			const long hi_i =
-			    std::min(m + 1, static_cast<long>(jmax) + i + mk + 1);
+			const long li = std::max(0L, i - mk);
+			const long hi_i = std::min(m + 1, i + mk + 1);
 			const char c = label[i - 1];
 			const int del_c = cost.del();
-			long diag = li - 1 >= l0 ? f[li - 1 - l0] : DistMatrix::INF;
-			long left = DistMatrix::INF; // f[i][b - 1]: below-band at li
-			for (long b = li; b < hi_i; ++b) {
-				const long up = f[b - l0]; // f[i - 1][b]
-				long cur = up + del_c;
-				if (left < DistMatrix::INF)
-					cur = std::min(cur, left + cost.ins());
-				if (diag < DistMatrix::INF)
-					cur = std::min(cur,
-					               diag + cost.consume(c,
-					                                   query[b - 1]));
-				if (cur > DistMatrix::INF)
-					cur = DistMatrix::INF;
-				f[b - l0] = cur;
+			long cur = f[li] + del_c;
+			if (li > 0) {
+				cur = std::min(cur, f[li - 1] + cost.consume(c, query[li - 1]));
+			}
+			long diag = f[li], left = cur;
+			f[li] = cur;
+			for (long b = li + 1; b < hi_i; ++b) {
+				const long up = f[b]; // f[i - 1][b]
+				cur = std::min(up + del_c, left + cost.ins());
+				cur = std::min(cur, diag + cost.consume(c, query[b - 1]));
+				f[b] = cur;
 				left = cur;
 				diag = up;
 			}
 		}
-		for (long b = lo; b < hi; ++b)
-			row[static_cast<std::size_t>(b - lo)] =
-			    static_cast<int>(f[b - l0]);
-		return row;
+		std::copy(f.begin() + lo, f.begin() + hL, state.row.begin());
+		lifter.clip_row(state.row, state.pos_range);
+		return state;
 	}
 
 	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
@@ -446,21 +431,15 @@ public:
 	void build_compressed_paths() {
 		compressed_paths.clear();
 		compressed_paths.reserve(dict.size());
-		for (std::size_t i = 0; i < dict.size(); ++i) {
-			if (dict[i].empty())
-				compressed_paths.emplace_back();
-			else
-				compressed_paths.push_back(graph.compressed_path(i));
-		}
+		for (std::size_t i = 0; i < dict.size(); ++i)
+			compressed_paths.push_back(graph.compressed_path(i));
 	}
 
-	/** Sorts nonempty dictionary paths after decompose() rewrites their steps. */
+	/** Sorts dictionary paths after decompose() rewrites their steps. */
 	void sort_compressed_paths() {
-		sorted_path_ids.clear();
-		sorted_path_ids.reserve(dict.size());
-		for (std::size_t i = 0; i < dict.size(); ++i)
-			if (!dict[i].empty())
-				sorted_path_ids.push_back(i);
+		sorted_path_ids.resize(dict.size());
+		std::iota(sorted_path_ids.begin(), sorted_path_ids.end(),
+		          std::size_t{0});
 		std::sort(sorted_path_ids.begin(), sorted_path_ids.end(),
 		          [this](std::size_t a, std::size_t b) {
 			          return path_less(a, b);

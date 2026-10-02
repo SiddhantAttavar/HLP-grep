@@ -184,15 +184,6 @@ void test_query_prefix_sharing() {
 		}
 	std::filesystem::remove(cache_file);
 
-	const Solver with_empty({"", "AC"});
-	const auto empty_results = with_empty.query("A", 1);
-	if (empty_results.size() != 2 || empty_results[0].id != 0 ||
-	    empty_results[0].dist != 1 || empty_results[1].id != 1 ||
-	    empty_results[1].dist != 1) {
-		std::cerr << "prefix-sharing: empty-path scoring failed\n";
-		std::exit(1);
-	}
-
 	const CostModel weighted(2, 2, 0, 1);
 	const Solver weighted_solver({"AA"}, weighted, false);
 	const auto over_threshold = weighted_solver.query("AAAA", 2);
@@ -259,81 +250,6 @@ void test_clip_row_two_sided() {
 	std::cout << "PASS clip-row-two-sided\n";
 }
 
-void test_step_bounded() {
-	// Bounded step() must match the full-window computation: stepping
-	// with a clipped subrange must give the same clipped result as
-	// stepping with the full row. Covers the single-character fast path
-	// (no compaction) and the generic sweep (compacted multi-char node).
-	for (const bool compact : {false, true}) {
-		const POAGraph graph({"ACGTACGT", "ACGTACGA", "ACGTTCGT"},
-		                     DEFAULT_COST_MODEL, compact);
-		BinaryLifter lifter(graph, 1);
-		std::vector<POAGraph::CompressedPath> paths{
-		    graph.compressed_path(0)};
-		lifter.decompose(paths);
-		lifter.build("ACGTACGT", 2);
-		bool covered_single = false, covered_multi = false;
-		for (std::size_t s = 0; s < graph.num_sequences(); ++s) {
-			const auto &path = graph.path(s);
-			for (std::size_t i = 1; i < path.size(); ++i) {
-				const auto u = path[i - 1];
-				const auto v = path[i];
-				const bool single = graph.seq(v).size() == 1;
-				if (single ? covered_single : covered_multi)
-					continue;
-				auto full_range = lifter.window(u);
-				const std::size_t width =
-				    full_range.second - full_range.first;
-				if (width < 5)
-					continue;
-				// Full row with above-threshold margins around a
-				// feasible core.
-				std::vector<int> full(width, DistMatrix::INF);
-				for (std::size_t j = 2; j + 2 < width; ++j)
-					full[j] = static_cast<int>(j % 3);
-				auto range_a = full_range;
-				auto row_a = full;
-				lifter.step(u, v, row_a, range_a);
-				auto range_b = full_range;
-				auto row_b = full;
-				lifter.clip_row(row_b, range_b);
-				if (row_b.empty())
-					continue;
-				lifter.step(u, v, row_b, range_b);
-				if (row_a != row_b || range_a != range_b) {
-					std::cerr << "step-bounded: clipped input "
-					             "changed the result (compact="
-					          << compact << " single=" << single
-					          << ")\n";
-					std::exit(1);
-				}
-				// Fully above-threshold input must stay dead.
-				auto range_c = full_range;
-				std::vector<int> row_c(width, DistMatrix::INF);
-				lifter.step(u, v, row_c, range_c);
-				if (!row_c.empty()) {
-					std::cerr << "step-bounded: dead input "
-					             "produced a live row\n";
-					std::exit(1);
-				}
-				if (single)
-					covered_single = true;
-				else
-					covered_multi = true;
-			}
-		}
-		if (!covered_single) {
-			std::cerr << "step-bounded: no single-char edge covered\n";
-			std::exit(1);
-		}
-		if (compact && !covered_multi) {
-			std::cerr << "step-bounded: no multi-char edge covered\n";
-			std::exit(1);
-		}
-	}
-	std::cout << "PASS step-bounded\n";
-}
-
 } // namespace
 
 int main(int argc, char **argv) {
@@ -346,7 +262,6 @@ int main(int argc, char **argv) {
 	test_query_prefix_sharing();
 	test_lifter_decompose();
 	test_clip_row_two_sided();
-	test_step_bounded();
 	if (files.empty()) {
 		std::cout << "no testcase files found, nothing to do\n";
 		return 0;

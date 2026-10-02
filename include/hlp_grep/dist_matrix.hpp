@@ -37,7 +37,7 @@ public:
 	 * @param cols Number of columns.
 	 * @param fill Initial value for every entry (defaults to 0).
 	 */
-	DistMatrix(std::size_t rows, std::size_t cols, int fill = 0)
+	DistMatrix(std::size_t rows, std::size_t cols, int fill = INF)
 	    : DistMatrix(rows, cols, fill, {0, rows}, {0, cols}) {}
 
 	/**
@@ -129,6 +129,23 @@ public:
 	 * @return The min-plus product a (x) b.
 	 * @pre a.cols == b.rows with a.cols > 0, and the shared position
 	 *      ranges agree (a.col_range() == b.row_range()).
+	 *
+	 * The bottom row (a = rows - 1) has no (a + 1) upper bound yet, so
+	 * it is solved by the divide-and-conquer once, capturing its
+	 * leftmost argmins for the rows above. Rows then run in decreasing
+	 * a, columns increasing: each cell scans candidates in
+	 * [opt(a, j - 1), opt(a + 1, j)].
+	 *
+	 * Cheap INF emission: the sweep computes first_finite1(a) = first c
+	 * with in1(a, c) < INF and first_finite2(c) = first j with
+	 * in2(c, j) < INF — both with a forward-only cursor (copy the
+	 * previous row's value, advance while the cell is INF). With the
+	 * row's first finite candidate at first_finite1(a), the earliest
+	 * finite landing over all remaining candidates is the suffix
+	 * minimum of first_finite2 at that index. For b below that minimum
+	 * every candidate saturates at INF, so the cell is emitted in O(1)
+	 * without scanning; an all-INF row whole-row INF-emits with a loose
+	 * bound for the row above.
 	 */
 	static DistMatrix min_plus_product(const DistMatrix &a,
 	                                   const DistMatrix &b,
@@ -136,10 +153,90 @@ public:
 		assert(a.cols == b.rows && a.cols > 0);
 		assert(a.col_range() == b.row_range());
 
-		DistMatrix out(a.rows, b.cols, 0, a.row_range(), b.col_range());
-		if (b.cols == 0)
+		DistMatrix out(a.rows, b.cols, INF, a.row_range(), b.col_range());
+		if (a.rows == 0 || b.cols == 0)
 			return out;
-		argmin_sweep(a, b, out, k);
+		const std::size_t E = a.rows;
+		const std::size_t F = b.cols;
+		const std::size_t B = a.cols;
+		const std::vector<std::size_t> ff1 = a.first_finite();
+		const std::vector<std::size_t> ff2 = b.first_finite();
+		// suffix_min_ff2[c] = min over c' >= c of first_finite2(c').
+		// Columns below this are INF for every candidate from first
+		// finite on — the gate needs no monotonicity of ff2 itself
+		// (real window-clamped layer blocks can violate it).
+		std::vector<std::size_t> smin_ff2(b.rows + 1, F);
+		for (std::size_t c = b.rows; c-- > 0;)
+			smin_ff2[c] = std::min(ff2[c], smin_ff2[c + 1]);
+		// Argmins of the row below the one being processed (loose B - 1
+		// until the bottom row is computed for real). Argmins are
+		// candidate indices, so any loose bound must be the last
+		// candidate row; using an output-row index would read out of
+		// range. Processing rows in decreasing a keeps every needed
+		// bound one swap behind.
+		std::vector<std::size_t> opt_next(F, B - 1);
+		std::vector<std::size_t> opt_cur(F);
+
+		// Bottom row: solve with the divide-and-conquer
+		// and capture its leftmost argmins, seeded at the
+		// row's first finite candidate.
+		const int *arow_last = &a.data[(E - 1) * a.cols];
+		int *orow_last = &out.data[(E - 1) * F];
+		const std::size_t ff_last = ff1[E - 1];
+		dnc_row(arow_last, b, orow_last, 0, F - 1,
+			ff_last < B ? ff_last : 0, a.cols - 1, &opt_next, 0, k);
+
+		for (std::size_t ra = E - 1; ra-- > 0;) {
+			const int *arow = &a.data[ra * a.cols];
+			int *orow = &out.data[ra * F];
+			const std::size_t ff = ff1[ra];
+			// First column that can be finite at all for this row:
+			// with the row's first finite candidate at ff, every
+			// candidate's first finite landing is the suffix
+			// minimum from ff, so columns below that are INF
+			// outright (smin_ff2[B] == F covers all-INF rows).
+			// Columns below the first finite landing are INF
+			// without scanning; the loose argmin bound keeps
+			// the staircase valid for the row above.
+			std::size_t j = smin_ff2[ff];
+			std::fill(opt_cur.begin(), opt_cur.begin() + j, B - 1);
+			std::size_t left = ff;
+			for (; j < F; ++j) {
+				const std::size_t hi = opt_next[j];
+				std::size_t best_k = left;
+				int best = std::min(INF,
+					arow[left] + b.data[left * F + j]);
+				for (std::size_t k = left + 1;
+					 k <= hi; ++k) {
+					int cand = arow[k] +
+						b.data[k * F + j];
+					if (cand < best) {
+						best = cand;
+						best_k = k;
+					}
+				}
+				orow[j] = best;
+				// A saturated cell has no
+				// meaningful argmin; the
+				// loose whole-range bound
+				// keeps the staircase valid
+				// as the upper bound for the
+				// row above. Likewise, a best
+				// above the threshold carries
+				// no usable order: clamping
+				// may have reordered it, so
+				// the row above keeps the
+				// full range too.
+				if (best <= k) {
+					opt_cur[j] = best_k;
+					left = best_k;
+				}
+				else {
+					opt_cur[j] = B - 1;
+				}
+			}
+			opt_next.swap(opt_cur);
+		}
 		return out;
 	}
 
@@ -194,173 +291,44 @@ public:
 		       input_range.second <= row_range_value.second &&
 		       input_range.first <= input_range.second);
 		const std::size_t offset = input_range.first - row_range_value.first;
-		const std::size_t expected = input_range.second - input_range.first;
-		assert(vec.size() == expected);
+		assert(vec.size() == input_range.second - input_range.first);
 
 		std::vector<int> out(cols, INF);
 		if (cols == 0)
 			return out;
 		if (vec.empty())
 			return out;
-		argmin_row(vec.data(), *this, out.data(), 0, cols - 1,
+		dnc_row(vec.data(), *this, out.data(), 0, cols - 1,
 		           offset, offset + vec.size() - 1, nullptr, offset, k);
 		return out;
 	}
 
 private:
+
 	/**
-	 * @brief Argmin-window computation of the min-plus product.
+	 * @brief First finite entry of each row: for every row, the first
+	 *        column holding a value < INF (or `cols` for an all-INF row).
 	 *
-	 * Implements the staircase described in min_plus_product. The bottom
-	 * row (a = rows - 1) has no (a + 1) upper bound yet, so it is solved
-	 * by the divide-and-conquer once, capturing its leftmost argmins for
-	 * the rows above. Rows then run in decreasing a, columns increasing:
-	 * each cell scans candidates in [opt(a, j - 1), opt(a + 1, j)].
-	 *
-	 * Cheap INF emission: per call the sweep computes
-	 * first_finite1(a) = first c with in1(a, c) < INF and
-	 * first_finite2(c) = first j with in2(c, j) < INF — both with a
-	 * forward-only cursor (copy the previous row's value, advance while
-	 * the cell is INF), linear in the matrix since the values are
-	 * monotone across consecutive ED-layer rows. With the row's first
-	 * finite candidate at first_finite1(a), the earliest finite landing
-	 * over all remaining candidates is the suffix minimum of
-	 * first_finite2 at that index (a suffix-minimum prefix is needed
-	 * because real window-clamped layer blocks can have non-monotone
-	 * first_finite2 values). For b below that minimum every candidate
-	 * saturates at INF, so the cell is emitted in O(1) without
-	 * scanning; scans also start at left = first_finite1(a), since no
-	 * argmin can be smaller. An all-INF left row (first_finite1 == B)
-	 * whole-row INF-emits with a loose bound for the row above.
-	 *
-	 * @param a Left factor.
-	 * @param b Right factor.
-	 * @param out Pre-sized product matrix to fill (a.rows x b.cols).
-	 * @param k Threshold gating the argmin narrowing (see
-	 *          min_plus_product): columns whose minimum exceeds k keep
-	 *          full candidate ranges.
+	 * Swept with a forward-only cursor: each row starts from the
+	 * previous row's value and advances while the cell is INF. For
+	 * ED-DAG layers the reaches band shifts right monotonically with
+	 * the index, so this is amortized O(rows + cols); an all-INF row
+	 * records itself as `cols` and hands its predecessor's cursor to
+	 * the next row. Nothing below relies on the cursor's monotonicity
+	 * (a too-small cursor only costs extra scans).
 	 */
-	static void argmin_sweep(const DistMatrix &a, const DistMatrix &b,
-	                         DistMatrix &out, int k) {
-		const std::size_t E = a.rows;
-		const std::size_t F = b.cols;
-		const std::size_t B = a.cols;
-		// first_finite1(ra): first candidate c with in1(ra, c) < INF
-		// (or B for an all-INF row); first_finite2(c): first column j
-		// with in2(c, j) < INF (or F). For ED-DAG layers all-INF rows
-		// are reserved pedantically: delete below and the reaches band
-		// shifts right monotonically with the index, so both are swept
-		// with a forward-only cursor: copy the previous row's value,
-		// then advance while the cell is INF. Amortized
-		// O(a.rows + B) and O(b.rows + F) over the whole
-		// precomputation; an all-INF row records itself as B/F and
-		// hands its predecessor's cursor to the next row. Nothing below
-		// relies on the monotonicity packing the cursor with (a wrong
-		// too-small cursor only costs extra scans).
-		std::vector<std::size_t> ff1(a.rows, B);
-		{
-			std::size_t cur = 0;
-			for (std::size_t ra = 0; ra < E; ++ra) {
-				std::size_t p = cur;
-				while (p < B && a.data[ra * B + p] >= INF)
-					++p;
-				ff1[ra] = p;
-				if (p < B)
-					cur = p; // all-INF rows retry at cur
-			}
+	std::vector<std::size_t> first_finite() const {
+		std::vector<std::size_t> ff(rows, cols);
+		std::size_t cur = 0;
+		for (std::size_t r = 0; r < rows; ++r) {
+			std::size_t p = cur;
+			while (p < cols && data[r * cols + p] >= INF)
+				++p;
+			ff[r] = p;
+			if (p < cols)
+				cur = p; // all-INF rows retry at cur
 		}
-		std::vector<std::size_t> ff2(b.rows, F);
-		{
-			std::size_t cur = 0;
-			for (std::size_t c = 0; c < B; ++c) {
-				std::size_t p = cur;
-				while (p < F && b.data[c * F + p] >= INF)
-					++p;
-				ff2[c] = p;
-				if (p < F)
-					cur = p;
-			}
-		}
-		// suffix_min_ff2[c] = min over c' >= c of first_finite2(c').
-		// Columns below this are INF for every candidate from first
-		// finite on — the gate needs no monotonicity of ff2 itself
-		// (real window-clamped layer blocks can violate it).
-		std::vector<std::size_t> smin_ff2(b.rows + 1, F);
-		for (std::size_t c = b.rows; c-- > 0;)
-			smin_ff2[c] = std::min(ff2[c], smin_ff2[c + 1]);
-		// Argmins of the row below the one being processed (loose B - 1
-		// until the bottom row is computed for real). Argmins are
-		// candidate indices, so any loose bound must be the last
-		// candidate row; using an output-row index would read out of
-		// range. Processing rows in decreasing a keeps every needed
-		// bound one swap behind.
-		std::vector<std::size_t> opt_next(F, B - 1);
-		std::vector<std::size_t> opt_cur(F);
-		for (std::size_t ra = E; ra-- > 0;) {
-			const int *arow = &a.data[ra * a.cols];
-			int *orow = &out.data[ra * F];
-			const std::size_t ff = ff1[ra];
-			// First column that can be finite at all for this row:
-			// with the row's first finite candidate at ff, every
-			// candidate's first finite landing is the suffix
-			// minimum from ff, so columns below that are INF
-			// outright (smin_ff2[B] == F covers all-INF rows).
-			const std::size_t thr = smin_ff2[ff];
-			if (ra + 1 == E) {
-				// Bottom row: solve with the divide-and-conquer
-				// and capture its leftmost argmins, seeded at the
-				// row's first finite candidate.
-				argmin_row(arow, b, orow, 0, F - 1,
-				           ff < B ? ff : 0, a.cols - 1, &opt_cur, 0,
-				           k);
-			} else {
-				// Columns below the first finite landing are INF
-				// without scanning; the loose argmin bound keeps
-				// the staircase valid for the row above.
-				std::size_t j = 0;
-				for (; j < thr; ++j) {
-					orow[j] = INF;
-					opt_cur[j] = B - 1;
-				}
-				std::size_t left = ff;
-				for (; j < F; ++j) {
-					const std::size_t hi = opt_next[j];
-					std::size_t best_k = left;
-					int best =
-					    arow[left] + b.data[left * F + j];
-					if (best > INF)
-						best = INF;
-					for (std::size_t k = left + 1;
-					     k <= hi; ++k) {
-						int cand =
-						    arow[k] +
-						    b.data[k * F + j];
-						if (cand > INF)
-							cand = INF;
-						if (cand < best) {
-							best = cand;
-							best_k = k;
-						}
-					}
-					orow[j] = best;
-					// A saturated cell has no
-					// meaningful argmin; the
-					// loose whole-range bound
-					// keeps the staircase valid
-					// as the upper bound for the
-					// row above. Likewise, a best
-					// above the threshold carries
-					// no usable order: clamping
-					// may have reordered it, so
-					// the row above keeps the
-					// full range too.
-					opt_cur[j] =
-					    best <= k ? best_k : B - 1;
-					left = best_k;
-				}
-			}
-			opt_next.swap(opt_cur);
-		}
+		return ff;
 	}
 
 	/**
@@ -386,7 +354,7 @@ private:
 	 *          full candidate ranges on both recursive sides.
 	 * @pre j_lo <= j_hi and k_lo <= k_hi.
 	 */
-	static void argmin_row(const int *arow, const DistMatrix &b, int *orow,
+	static void dnc_row(const int *arow, const DistMatrix &b, int *orow,
 	                       std::size_t j_lo, std::size_t j_hi,
 	                       std::size_t k_lo, std::size_t k_hi,
 	                       std::vector<std::size_t> *found = nullptr,
@@ -394,13 +362,10 @@ private:
 		assert(j_lo <= j_hi && k_lo <= k_hi);
 		const std::size_t j_mid = (j_lo + j_hi) / 2;
 		std::size_t best_k = k_lo;
-		int best = arow[k_lo - a_offset] + b.data[k_lo * b.cols + j_mid];
-		if (best > INF)
-			best = INF;
+		int best = std::min(INF,
+			arow[k_lo - a_offset] + b.data[k_lo * b.cols + j_mid]);
 		for (std::size_t k = k_lo + 1; k <= k_hi; ++k) {
 			int cand = arow[k - a_offset] + b.data[k * b.cols + j_mid];
-			if (cand > INF)
-				cand = INF;
 			if (cand < best) {
 				best = cand;
 				best_k = k;
@@ -418,10 +383,10 @@ private:
 		const std::size_t left_k_hi = has_argmin ? best_k : k_hi;
 		const std::size_t right_k_lo = has_argmin ? best_k : k_lo;
 		if (j_mid > j_lo)
-			argmin_row(arow, b, orow, j_lo, j_mid - 1, k_lo, left_k_hi,
+			dnc_row(arow, b, orow, j_lo, j_mid - 1, k_lo, left_k_hi,
 			           found, a_offset, k);
 		if (j_mid < j_hi)
-			argmin_row(arow, b, orow, j_mid + 1, j_hi, right_k_lo, k_hi,
+			dnc_row(arow, b, orow, j_mid + 1, j_hi, right_k_lo, k_hi,
 			           found, a_offset, k);
 	}
 

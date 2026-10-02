@@ -110,7 +110,9 @@ public:
 	 * width `2w` centered on the node's position range (see band_bounds()).
 	 * Successful alignments halve `w` for the next sequence.
 	 *
-	 * @param dict Dictionary of DNA sequences to index.
+	 * @param dict Dictionary of DNA sequences to index. Every sequence must
+	 *             be non-empty: an empty sequence has no path to store and
+	 *             is rejected with std::runtime_error.
 	 * @param cost Cost model used for the sequence-to-graph alignments.
 	 *             Defaults to the unit-cost model. The referenced model
 	 *             must outlive the graph.
@@ -313,8 +315,7 @@ public:
 	 *
 	 * The offset of a node in a path is the number of bases consumed
 	 * before the node's label starts (the running sum of preceding
-	 * labels). Both values equal SIZE_MAX for nodes on no stored path
-	 * (an empty dictionary sequence).
+	 * labels). Both values equal SIZE_MAX for nodes on no stored path.
 	 */
 	std::pair<std::size_t, std::size_t> pos_range(node_id u) const {
 		return {nodes[u].pos_min, nodes[u].pos_max};
@@ -452,10 +453,13 @@ private:
 			if (nodes[u].heavy_length != expected)
 				throw std::runtime_error("POAGraph::load: heavy-chain length mismatch");
 		}
-		for (const auto &path : paths)
+		for (const auto &path : paths) {
+			if (path.empty())
+				throw std::runtime_error("POAGraph::load: empty path");
 			for (std::size_t i = 1; i < path.size(); ++i)
 				if (!find_edge(out_edges[path[i - 1]], path[i]))
 					throw std::runtime_error("POAGraph::load: path contains missing edge");
+		}
 		for (unsigned char present : seen)
 			if (!present)
 				throw std::runtime_error("POAGraph::load: unused edge id");
@@ -548,11 +552,10 @@ private:
 	void compact_chain_nodes() {
 		const std::size_t V = nodes.size();
 		std::vector<char> is_start(V, 0), is_end(V, 0);
-		for (const auto &path : paths)
-			if (!path.empty()) {
-				is_start[path.front()] = 1;
-				is_end[path.back()] = 1;
-			}
+		for (const auto &path : paths) {
+			is_start[path.front()] = 1;
+			is_end[path.back()] = 1;
+		}
 
 		// Greedy run walk: absorb the successor while the guards hold.
 		std::vector<node_id> run_end(V, START); // run head -> run tail
@@ -639,10 +642,15 @@ private:
 	 * @param compact_nodes: whether to merge chains of single-in/
 	 * single-out nodes into multi-character nodes after the last
 	 * alignment (the run compaction pass; see compact_chain_nodes()).
+	 * @throws std::runtime_error if a dictionary sequence is empty.
 	 */
 	void build(const std::vector<std::string> &dict, bool compact_nodes = true) {
 		if (dict.empty())
 			return;
+		for (const std::string &sequence : dict)
+			if (sequence.empty())
+				throw std::runtime_error(
+				    "POAGraph: empty dictionary sequence");
 
 		node_id prev = START;
 		std::vector<node_id> seed;

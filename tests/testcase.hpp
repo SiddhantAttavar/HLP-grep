@@ -84,8 +84,11 @@ inline Testcase parse_testcase(const fs::path &file) {
 			fail(file, line_no, "dictionary size is not an integer: " + header);
 		}
 		tc.dict.reserve(n);
-		for (std::size_t i = 0; i < n; ++i)
+		for (std::size_t i = 0; i < n; ++i) {
 			tc.dict.push_back(next("dictionary sequence"));
+			if (tc.dict.back().empty())
+				fail(file, line_no, "dictionary sequence must not be empty");
+		}
 	}
 
 	// 4. Query header + queries ("<k> <seq>" per line).
