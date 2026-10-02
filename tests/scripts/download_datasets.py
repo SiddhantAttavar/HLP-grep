@@ -30,6 +30,7 @@ RAW_DIR = os.path.join(DATASETS_DIR, "raw")
 
 IMGT_BASE = "https://raw.githubusercontent.com/ANHIG/IMGTHLA/Latest/fasta"
 NCBI_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+UNIPROT_REST = "https://rest.uniprot.org/uniprotkb/search"
 
 
 def ncbi_url(accession, start=None, stop=None):
@@ -82,6 +83,15 @@ FILES = {
     # Curated mtDNA: rCRS reference (16.6 kb).
     "mtdna": [
         ("mtdna/NC_012920.fasta", ncbi_url("NC_012920.1"), 17500, False, False),
+    ],
+    # Curated UniProt: 300 reviewed (Swiss-Prot) proteins, 200-600 aa, FASTA
+    # (~150 KB). Sparse de-duplicated protein regime (UniRef-like); the REST
+    # query fixes the length window, review status caps the size. CC BY 4.0.
+    "uniprot": [
+        ("uniprot/swissprot_l200_600.fasta",
+         f"{UNIPROT_REST}?query=%28reviewed%3Atrue%29"
+         "+AND+%28length%3A%5B200+TO+600%5D%29&format=fasta&size=300",
+         150000, False, False),
     ],
 }
 

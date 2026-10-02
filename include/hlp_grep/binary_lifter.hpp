@@ -214,7 +214,7 @@ public:
 						up_mat[u][t] =
 						    DistMatrix::min_plus_product(
 						        up_mat[u][t - 1],
-						        up_mat[v][t - 1]);
+						        up_mat[v][t - 1], k);
 					}
 				}
 				// The for's implicit barrier separates
@@ -268,7 +268,8 @@ public:
 		assert(level < up_mat[u].size() &&
 		       up_mat[u][level].num_cols() > 0);
 		const DistMatrix &mat = up_mat[u][level];
-		std::vector<int> row = mat.min_plus_apply(cost, pos_range);
+		std::vector<int> row =
+		    mat.min_plus_apply(cost, pos_range, k);
 		const node_id v = *up[u][level];
 		pos_range = mat.col_range();
 		assert(pos_range == window(v));

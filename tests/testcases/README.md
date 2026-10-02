@@ -76,6 +76,8 @@ python3 tests/scripts/download_datasets.py --full --dataset hla --yes
 | `mhc` | Two 10 kb windows of finished haplotype APD (`OK649231`) | Six finished haplotypes `OK649231-OK649236` (~30 MB) | GenBank (INSDC, open) |
 | `sarscov2` | Wuhan-Hu-1 `NC_045512.2` (29.9 kb) | Theseus `covid_19_complete.fasta` (2732 genomes, manual, Zenodo `18482097`) | GenBank (open); Theseus per original licences |
 | `mtdna` | rCRS `NC_012920.1` (16.6 kb) | MITOMAP / GenBank bulk (manual, 65k+ sequences) | GenBank (open); MITOMAP cite Brandon et al. |
+| `reads` | No new download: READS-like dense 100 bp windows + 1–2-edit mutants sampled from the `sarscov2`/`mtdna` references (competition originals are offline) | Same | EDBT'13 search/join competition (Wandelt et al.); dense same-locus regime |
+| `uniprot` | 300 reviewed (Swiss-Prot) proteins, 200–600 aa, via UniProt REST | Same query without `size` cap (manual) | UniProt, CC BY 4.0; sparse de-duplicated (UniRef-like) regime |
 | `markers`/`theseus` | Bring your own FASTA via `--from-fasta` | Same | 16S/COX1 GenBank loci; Theseus Zenodo sets (MTB/HIV/monkeypox) |
 
 ### Generate
@@ -108,7 +110,11 @@ build/tests/test_hlp_grep tests/testcases/datasets/derived/hla
 Why these sets: alleles of one HLA gene differ by 1–tens of edits
 (maximal chain sharing); MHC haplotype windows stress long chains;
 SARS-CoV-2/mtDNA give 16–30 kb near-identical cohorts; `synthetic`
-isolates sharing vs length vs `k`; `uniform` is the low-sharing control.
+isolates sharing vs length vs `k`; `uniform` is the low-sharing control;
+`reads` covers the dense short-read regime (overlapping ~100 bp windows,
+several matches per query); `uniprot` covers the sparse protein regime
+(de-duplicated Swiss-Prot records, 20-letter alphabet, unit costs —
+typically only the exact hit per query).
 
 ## *Optional*: testcase solution
 For each testcase file `{testcase_name}.txt`, solutions may be stored in `{testcase_name}.sol`. The solution file contains 3 lines for each query

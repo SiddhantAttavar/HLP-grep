@@ -122,19 +122,24 @@ public:
 	 *
 	 * @param a Left factor; entries must not exceed INF.
 	 * @param b Right factor; entries must not exceed INF.
+	 * @param k Threshold gating the argmin narrowing: columns whose
+	 *          minimum exceeds k retain full candidate ranges, since
+	 *          window-clamped tables need not satisfy the staircase
+	 *          there. Defaults to legacy unconstrained narrowing.
 	 * @return The min-plus product a (x) b.
 	 * @pre a.cols == b.rows with a.cols > 0, and the shared position
 	 *      ranges agree (a.col_range() == b.row_range()).
 	 */
 	static DistMatrix min_plus_product(const DistMatrix &a,
-	                                   const DistMatrix &b) {
+	                                   const DistMatrix &b,
+	                                   int k = INF - 1) {
 		assert(a.cols == b.rows && a.cols > 0);
 		assert(a.col_range() == b.row_range());
 
 		DistMatrix out(a.rows, b.cols, 0, a.row_range(), b.col_range());
 		if (b.cols == 0)
 			return out;
-		argmin_sweep(a, b, out);
+		argmin_sweep(a, b, out, k);
 		return out;
 	}
 
@@ -154,11 +159,15 @@ public:
 	 *
 	 * @param vec Row vector of costs, one per row of this matrix; entries
 	 *            must not exceed INF.
+	 * @param k Threshold gating the argmin narrowing (see
+	 *          min_plus_product); defaults to legacy unconstrained
+	 *          narrowing.
 	 * @return The resulting row vector, one entry per column.
 	 * @pre vec.size() == rows.
 	 */
-	std::vector<int> min_plus_apply(const std::vector<int> &vec) const {
-		return min_plus_apply(vec, row_range_value);
+	std::vector<int> min_plus_apply(const std::vector<int> &vec,
+	                                int k = INF - 1) const {
+		return min_plus_apply(vec, row_range_value, k);
 	}
 
 	/**
@@ -170,13 +179,17 @@ public:
 	 *
 	 * @param vec Costs for the selected contiguous range of matrix rows.
 	 * @param input_range Query-position range represented by @p vec.
+	 * @param k Threshold gating the argmin narrowing (see
+	 *          min_plus_product); defaults to legacy unconstrained
+	 *          narrowing.
 	 * @return One entry per matrix column.
 	 * @pre input_range lies within the matrix row range and vec.size()
 	 *      matches its width.
 	 */
 	std::vector<int> min_plus_apply(
 	    const std::vector<int> &vec,
-	    std::pair<std::size_t, std::size_t> input_range) const {
+	    std::pair<std::size_t, std::size_t> input_range,
+	    int k = INF - 1) const {
 		assert(input_range.first >= row_range_value.first &&
 		       input_range.second <= row_range_value.second &&
 		       input_range.first <= input_range.second);
@@ -190,7 +203,7 @@ public:
 		if (vec.empty())
 			return out;
 		argmin_row(vec.data(), *this, out.data(), 0, cols - 1,
-		           offset, offset + vec.size() - 1, nullptr, offset);
+		           offset, offset + vec.size() - 1, nullptr, offset, k);
 		return out;
 	}
 
@@ -223,9 +236,12 @@ private:
 	 * @param a Left factor.
 	 * @param b Right factor.
 	 * @param out Pre-sized product matrix to fill (a.rows x b.cols).
+	 * @param k Threshold gating the argmin narrowing (see
+	 *          min_plus_product): columns whose minimum exceeds k keep
+	 *          full candidate ranges.
 	 */
 	static void argmin_sweep(const DistMatrix &a, const DistMatrix &b,
-	                         DistMatrix &out) {
+	                         DistMatrix &out, int k) {
 		const std::size_t E = a.rows;
 		const std::size_t F = b.cols;
 		const std::size_t B = a.cols;
@@ -295,7 +311,8 @@ private:
 				// and capture its leftmost argmins, seeded at the
 				// row's first finite candidate.
 				argmin_row(arow, b, orow, 0, F - 1,
-				           ff < B ? ff : 0, a.cols - 1, &opt_cur);
+				           ff < B ? ff : 0, a.cols - 1, &opt_cur, 0,
+				           k);
 			} else {
 				// Columns below the first finite landing are INF
 				// without scanning; the loose argmin bound keeps
@@ -331,9 +348,14 @@ private:
 					// loose whole-range bound
 					// keeps the staircase valid
 					// as the upper bound for the
-					// row above.
+					// row above. Likewise, a best
+					// above the threshold carries
+					// no usable order: clamping
+					// may have reordered it, so
+					// the row above keeps the
+					// full range too.
 					opt_cur[j] =
-					    best < INF ? best_k : B - 1;
+					    best <= k ? best_k : B - 1;
 					left = best_k;
 				}
 			}
@@ -359,13 +381,16 @@ private:
 	 * @param found Optional buffer of length b.cols — when set, receives
 	 *        the leftmost argmin of each solved column (indexed by j).
 	 * @param a_offset Candidate-row index represented by arow[0].
+	 * @param k Threshold gating the argmin narrowing (see
+	 *          min_plus_product): columns whose minimum exceeds k keep
+	 *          full candidate ranges on both recursive sides.
 	 * @pre j_lo <= j_hi and k_lo <= k_hi.
 	 */
 	static void argmin_row(const int *arow, const DistMatrix &b, int *orow,
 	                       std::size_t j_lo, std::size_t j_hi,
 	                       std::size_t k_lo, std::size_t k_hi,
 	                       std::vector<std::size_t> *found = nullptr,
-	                       std::size_t a_offset = 0) {
+	                       std::size_t a_offset = 0, int k = INF - 1) {
 		assert(j_lo <= j_hi && k_lo <= k_hi);
 		const std::size_t j_mid = (j_lo + j_hi) / 2;
 		std::size_t best_k = k_lo;
@@ -382,20 +407,22 @@ private:
 			}
 		}
 		orow[j_mid] = best;
-		const bool has_argmin = best < INF;
+		const bool has_argmin = best <= k;
 		// A saturated cell has no meaningful argmin. Store the loose upper
 		// bound for callers, and retain the full candidate range on both
 		// recursive sides instead of narrowing around the arbitrary best_k.
+		// The same holds for a best above the threshold: clamping may
+		// have reordered it, so it must not constrain either side.
 		if (found)
 			(*found)[j_mid] = has_argmin ? best_k : k_hi;
 		const std::size_t left_k_hi = has_argmin ? best_k : k_hi;
 		const std::size_t right_k_lo = has_argmin ? best_k : k_lo;
 		if (j_mid > j_lo)
 			argmin_row(arow, b, orow, j_lo, j_mid - 1, k_lo, left_k_hi,
-			           found, a_offset);
+			           found, a_offset, k);
 		if (j_mid < j_hi)
 			argmin_row(arow, b, orow, j_mid + 1, j_hi, right_k_lo, k_hi,
-			           found, a_offset);
+			           found, a_offset, k);
 	}
 
 	std::size_t rows;      ///< Number of rows.

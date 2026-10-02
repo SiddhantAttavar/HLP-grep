@@ -272,8 +272,28 @@ void test_apply() {
 	      "apply: zero-column result not empty");
 }
 
-void test_errors() {
-	// Dimension and range contracts are debug-only asserts now; only
+void test_threshold_gated_argmin() {
+	// Regression (DPA1 solver miss): argmin narrowing sourced at a
+	// column whose minimum exceeds the threshold must retain full
+	// candidate ranges — window-clamped tables need not satisfy the
+	// staircase there. Real H4 chain block values (2 rows x 3 cols).
+	DistMatrix m(2, 3, DistMatrix::INF, {0, 2}, {0, 3});
+	m(0, 0) = 1;
+	m(0, 1) = 37;
+	m(0, 2) = 103;
+	m(1, 0) = 0;
+	m(1, 1) = 38;
+	m(1, 2) = 102;
+	// min(1+1, 0+0) = 0; legacy narrowing returned 2 (restricted the
+	// target column to the phantom-tie argmin of an over-threshold
+	// column).
+	const std::vector<int> got = m.min_plus_apply({1, 0}, {0, 2}, 1);
+	check(got.size() == 3, "gated argmin: result size");
+	check(got[0] == 0 && got[1] == 38 && got[2] == 102,
+	      "gated argmin: values wrong");
+}
+
+void test_errors() {	// Dimension and range contracts are debug-only asserts now; only
 	// the defined degenerate behaviours are checked here.
 	const DistMatrix z(0, 2);
 	const std::vector<int> zg = z.min_plus_apply({});
@@ -343,6 +363,7 @@ int main() {
 	test_staircase_product();
 	test_layer_inf_fills();
 	test_apply();
+	test_threshold_gated_argmin();
 	test_errors();
 	test_cost_model();
 	test_empty();
