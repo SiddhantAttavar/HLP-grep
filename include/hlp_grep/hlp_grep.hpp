@@ -233,7 +233,8 @@ private:
 		std::vector<int> dist(dict.size(), DistMatrix::INF);
 		if (!eligible.empty()) {
 			const std::size_t thread_count = static_cast<std::size_t>(
-			    num_threads == 0 ? omp_get_max_threads() : num_threads);
+			    num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
+				: num_threads);
 			const std::size_t batch_count =
 			    std::min(eligible.size(), thread_count * 4);
 			const std::size_t batch_size = eligible.size() / batch_count;

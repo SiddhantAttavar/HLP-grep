@@ -190,9 +190,11 @@ public:
 	 * @param k     Edit distance threshold widening the windows.
 	 */
 	void build(const std::string &query, int k) {
-		// The per-node blocks are one task each with uniform cost
+		// The per-node blocks are one task each with uniform cost; past
+		// ~8 threads barrier and spawn overhead dominates the level loop.
 		const int threads = static_cast<int>(
-		    num_threads == 0 ? omp_get_max_threads() : num_threads);
+		    num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
+		                     : num_threads);
 		this->query = query;
 		this->k = k;
 #pragma omp parallel num_threads(threads)
@@ -473,7 +475,8 @@ private:
 				if (a >= lo_v)
 					mat(a - lo_u, a - lo_v) = cost_model.del();
 				int cur = 0, sub = cost_model.mismatch;
-				for (std::size_t b = a + 1; b < hi_v; ++b) {
+				std::size_t b_max = std::min(hi_v, a + k + 2);
+				for (std::size_t b = a + 1; b < b_max; ++b) {
 					if (query[b - 1] == c)
 						sub = cost_model.match;
 					if (b >= lo_v)
