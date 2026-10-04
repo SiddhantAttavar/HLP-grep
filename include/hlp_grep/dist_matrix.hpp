@@ -77,6 +77,19 @@ public:
 		return col_range_value;
 	}
 
+	/// Precomputed col_finite() of this matrix, filled by the builders
+	/// (edge_matrix, min_plus_product); empty otherwise.
+	const std::vector<std::pair<int, int>> &col_finite_range() const {
+		assert(!col_finite_value.empty());
+		return col_finite_value;
+	}
+
+	/// Stores col_finite() for later queries; called by the builders
+	/// once the entries are final.
+	void cache_col_finite() {
+		col_finite_value = col_finite();
+	}
+
 	/**
 	 * @brief Mutable access to entry (i, j).
 	 *
@@ -149,8 +162,10 @@ public:
 		assert(a.col_range() == b.row_range());
 
 		DistMatrix out(a.rows, b.cols, INF, a.row_range(), b.col_range());
-		if (a.rows == 0 || b.cols == 0)
+		if (a.rows == 0 || b.cols == 0) {
+			out.cache_col_finite();
 			return out;
+		}
 		const std::size_t E = a.rows;
 		const std::size_t F = b.cols;
 		const std::size_t B = a.cols;
@@ -171,6 +186,7 @@ public:
 		// bound one swap behind.
 		std::vector<std::size_t> opt_next(F, B - 1);
 		std::vector<std::size_t> opt_cur(F);
+		const auto &finite = b.col_finite_range();
 
 		// Bottom row: solve with the divide-and-conquer
 		// and capture its leftmost argmins, seeded at the
@@ -197,14 +213,14 @@ public:
 			std::fill(opt_cur.begin(), opt_cur.begin() + j, B - 1);
 			std::size_t left = ff;
 			for (; j < F; ++j) {
-				const std::size_t hi = opt_next[j];
-				std::size_t best_k = left;
-				int best = std::min(INF,
-					arow[left] + b.data[left * F + j]);
-				for (std::size_t k = left + 1;
-					 k <= hi; ++k) {
-					int cand = arow[k] +
-						b.data[k * F + j];
+				int lo = std::max(static_cast<int>(left),
+					  finite[j].first);
+				int hi = std::min(static_cast<int>(opt_next[j]),
+					  finite[j].second);
+				std::size_t best_k = lo;
+				int best = INF;
+				for (int k = lo; k <= hi; ++k) {
+					int cand = arow[k] + b.data[k * F + j];
 					if (cand < best) {
 						best = cand;
 						best_k = k;
@@ -227,11 +243,12 @@ public:
 					left = best_k;
 				}
 				else {
-					opt_cur[j] = B - 1;
+					opt_cur[j] = opt_next[j];
 				}
 			}
 			opt_next.swap(opt_cur);
 		}
+		out.cache_col_finite();
 		return out;
 	}
 
@@ -319,12 +336,40 @@ private:
 	}
 
 	/**
+	 * @brief Lowest and highest row holding a finite entry per column.
+	 *
+	 * @return One (lowest, highest) pair per column; columns with no
+	 *         finite entry report {rows, -1}.
+	 */
+	std::vector<std::pair<int, int>> col_finite() const {
+		std::vector<std::pair<int, int>> out(
+		    cols, {static_cast<int>(rows), -1});
+		// Single row-major pass: sequential reads instead of one
+		// strided pass per column. Rows increase, so the first finite
+		// cell sets the low end and every finite cell raises the high.
+		for (std::size_t i = 0; i < rows; ++i) {
+			const int r = static_cast<int>(i);
+			const int *row = &data[i * cols];
+			for (std::size_t j = 0; j < cols; ++j)
+				if (row[j] < INF) {
+					auto &[lo, hi] = out[j];
+					lo = std::min(lo, r);
+					hi = std::max(hi, r);
+				}
+		}
+		return out;
+	}
+
+	/**
 	 * @brief Divide-and-conquer column minima of M(c, j) = arow(c) + b(c, j).
 	 *
 	 * With both factors ED-DAG layers, M's leftmost column argmins are
 	 * monotone in j (the non-crossing shortest-path staircase), so the
 	 * argmin of the middle column bounds the argmin ranges of both
 	 * halves. Ties resolve to the leftmost argmin, preserving monotonicity.
+	 * Candidates outside the column's cached finite range (see
+	 * col_finite) can only saturate at INF and are skipped; the
+	 * recursion bounds below still use the full range.
 	 *
 	 * @param arow One row of the left factor, length b.rows.
 	 * @param b Right factor.
@@ -348,10 +393,19 @@ private:
 	                       std::size_t a_offset = 0, int k = INF - 1) {
 		assert(j_lo <= j_hi && k_lo <= k_hi);
 		const std::size_t j_mid = (j_lo + j_hi) / 2;
-		std::size_t best_k = k_lo;
-		int best = std::min(INF,
-			arow[k_lo - a_offset] + b.data[k_lo * b.cols + j_mid]);
-		for (std::size_t k = k_lo + 1; k <= k_hi; ++k) {
+		// Candidates outside this column's finite range can only
+		// saturate at INF, so the scan stays within the intersection.
+		// Matrices without a cached range scan the full range as before.
+		// The recursion below still uses the full [k_lo, k_hi] bounds:
+		// a best below INF is the true leftmost argmin over the full
+		// range (every excluded candidate saturates), so narrowing
+		// around it stays sound; without one the full range is kept.
+		const auto &finite = b.col_finite_range();
+		int scan_lo = std::max(static_cast<int>(k_lo), finite[j_mid].first);
+		int scan_hi = std::min(static_cast<int>(k_hi), finite[j_mid].second);
+		std::size_t best_k = scan_lo;
+		int best = INF;
+		for (int k = scan_lo; k <= scan_hi; ++k) {
 			int cand = arow[k - a_offset] + b.data[k * b.cols + j_mid];
 			if (cand < best) {
 				best = cand;
@@ -383,6 +437,10 @@ private:
 	std::pair<std::size_t, std::size_t> row_range_value;
 	std::pair<std::size_t, std::size_t> col_range_value;
 	std::vector<int> data; ///< Flat row-major storage.
+	/// Per column, the lowest and highest row holding a finite entry
+	/// ({rows, -1} when the column has none). Populated by
+	/// edge_matrix()/min_plus_product(); empty otherwise.
+	std::vector<std::pair<int, int>> col_finite_value;
 };
 
 } // namespace hlp_grep

@@ -463,8 +463,10 @@ private:
 		               static_cast<std::size_t>(hi_v - lo_v), DistMatrix::INF,
 		               {lo_u, hi_u}, {lo_v, hi_v});
 		const auto [lL, hL] = window(v, label.size());
-		if (lL >= hL)
+		if (lL >= hL) {
+			mat.cache_col_finite();
 			return mat; // final band empty: every crossing exceeds k
+		}
 		const auto [l0, h0] = window(v, 0);
 		const std::size_t label_len = label.size();
 		const std::size_t m = query.size();
@@ -484,6 +486,7 @@ private:
 					cur += cost_model.ins();
 				}
 			}
+			mat.cache_col_finite();
 			return mat;
 		}
 		// DP row over [l0, hL); band j of the label occupies
@@ -523,6 +526,7 @@ private:
 			for (long b = std::max(a, static_cast<long>(lo_v)); b < hL; ++b)
 				mat(a - lo_u, b - lo_v) = static_cast<int>(f[b - l0]);
 		}
+		mat.cache_col_finite();
 		return mat;
 	}
 
