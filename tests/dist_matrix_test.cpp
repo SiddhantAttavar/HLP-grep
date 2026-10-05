@@ -38,7 +38,6 @@ DistMatrix make(std::size_t rows, std::size_t cols,
 	for (std::size_t i = 0; i < rows; ++i)
 		for (std::size_t j = 0; j < cols; ++j)
 			m(i, j) = cells[i][j] - '0';
-	m.cache_col_finite();
 	return m;
 }
 
@@ -49,7 +48,6 @@ DistMatrix make_values(std::size_t rows, std::size_t cols,
 	for (std::size_t i = 0; i < rows; ++i)
 		for (std::size_t j = 0; j < cols; ++j)
 			m(i, j) = cells[i][j];
-	m.cache_col_finite();
 	return m;
 }
 
@@ -71,10 +69,8 @@ void check_equal(const DistMatrix &got, const DistMatrix &want,
 void test_product() {
 	// Products preserve the outer position ranges while composing adjacent
 	// ranges on the shared axis.
-	DistMatrix ranged_a(2, 3, 0, {5, 7}, {10, 13});
-	DistMatrix ranged_b(3, 2, 0, {10, 13}, {20, 22});
-	ranged_a.cache_col_finite();
-	ranged_b.cache_col_finite();
+	const DistMatrix ranged_a(2, 3, 0, {5, 7}, {10, 13});
+	const DistMatrix ranged_b(3, 2, 0, {10, 13}, {20, 22});
 	const DistMatrix ranged_out =
 	    DistMatrix::min_plus_product(ranged_a, ranged_b);
 	check(ranged_out.row_range() == std::make_pair<std::size_t, std::size_t>(5, 7),
@@ -89,12 +85,10 @@ void test_product() {
 	saturated_vec(0, 0) = DistMatrix::INF - 1;
 	saturated_vec(0, 1) = DistMatrix::INF - 1;
 	saturated_vec(0, 4) = DistMatrix::INF - 2;
-	saturated_vec.cache_col_finite();
 	DistMatrix position_costs(5, 5, DistMatrix::INF);
 	for (std::size_t i = 0; i < 5; ++i)
 		for (std::size_t j = 0; j < 5; ++j)
 			position_costs(i, j) = static_cast<int>(i > j ? i - j : j - i);
-	position_costs.cache_col_finite();
 	const DistMatrix saturated_product =
 	    DistMatrix::min_plus_product(saturated_vec, position_costs);
 	check_equal(saturated_product,
@@ -161,11 +155,9 @@ void test_staircase_product() {
 				for (std::size_t j = i; j < 6; ++j) {
 					m1(i, j) =
 					    ed_block(l1, *model, query, i, j);
-m2(i, j) =
+					m2(i, j) =
 					    ed_block(l2, *model, query, i, j);
-			}
-			m1.cache_col_finite();
-			m2.cache_col_finite();
+				}
 			DistMatrix brute(6, 6, DistMatrix::INF);
 			for (std::size_t i = 0; i < 6; ++i)
 				for (std::size_t j = 0; j < 6; ++j)
@@ -194,12 +186,10 @@ void test_layer_inf_fills() {
 	for (std::size_t i = 0; i < 5; ++i)
 		for (std::size_t k = i; k < 6; ++k)
 			a(i, k) = static_cast<int>(k - i);
-	a.cache_col_finite();
 	DistMatrix b(6, 7, DistMatrix::INF);
 	for (std::size_t k = 0; k < 6; ++k)
 		for (std::size_t j = k; j < 7; ++j)
 			b(k, j) = static_cast<int>(j - k);
-	b.cache_col_finite();
 	const DistMatrix got = DistMatrix::min_plus_product(a, b);
 	// Hand checks: out(0,0) = a(0,0)+b(0,0) = 0; out(0,6) = 0+6 = 6;
 	// column 0 of b has only b(0,0) = 0 realized while a(1,0) is INF,
@@ -245,7 +235,6 @@ void test_apply() {
 	for (std::size_t i = 0; i < 5; ++i)
 		for (std::size_t j = i; j < 6; ++j)
 			stair(i, j) = static_cast<int>(j - i);
-	stair.cache_col_finite();
 	const std::vector<int> sf =
 	    stair.min_plus_apply(
 	        {0, DistMatrix::INF, 1, DistMatrix::INF, 0});
@@ -278,16 +267,14 @@ void test_apply() {
 	      "apply empty suffix: output is not all-INF");
 
 	// Zero columns take the early return as well.
-	DistMatrix wide(2, 0);
-	wide.cache_col_finite();
+	const DistMatrix wide(2, 0);
 	check(wide.min_plus_apply({0, 0}).empty(),
 	      "apply: zero-column result not empty");
 }
 
 void test_errors() {	// Dimension and range contracts are debug-only asserts now; only
 	// the defined degenerate behaviours are checked here.
-	DistMatrix z(0, 2);
-	z.cache_col_finite();
+	const DistMatrix z(0, 2);
 	const std::vector<int> zg = z.min_plus_apply({});
 	check(zg.size() == 2 &&
 	          std::all_of(zg.begin(), zg.end(),
@@ -337,16 +324,13 @@ void test_cost_model() {
 
 void test_empty() {
 	// Zero outer dimensions are fine: the loops simply do not run.
-	DistMatrix a(0, 2);
-	DistMatrix b(2, 3);
-	a.cache_col_finite();
-	b.cache_col_finite();
+	const DistMatrix a(0, 2);
+	const DistMatrix b(2, 3);
 	const DistMatrix got = DistMatrix::min_plus_product(a, b);
 	check(got.num_rows() == 0 && got.num_cols() == 3,
 	      "empty: zero-row product shape wrong");
 
-	DistMatrix m(2, 0);
-	m.cache_col_finite();
+	const DistMatrix m(2, 0);
 	const std::vector<int> got_vec = m.min_plus_apply({0, 0});
 	check(got_vec.empty(), "empty: apply result not empty");
 }
