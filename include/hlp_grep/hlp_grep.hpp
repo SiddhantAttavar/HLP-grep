@@ -16,9 +16,10 @@
 #include <hlp_grep/result.hpp>
 
 #include <algorithm>
-#include <cassert>
 #include <cstddef>
-#include <numeric>
+#include <cstdlib>
+#include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -95,27 +96,26 @@ public:
 	 * @brief Finds all dictionary sequences within edit distance k of the
 	 *        query.
 	 *
-	 * Rebuilds the per-query chain tables of the pre-marked BinaryLifter
-	 * (build(query, k) over the blocks decompose() touched — the touched set is
-	 * query-independent, so every query fills the same blocks), then scores
-	 * the length-filtered compressed paths in lexicographic order, divided
-	 * into contiguous batches scored in parallel. Each batch keeps its own
-	 * stack of DP rows for shared prefixes and computes only each path's
-	 * unmatched suffix across heavy blocks (jump) or light edges (step).
-	 * Prefixes at batch boundaries are recomputed. The final row's entry at
-	 * query position |query| is the edit distance between the sequence's path
-	 * and the query; it is reported when retained and no greater than k.
+	 * Rebuilds the per-query chain tables of the pre-marked BinaryLifter, then
+	 * evaluates each length-eligible path with bounded A*. Integer f-score
+	 * buckets 0..k are scanned in order. The heuristic is the unavoidable
+	 * net-indel cost: min(ins, del) times the distance from the current to the
+	 * terminal diagonal. Each search offset indexes a
+	 * sparse path coordinate whose actual sequence position is built from
+	 * CompressedEdge::label_shift; query_pos is that position plus the diagonal.
+	 * Character transitions advance through retained label positions; a heavy
+	 * edge uses its matrix to skip every destination label in its compressed
+	 * block. A path's distance is finalized when its terminal state is removed
+	 * from its f-score bucket.
 	 *
-	 * Scoring aborts a path early once every entry of its DP row exceeds
-	 * k: with nonnegative operation costs each transition only adds cost,
-	 * so the row minimum never decreases and no later state can fall back
-	 * to <= k. Costs are nonnegative in every sane model; negative-cost
-	 * models make the check unsound and must not rely on it.
+	 * Scoring ignores relaxations above k. All operation costs are
+	 * nonnegative, and insertion/deletion costs are at least 1, so an
+	 * alignment within k stays in the represented diagonal band.
 	 *
 	 * Sequences whose length differs from the query by more than k are
 	 * skipped without scoring: their length difference is a lower bound
 	 * on the edit distance, and their DP states need not fit the windows
-	 * the lifter precomputes.
+	 * the lifter precomputes and the diagonal band remains sufficient.
 	 *
 	 * @param query The query DNA sequence.
 	 * @param k     Maximum allowed edit distance (threshold).
@@ -154,79 +154,23 @@ private:
 		}
 		build_compressed_paths();
 		lifter.decompose(compressed_paths);
-		sort_compressed_paths();
+		build_search_paths();
 	}
 
 	// -- implementation ----------------------------------------------------
-	/** A reusable DP row at a prefix boundary of a sorted path. */
-	struct QueryState {
-		POAGraph::node_id node;
-		std::vector<int> row;
-		std::pair<std::size_t, std::size_t> pos_range;
-	};
-
-	/** Lexicographic order over the canonical path-operation tokens. */
-	bool path_less(std::size_t lhs, std::size_t rhs) const {
-		const auto &a = compressed_paths[lhs];
-		const auto &b = compressed_paths[rhs];
-		if (a.start != b.start)
-			return a.start < b.start;
-		const std::size_t common = std::min(a.steps.size(), b.steps.size());
-		for (std::size_t i = 0; i < common; ++i) {
-			const auto &x = a.steps[i];
-			const auto &y = b.steps[i];
-			if (x.type != y.type)
-				return static_cast<unsigned char>(x.type) <
-				       static_cast<unsigned char>(y.type);
-			if (x.type == POAGraph::EdgeType::HEAVY) {
-				if (x.length != y.length)
-					return x.length < y.length;
-			} else if (x.next != y.next) {
-				return x.next < y.next;
-			}
-		}
-		if (a.steps.size() != b.steps.size())
-			return a.steps.size() < b.steps.size();
-		return lhs < rhs;
-	}
-
-	/** Number of saved states shared by two canonical path prefixes. */
-	static std::size_t common_prefix_states(
-	    const POAGraph::CompressedPath &a,
-	    const POAGraph::CompressedPath &b) {
-		if (a.start != b.start)
-			return 0;
-		std::size_t common = 0;
-		while (common < a.steps.size() && common < b.steps.size()) {
-			const auto &x = a.steps[common];
-			const auto &y = b.steps[common];
-			if (x.type != y.type)
-				break;
-			if (x.type == POAGraph::EdgeType::HEAVY) {
-				if (x.length != y.length)
-					break;
-			} else if (x.next != y.next) {
-				break;
-			}
-			++common;
-		}
-		// State zero is the row after the starting node's label.
-		return common + 1;
-	}
-
-	/** Filters by the length lower bound while preserving sorted path order. */
+	/** Filters paths by the length-difference lower bound. */
 	std::vector<std::size_t> eligible_paths(std::size_t query_length,
 	                                        int k) const {
 		std::vector<std::size_t> eligible;
-		eligible.reserve(sorted_path_ids.size());
+		eligible.reserve(dict.size());
 		const long m = static_cast<long>(query_length);
-		for (const std::size_t id : sorted_path_ids)
+		for (std::size_t id = 0; id < dict.size(); ++id)
 			if (std::abs(static_cast<long>(dict[id].size()) - m) <= k)
 				eligible.push_back(id);
 		return eligible;
 	}
 
-	/** Scores contiguous batches in parallel, preserving prefix sharing per batch. */
+	/** Scores independent compressed paths in parallel using bounded A*. */
 	std::vector<Result> score_paths(
 	    const std::string &query, int k,
 	    const std::vector<std::size_t> &eligible) const {
@@ -235,182 +179,136 @@ private:
 			const std::size_t thread_count = static_cast<std::size_t>(
 			    num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
 				: num_threads);
-			const std::size_t batch_count =
-			    std::min(eligible.size(), thread_count * 4);
-			const std::size_t batch_size = eligible.size() / batch_count;
-			const std::size_t larger_batches = eligible.size() % batch_count;
 			const std::size_t active_threads =
-			    std::min(thread_count, batch_count);
+			    std::min(thread_count, eligible.size());
 #pragma omp parallel for schedule(dynamic) num_threads(active_threads)
-			for (std::size_t batch = 0; batch < batch_count; ++batch) {
-				const std::size_t begin =
-				    batch * batch_size + std::min(batch, larger_batches);
-				const std::size_t end =
-				    begin + batch_size + (batch < larger_batches ? 1 : 0);
-				score_batch(query, k, eligible, begin, end, dist);
-			}
+			for (std::size_t i = 0; i < eligible.size(); ++i)
+				dist[eligible[i]] = score_path(query, k, eligible[i]);
 		}
 
 		return collect_results(dist, k);
 	}
 
-	/** Scores one contiguous range, sharing DP states only within the batch. */
-	void score_batch(const std::string &query, int k,
-	                 const std::vector<std::size_t> &eligible,
-	                 std::size_t begin, std::size_t end,
-	                 std::vector<int> &dist) const {
-		std::vector<QueryState> stack;
-		const POAGraph::CompressedPath *previous = nullptr;
+	/** One queued state at a sparse path-coordinate index and diagonal. */
+	struct SearchState {
+		std::size_t offset;
+		std::size_t diagonal_index;
+		int distance;
+	};
 
-		for (std::size_t i = begin; i < end; ++i) {
-			const std::size_t id = eligible[i];
-			const auto &cp = compressed_paths[id];
-			std::size_t common =
-			    previous ? common_prefix_states(*previous, cp) : 0;
-			// An earlier path may have stopped after its row became
-			// impossible, so only states actually present can be reused.
-			common = std::min(common, stack.size());
-			while (stack.size() > common)
-				stack.pop_back();
+	/** Sparse per-path coordinates used by the distance-bucket search. */
+	struct PathSearchIndex {
+		std::vector<std::size_t> step_len;
+		std::vector<std::size_t> label_pos;
+		std::vector<std::size_t> seq_pos;
+		std::vector<POAGraph::node_id> node;
+	};
 
-			if (stack.empty())
-				stack.push_back(initial_state(cp.start, query, k));
+	/** Computes one path's exact distance with buckets indexed by f-score. */
+	int score_path(const std::string &query, int k, std::size_t id) const {
+		const std::string &sequence = dict[id];
+		const std::size_t sequence_length = sequence.size();
 
-			std::size_t step_index = stack.size() - 1;
-			bool dead = stack.back().row.empty();
-			while (!dead && step_index < cp.steps.size()) {
-				const auto &step = cp.steps[step_index];
-				const QueryState &state = stack.back();
-				POAGraph::node_id cur = state.node;
-				QueryState next_state = state;
-				if (step.type == POAGraph::EdgeType::HEAVY) {
-					if (step.length == 1) {
-						const auto destination =
-						    *graph.node(cur).heavy_neighbour;
-						lifter.step(cur, destination, next_state.row,
-						            next_state.pos_range);
-						next_state.node = destination;
-					} else {
-						next_state.node = lifter.jump(
-						    cur, step.length, next_state.row,
-						    next_state.pos_range);
-					}
-				} else {
-					lifter.step(cur, step.next, next_state.row,
-					            next_state.pos_range);
-					next_state.node = step.next;
-				}
-				stack.push_back(std::move(next_state));
-				++step_index;
-				dead = stack.back().row.empty();
-			}
-			if (!dead) {
-				const QueryState &final_state = stack.back();
-				const std::size_t query_end = query.size();
-				if (query_end >= final_state.pos_range.first &&
-				    query_end < final_state.pos_range.second)
-					dist[id] = final_state.row[
-					    query_end - final_state.pos_range.first];
-			}
-			previous = &cp;
+		if (sequence_length + k < query.size() || query.size() + k < sequence_length) {
+			return DistMatrix::INF;
 		}
+
+		const auto &path_index = search_paths[id];
+		const std::size_t state_count = path_index.label_pos.size();
+		const std::size_t width = static_cast<std::size_t>(k) * 2 + 1;
+		std::vector<int> best(state_count * width, DistMatrix::INF);
+
+		// A net diagonal change requires at least this many indels. Using the
+		// minimum indel cost makes the lower bound consistent for either sign.
+		const int goal_diagonal = static_cast<int>(query.size()) -
+		    static_cast<int>(sequence_length);
+		const int MIN_INDEL_COST = std::min(cost.ins(), cost.del());
+		std::vector<std::vector<SearchState>> buckets(
+		    static_cast<std::size_t>(k) + 1);
+
+		auto relax = [&](std::size_t offset, int diagonal, int candidate) {
+			if (candidate > k || std::abs(diagonal) > static_cast<long>(k))
+				return;
+			const std::size_t query_pos = diagonal + path_index.seq_pos[offset];
+			if (query_pos < 0 || query_pos > query.size())
+				return;
+			const int delta = std::abs(diagonal - goal_diagonal);
+			const int heuristic = static_cast<int>(delta * MIN_INDEL_COST);
+			const int f_score = candidate + heuristic;
+			if (f_score > k)
+				return;
+			const std::size_t d = diagonal + k;
+			int &known = best[offset * width + d];
+			if (candidate < known) {
+				known = candidate;
+				buckets[static_cast<std::size_t>(f_score)].push_back(
+				    {offset, d, candidate});
+			}
+		};
+		relax(0, 0, 0);
+
+		for (int f_score = 0; f_score <= k; ++f_score) {
+			auto &bucket = buckets[static_cast<std::size_t>(f_score)];
+			for (std::size_t cursor = 0; cursor < bucket.size(); ++cursor) {
+				const auto [offset, diagonal_index, distance] = bucket[cursor];
+				if (best[offset * width + diagonal_index] != distance)
+					continue;
+
+				const POAGraph::node_id node = path_index.node[offset];
+				const std::size_t seq_pos = path_index.seq_pos[offset];
+				const std::size_t label_pos = path_index.label_pos[offset];
+				const std::size_t step_len = path_index.step_len[offset];
+
+				const int diagonal = static_cast<int>(diagonal_index) - k;
+				const std::size_t query_pos = diagonal + seq_pos;
+
+				if (query_pos == query.size() && offset == state_count - 1)
+					return distance;
+
+				// Insert a query character without advancing in the dictionary.
+				relax(offset, diagonal + 1, distance + cost.ins());
+
+				if (offset == state_count - 1)
+					continue;
+
+				const std::size_t next_offset = offset + 1;
+				const std::size_t next_seq_pos = path_index.seq_pos[next_offset];
+				if (step_len > 0) {
+					std::vector<int> row;
+					std::pair<std::size_t, std::size_t> range;
+					const std::size_t label_shift = next_seq_pos - seq_pos;
+					lifter.jump_point(node, step_len, query_pos, distance,
+					    label_shift, row, range);
+					for (std::size_t i = 0; i < row.size(); ++i) {
+						const int output_diagonal =
+						    static_cast<int>(range.first + i) -
+						    static_cast<int>(next_seq_pos);
+						relax(next_offset, output_diagonal, row[i]);
+					}
+				}
+				else {
+					relax(next_offset, diagonal - 1, distance + cost.del());
+					if (query_pos < query.size()) {
+						const int consume_cost =
+							cost.consume(graph.seq(node)[label_pos], query[query_pos]);
+						relax(next_offset, diagonal, distance + consume_cost);
+					}
+				}
+			}
+		}
+		return DistMatrix::INF;
 	}
 
 	/** Returns result records in dictionary-id order. */
 	std::vector<Result> collect_results(const std::vector<int> &dist,
 	                                    int k) const {
 		std::vector<Result> results;
-		// Iterate dictionary ids in increasing order, independent of batch
-		// completion order, so the public result order is deterministic.
+		// Iterate dictionary ids in increasing order, independent of parallel
+		// path completion order, so the public result order is deterministic.
 		for (std::size_t id = 0; id < dict.size(); ++id)
 			if (dist[id] <= k)
 				results.push_back({id, dist[id]});
 		return results;
-	}
-
-	/**
-	 * @brief Initial DP state at the start node of a compressed path: the
-	 *        node's label aligned as a block, clipped like every other row.
-	 *
-	 * Row entries are the node's window positions: the number of query
-	 * characters consumed before the start node's label begins. The
-	 * label is aligned as a block against some query substring ending at
-	 * b (matches, substitutions, and internal deletions via the ED
-	 * recurrence below), with every earlier query character inserted.
-	 *
-	 * A start node sits at offset 0 of its path, so its position range is
-	 * (0, j_max) and only |label| matters: entering the block costs at
-	 * least one insertion per earlier query character, and reaching query
-	 * position b costs at least b - |label|. Sources therefore enter over
-	 * [0, min(m, k)] and the outputs kept are the after-label band
-	 * [max(0, |label| - k), min(m + 1, |label| + k + 1)) — a subrange of
-	 * BinaryLifter::window (the start node's label is never crossed by an
-	 * edge, so no matrix can produce this row). The band is empty when
-	 * |label| > m + k, leaving the state without a row.
-	 *
-	 * @param start First node of the compressed path.
-	 * @param query Query string (may be empty).
-	 * @param k     Edit distance threshold widening the window.
-	 * @return The start node's DP row over the band it covers.
-	 */
-	QueryState initial_state(POAGraph::node_id start,
-	                         const std::string &query, int k) const {
-		const long m = static_cast<long>(query.size());
-		const long mk = static_cast<long>(k);
-		const std::string &label = graph.seq(start);
-		const long label_len = static_cast<long>(label.size());
-		const long lo = std::max(0L, label_len - mk);
-		const long hL = std::min(m + 1, label_len + mk + 1);
-		// The label is longer than the query by more than k, so no band
-		// position carries a cost within k and the state has no row.
-		if (lo >= hL)
-			return {start, {}, {static_cast<std::size_t>(lo),
-			                   static_cast<std::size_t>(lo)}};
-
-		QueryState state{start,
-		                 std::vector<int>(static_cast<std::size_t>(hL - lo),
-		                                   DistMatrix::INF),
-		                 {static_cast<std::size_t>(lo),
-		                  static_cast<std::size_t>(hL)}};
-
-		// Semiglobal DP over (label prefix, query prefix): f[i][b] is the
-		// min cost of consuming the first i label characters against a
-		// query substring ending at b. Row 0 is the pure insertion prefix
-		// from the virtual source at position 0; each label character
-		// sweeps over its own band [max(0, i - k), min(m + 1, i + k + 1))
-		// — mirroring BinaryLifter::sweep_label — so the work stays
-		// O(|label| * k). Consecutive bands overlap, so every cell a band
-		// covers is reachable from the entry row: no entry saturates at
-		// INF.
-		std::vector<long> f(static_cast<std::size_t>(hL),
-		                    DistMatrix::INF);
-		const long h0 = std::min(m + 1, mk + 1);
-		f[0] = 0;
-		for (long b = 1; b < h0; ++b)
-			f[b] = f[b - 1] + cost.ins();
-		for (long i = 1; i <= label_len; ++i) {
-			const long li = std::max(0L, i - mk);
-			const long hi_i = std::min(m + 1, i + mk + 1);
-			const char c = label[i - 1];
-			const int del_c = cost.del();
-			long cur = f[li] + del_c;
-			if (li > 0) {
-				cur = std::min(cur, f[li - 1] + cost.consume(c, query[li - 1]));
-			}
-			long diag = f[li], left = cur;
-			f[li] = cur;
-			for (long b = li + 1; b < hi_i; ++b) {
-				const long up = f[b]; // f[i - 1][b]
-				cur = std::min(up + del_c, left + cost.ins());
-				cur = std::min(cur, diag + cost.consume(c, query[b - 1]));
-				f[b] = cur;
-				left = cur;
-				diag = up;
-			}
-		}
-		std::copy(f.begin() + lo, f.begin() + hL, state.row.begin());
-		lifter.clip_row(state.row, state.pos_range);
-		return state;
 	}
 
 	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
@@ -425,9 +323,8 @@ private:
 	mutable BinaryLifter lifter;
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
-	/// Dictionary ids in lexicographic compressed-path order.
-	std::vector<std::size_t> sorted_path_ids;
-
+	/// Sparse character and heavy-landing coordinates for each dictionary path.
+	std::vector<PathSearchIndex> search_paths;
 	/** Builds the merged compressed representation of every dictionary path. */
 	void build_compressed_paths() {
 		compressed_paths.clear();
@@ -436,15 +333,51 @@ private:
 			compressed_paths.push_back(graph.compressed_path(i));
 	}
 
-	/** Sorts dictionary paths after decompose() rewrites their steps. */
-	void sort_compressed_paths() {
-		sorted_path_ids.resize(dict.size());
-		std::iota(sorted_path_ids.begin(), sorted_path_ids.end(),
-		          std::size_t{0});
-		std::sort(sorted_path_ids.begin(), sorted_path_ids.end(),
-		          [this](std::size_t a, std::size_t b) {
-			          return path_less(a, b);
-		          });
+	/** Builds sparse coordinates, omitting all interior positions of heavy blocks. */
+	void build_search_paths() {
+		search_paths.clear();
+		search_paths.resize(compressed_paths.size());
+		for (std::size_t i = 0; i < compressed_paths.size(); ++i) {
+			const auto &cp = compressed_paths[i];
+			auto &index = search_paths[i];
+
+			POAGraph::node_id current_node = cp.start;
+			std::size_t sequence_offset = 0;
+
+			auto append_light = [&]() {
+				const std::size_t label_size = graph.seq(current_node).size();
+				for (std::size_t label_pos = 0; label_pos < label_size;
+					 ++label_pos) {
+					index.step_len.push_back(0);
+					index.label_pos.push_back(label_pos);
+					index.seq_pos.push_back(sequence_offset);
+					index.node.push_back(current_node);
+					sequence_offset++;
+				}
+			};
+
+			append_light();
+			for (std::size_t step_index = 0;
+			     step_index < cp.steps.size(); ++step_index) {
+				const auto &step = cp.steps[step_index];
+				if (step.type == POAGraph::EdgeType::LIGHT) {
+					current_node = step.next;
+					append_light();
+				}
+				else {
+					index.step_len.push_back(step.length);
+					index.label_pos.push_back(0);
+					index.seq_pos.push_back(sequence_offset);
+					index.node.push_back(current_node);
+					sequence_offset += step.label_shift;
+					current_node = lifter.jump_node(current_node, step.length);
+				}
+			}
+			index.step_len.push_back(0);
+			index.label_pos.push_back(0);
+			index.seq_pos.push_back(sequence_offset);
+			index.node.push_back(current_node);
+		}
 	}
 };
 

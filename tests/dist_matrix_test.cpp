@@ -301,10 +301,12 @@ void test_cost_model() {
 		          "," + std::to_string(match) + "," +
 		          std::to_string(mismatch) + ")");
 	}
-	// Negative ins/del individually, and ins+de < mismatch.
+	// Indels must be positive; mismatch must be nonnegative; and
+	// ins + del must bound the mismatch cost.
 	for (const auto &[ins, del, match, mismatch] :
 	     std::vector<std::tuple<int, int, int, int>>{
-	         {-1, 3, 0, 1}, {2, -3, 0, 1}, {1, 1, 0, 3}}) {
+	         {-1, 3, 0, 1}, {0, 3, 0, 1}, {2, -3, 0, 1},
+	         {2, 0, 0, 1}, {1, 1, 0, -1}, {1, 1, 0, 3}}) {
 		bool threw = false;
 		try {
 			CostModel bad(ins, del, match, mismatch);

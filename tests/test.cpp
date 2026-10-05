@@ -113,6 +113,8 @@ void test_testcase(const fs::path &file, const Testcase &tc,
 			std::cerr << file << ": query " << q << " (\"" << query << "\", k=" << k
 			          << "): expected " << expected[q].ids.size() << " matches, got "
 			          << results.size() << '\n';
+			for (const auto &result : results)
+				std::cerr << "  got id=" << result.id << " dist=" << result.dist << '\n';
 			std::exit(1);
 		}
 		for (std::size_t i = 0; i < results.size(); ++i) {
@@ -184,7 +186,7 @@ void test_query_prefix_sharing() {
 		}
 	std::filesystem::remove(cache_file);
 
-	const CostModel weighted(2, 2, 0, 1);
+	const CostModel weighted(2, 3, 0, 1);
 	const Solver weighted_solver({"AA"}, weighted, false);
 	const auto over_threshold = weighted_solver.query("AAAA", 2);
 	if (!over_threshold.empty()) {
@@ -195,6 +197,11 @@ void test_query_prefix_sharing() {
 	if (within_threshold.size() != 1 || within_threshold[0].id != 0 ||
 	    within_threshold[0].dist != 2) {
 		std::cerr << "prefix-sharing: two-sided row clipping lost an endpoint match\n";
+		std::exit(1);
+	}
+	const auto deletion_over_threshold = weighted_solver.query("A", 2);
+	if (!deletion_over_threshold.empty()) {
+		std::cerr << "prefix-sharing: asymmetric deletion cost was not respected\n";
 		std::exit(1);
 	}
 	std::cout << "PASS query-prefix-sharing\n";
@@ -208,7 +215,8 @@ void test_lifter_decompose() {
 		paths.push_back(graph.compressed_path(i));
 	if (paths[0].steps.size() != 1 ||
 	    paths[0].steps[0].type != POAGraph::EdgeType::HEAVY ||
-	    paths[0].steps[0].length != 11) {
+	    paths[0].steps[0].length != 11 ||
+	    paths[0].steps[0].label_shift != 11) {
 		std::cerr << "decompose: expected one 11-edge heavy run before split\n";
 		std::exit(1);
 	}
@@ -218,8 +226,30 @@ void test_lifter_decompose() {
 	for (const auto &path : paths) {
 		if (path.steps.size() != 3 ||
 		    path.steps[0].length != 1 || path.steps[1].length != 2 ||
-		    path.steps[2].length != 8) {
+		    path.steps[2].length != 8 ||
+		    path.steps[0].label_shift != 1 ||
+		    path.steps[1].label_shift != 2 ||
+		    path.steps[2].label_shift != 8) {
 			std::cerr << "decompose: length-11 chain was not split as 1+2+8\n";
+			std::exit(1);
+		}
+	}
+
+	const std::vector<std::string> compact_dict{
+	    "AACCGGTTAACCGGTT", "AACCGGTTAACCAGTT", "TTCCGGTTAACCGGTT"};
+	const POAGraph compact_graph(compact_dict, DEFAULT_COST_MODEL, true);
+	std::vector<POAGraph::CompressedPath> compact_paths;
+	for (std::size_t i = 0; i < compact_dict.size(); ++i) {
+		compact_paths.push_back(compact_graph.compressed_path(i));
+	}
+	BinaryLifter compact_lifter(compact_graph);
+	compact_lifter.decompose(compact_paths);
+	for (std::size_t i = 0; i < compact_paths.size(); ++i) {
+		std::size_t shift = compact_graph.seq(compact_paths[i].start).size();
+		for (const auto &step : compact_paths[i].steps)
+			shift += step.label_shift;
+		if (shift != compact_dict[i].size()) {
+			std::cerr << "decompose: compact block shifts do not span path\n";
 			std::exit(1);
 		}
 	}

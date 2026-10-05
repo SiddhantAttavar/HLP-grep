@@ -31,11 +31,13 @@ public:
 	 * behind the argmin-staircase composition used by DistMatrix and
 	 * BinaryLifter (see DistMatrix::min_plus_product):
 	 *   match == 0,
-	 *   ins >= 0,
-	 *   del >= 0,
+	 *   ins >= 1,
+	 *   del >= 1,
+	 *   mismatch >= 0,
 	 *   ins + del >= mismatch
-	 * (the last implies mismatch >= 0, so match == 0 makes every
-	 * substitution cost at least the match cost).
+	 * With nonnegative substitution and indel costs, shortest-path scoring
+	 * has nonnegative transitions; positive indel costs also bound every
+	 * alignment of cost <= k to diagonals [-k, k].
 	 *
 	 * @param ins      Insertion cost (default 1).
 	 * @param del      Deletion cost (default 1).
@@ -48,13 +50,16 @@ public:
 		if (match != 0)
 			throw std::invalid_argument(
 			    "CostModel: match cost must be 0");
-		if (ins_cost < 0)
+		if (ins_cost < 1)
 			throw std::invalid_argument(
-			    "CostModel: insertion cost must be nonnegative");
-		if (del_cost < 0)
+			    "CostModel: insertion cost must be at least 1");
+		if (del_cost < 1)
 			throw std::invalid_argument(
-			    "CostModel: deletion cost must be nonnegative");
-		if (ins_cost + del_cost < mismatch)
+			    "CostModel: deletion cost must be at least 1");
+		if (mismatch < 0)
+			throw std::invalid_argument(
+			    "CostModel: mismatch cost must be nonnegative");
+		if (static_cast<long long>(ins_cost) + del_cost < mismatch)
 			throw std::invalid_argument(
 			    "CostModel: ins + del must be >= mismatch");
 	}

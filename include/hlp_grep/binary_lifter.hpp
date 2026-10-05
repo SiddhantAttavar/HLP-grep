@@ -14,6 +14,7 @@
 #include <hlp_grep/dist_matrix.hpp>
 #include <hlp_grep/poa_graph.hpp>
 
+#include <iostream>
 #include <omp.h>
 
 #include <algorithm>
@@ -74,12 +75,21 @@ public:
 		while ((std::size_t{1} << max_level) <= n)
 			++max_level; // floor(log2(n)) + 1; 0 for n == 0
 		up.assign(n, std::vector<std::optional<node_id>>(max_level));
-		for (std::size_t u = 0; u < n; ++u)
+		up_shift.assign(n, std::vector<std::size_t>(max_level, 0));
+		for (std::size_t u = 0; u < n; ++u) {
 			up[u][0] = graph.node(u).heavy_neighbour;
+			if (up[u][0])
+				up_shift[u][0] = graph.seq(*up[u][0]).size();
+		}
 		for (std::size_t t = 1; t < max_level; ++t)
 			for (std::size_t u = 0; u < n; ++u)
-				if (up[u][t - 1])
-					up[u][t] = up[*up[u][t - 1]][t - 1];
+				if (up[u][t - 1]) {
+					const node_id mid = *up[u][t - 1];
+					up[u][t] = up[mid][t - 1];
+					if (up[u][t])
+						up_shift[u][t] =
+						    up_shift[u][t - 1] + up_shift[mid][t - 1];
+				}
 	}
 
 	/**
@@ -119,15 +129,16 @@ public:
 					while (rem > 0) {
 						const std::size_t level =
 						    std::min(
-						        static_cast<unsigned long long>(
+						        static_cast<unsigned long>(
 						            __builtin_ctzll(graph.node(
 						                cur).heavy_length)),
-						        static_cast<unsigned long long>(
+						        static_cast<unsigned long>(
 						            63 - __builtin_clzll(rem)));
-						const std::size_t block = std::size_t{1} << level;
+						const int block = 1 << level;
 						POAGraph::CompressedEdge block_step;
 						block_step.type = POAGraph::EdgeType::HEAVY;
-						block_step.length = static_cast<int>(block);
+						block_step.length = block;
+						block_step.label_shift = up_shift[cur][level];
 						decomposed.push_back(block_step);
 						touched[cur][level] = true;
 						cur = *up[cur][level];
@@ -272,6 +283,53 @@ public:
 		assert(pos_range == window(v));
 		clip_row(row, pos_range);
 		cost = std::move(row);
+		return v;
+	}
+
+	node_id jump_node(node_id u, int l) const {
+		const std::size_t level = 63 - __builtin_clzll(l);
+		return *up[u][level];
+	}
+
+	/**
+	 * @brief Applies one source cell of a heavy-chain matrix directly.
+	 *
+	 * Unlike jump(), this point query emits only destination positions in the
+	 * path-specific diagonal band around @p destination_offset. This avoids
+	 * scanning a shared node's full global position-spread window when a
+	 * shortest-path search expands one state at a time.
+	 *
+	 * @param u                 Source node of the heavy block.
+	 * @param l                 Number of heavy edges in the power-of-two block.
+	 * @param source_pos        Query position at the source after-label boundary.
+	 * @param source_cost       Distance accumulated before applying the matrix.
+	 * @param destination_offset Reference offset after the block's last label.
+	 * @param row               Replaced by costs at the reachable destination
+	 *                          query positions.
+	 * @param pos_range         Replaced by the query-position range in @p row.
+	 * @return The node reached by the block.
+	 */
+	node_id jump_point(node_id u, int l, std::size_t source_pos,
+	                   int source_cost, std::size_t label_shift,
+	                   std::vector<int> &row,
+	                   std::pair<std::size_t, std::size_t> &pos_range) const {
+		const std::size_t level = 63 - __builtin_clzll(l);
+		const DistMatrix &mat = up_mat[u][level];
+		const node_id v = *up[u][level];
+
+		const std::size_t target_pos = source_pos + label_shift;
+		assert(source_pos < mat.row_range().second);
+		const auto [col_lo, col_hi] = mat.col_range();
+		const std::size_t lo = std::max(static_cast<long>(col_lo),
+			  static_cast<long>(target_pos) - k);
+		const std::size_t hi = std::max(lo, std::min(col_hi, target_pos + k + 1));
+
+		row.resize(hi - lo);
+		const std::size_t matrix_row = source_pos - mat.row_range().first;
+		for (std::size_t b = lo; b < hi; ++b) {
+			row[b - lo] = source_cost + mat(matrix_row, b - col_lo);
+		}
+		pos_range = {lo, hi};
 		return v;
 	}
 
@@ -568,6 +626,8 @@ private:
 	/// up[u][t] is the node 2^t heavy steps from u, or empty if the chain
 	/// ends before then.
 	std::vector<std::vector<std::optional<node_id>>> up;
+	/// up_shift[u][t] is the total label length entered by the same block.
+	std::vector<std::vector<std::size_t>> up_shift;
 	/// up_mat[u][t] is the DistMatrix ed(u, 2^t, a, b) for every (u, t)
 	/// touched by queries and built by the last build() call; untouched
 	/// slots stay empty. decompose() sizes each node's vector to the top of

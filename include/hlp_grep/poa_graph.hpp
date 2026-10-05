@@ -62,6 +62,9 @@ public:
 	 */
 	struct CompressedEdge {
 		EdgeType type = EdgeType::LIGHT;
+		/// Dictionary bases consumed: the destination label for LIGHT, and
+		/// all destination labels in the block for HEAVY.
+		std::size_t label_shift = 0;
 
 		/// HEAVY: number of heavy edges advanced along the chain.
 		/// LIGHT: destination node of the single light edge.
@@ -333,9 +336,9 @@ public:
 		std::vector<CompressedEdge> steps; ///< Steps, in path order.
 	};
 
-	CompressedPath compressed_path(std::size_t seq) const {
+	CompressedPath compressed_path(std::size_t seq_id) const {
 		CompressedPath out;
-		const auto &p = paths[seq];
+		const auto &p = paths[seq_id];
 		out.start = p.front();
 		out.steps.reserve(p.size());
 		std::size_t i = 1;
@@ -344,15 +347,19 @@ public:
 			if (edge_type(p[i - 1], p[i]) == EdgeType::HEAVY) {
 				step.type = EdgeType::HEAVY;
 				int len = 1;
+				step.label_shift = seq(p[i]).size();
 				++i;
 				while (i < p.size() &&
 				       edge_type(p[i - 1], p[i]) == EdgeType::HEAVY) {
 					++len;
+					step.label_shift += seq(p[i]).size();
 					++i;
 				}
 				step.length = len;
 			} else {
+				step.type = EdgeType::LIGHT;
 				step.next = p[i];
+				step.label_shift = seq(p[i]).size();
 				++i;
 			}
 			out.steps.push_back(step);

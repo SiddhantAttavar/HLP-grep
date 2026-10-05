@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <set>
 #include <string>
@@ -44,8 +45,42 @@ std::string summary(const std::vector<std::size_t> &xs) {
 	          }());
 }
 
+void plot_weight_distribution(const char *label,
+                             const std::vector<std::size_t> &weights,
+                             std::size_t trunk) {
+	std::cout << "  " << label << " (" << weights.size() << " values):\n";
+	if (weights.empty()) {
+		std::cout << "    n/a\n";
+		return;
+	}
+
+	const std::size_t max_weight =
+	    *std::max_element(weights.begin(), weights.end());
+	const std::size_t bin_width =
+	    std::max<std::size_t>(1, 1 + (max_weight - 1) / 20);
+	const std::size_t bin_count = 1 + (max_weight - 1) / bin_width;
+	std::vector<std::size_t> bins(bin_count, 0);
+	for (const std::size_t weight : weights)
+		++bins[(weight - 1) / bin_width];
+
+	const std::size_t max_count =
+	    *std::max_element(bins.begin(), bins.end());
+	for (std::size_t i = 0; i < bins.size(); ++i) {
+		const std::size_t lo = i * bin_width + 1;
+		const std::size_t hi = std::min(max_weight, (i + 1) * bin_width);
+		const std::size_t bar_width = bins[i] * 40 / max_count;
+		std::cout << "    " << lo;
+		if (hi != lo)
+			std::cout << "-" << hi;
+		std::cout << " | " << std::string(bar_width, '#') << " " << bins[i];
+		if (trunk >= lo && trunk <= hi)
+			std::cout << "  <-- trunk=" << trunk;
+		std::cout << "\n";
+	}
+}
+
 void stats_testcase(const fs::path &file, const Testcase &tc,
-                    bool compact_nodes) {
+                    bool compact_nodes, bool plot_weight_dist) {
 	std::cout << "=== " << file << " ===\n";
 
 	std::vector<std::size_t> seq_lens;
@@ -64,16 +99,18 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 	    std::chrono::steady_clock::now();
 
 	// Unique edges and their heavy/light mix, straight from the paths.
-	std::set<std::pair<POAGraph::node_id, POAGraph::node_id>> edges;
+	std::map<std::pair<POAGraph::node_id, POAGraph::node_id>, std::size_t>
+	    edge_weights;
 	std::size_t light_edges = 0, heavy_total = 0;
 	std::vector<std::size_t> path_lens, light_per_path, heavy_per_path;
 	for (std::size_t i = 0; i < graph.num_sequences(); ++i) {
 		const auto &p = graph.path(i);
 		path_lens.push_back(p.size());
-		std::size_t heavy = 0, light = 0, dup = 0;
+		std::size_t heavy = 0, light = 0;
 		for (std::size_t j = 1; j < p.size(); ++j) {
 			const POAGraph::node_id u = p[j - 1], v = p[j];
-			const bool fresh = edges.insert({u, v}).second;
+			auto [edge, fresh] = edge_weights.try_emplace({u, v}, 0);
+			++edge->second;
 			if (graph.edge_type(u, v) == POAGraph::EdgeType::HEAVY) {
 				if (fresh)
 					heavy_total++; // each heavy edge exists exactly once
@@ -83,7 +120,6 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 					light_edges++;
 				light++;
 			}
-			(void)dup;
 		}
 		heavy_per_path.push_back(heavy);
 		light_per_path.push_back(light);
@@ -117,6 +153,32 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 			          : 0.0)
 	          << "\n";
 
+	if (plot_weight_dist) {
+		std::vector<std::size_t> all_edge_weights;
+		all_edge_weights.reserve(edge_weights.size());
+		std::vector<std::size_t> best_outgoing_weights(graph.num_nodes(), 0);
+		for (const auto &[edge, weight] : edge_weights) {
+			all_edge_weights.push_back(weight);
+			best_outgoing_weights[edge.first] =
+			    std::max(best_outgoing_weights[edge.first], weight);
+		}
+		best_outgoing_weights.erase(
+		    std::remove(best_outgoing_weights.begin(), best_outgoing_weights.end(), 0),
+		    best_outgoing_weights.end());
+		const std::size_t trunk = graph.num_sequences() / 2;
+		const std::size_t eligible = static_cast<std::size_t>(std::count_if(
+		    best_outgoing_weights.begin(), best_outgoing_weights.end(),
+		    [trunk](std::size_t weight) { return weight >= trunk; }));
+		std::cout << "  weight distribution: trunk=" << trunk << ", " << eligible
+		          << "/" << best_outgoing_weights.size()
+		          << " node-best edges meet the cutoff\n";
+		plot_weight_distribution("all edge traversal weights", all_edge_weights,
+		                         trunk);
+		plot_weight_distribution("best outgoing edge weight per node",
+		                         best_outgoing_weights, trunk);
+		std::cout << "\n";
+	}
+
 	// Where the extra nodes live: seed path vs bubbles. The first stored
 	// path seeds the graph; every later insertion event appends nodes of
 	// its own, and every deletion/insertion creates branching points.
@@ -125,9 +187,9 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 		std::set<POAGraph::node_id> on_seed(seed.begin(), seed.end());
 		std::size_t branching = 0, max_out = 0, chain_nodes = 0, sinks = 0;
 		std::vector<std::size_t> outdeg(graph.num_nodes(), 0);
-		for (const auto &[u, v] : edges) {
-			(void)v;
-			outdeg[u]++;
+		for (const auto &[edge, weight] : edge_weights) {
+			(void)weight;
+			outdeg[edge.first]++;
 		}
 		for (const std::size_t d : outdeg) {
 			if (d > 1)
@@ -220,17 +282,21 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 
 int main(int argc, char **argv) {
 	bool compact_nodes = true;
+	bool plot_weight_dist = false;
 	std::vector<const char *> args;
 	for (int i = 1; i < argc; ++i) {
 		if (std::string(argv[i]) == "--no-compact") {
 			compact_nodes = false;
+		} else if (std::string(argv[i]) == "--plot-weight-dist") {
+			plot_weight_dist = true;
 		} else {
 			args.push_back(argv[i]);
 		}
 	}
 	if (args.empty()) {
 		std::cerr << "usage: " << argv[0]
-		          << " [--no-compact] <testcase-file-or-dir>...\n";
+		          << " [--no-compact] [--plot-weight-dist]"
+		             " <testcase-file-or-dir>...\n";
 		return 1;
 	}
 
@@ -249,7 +315,8 @@ int main(int argc, char **argv) {
 	}
 	std::cout << "run compaction: " << (compact_nodes ? "on" : "off") << "\n";
 	for (const auto &file : files) {
-		stats_testcase(file, parse_testcase(file), compact_nodes);
+		stats_testcase(file, parse_testcase(file), compact_nodes,
+		               plot_weight_dist);
 	}
 	return 0;
 }

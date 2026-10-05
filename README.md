@@ -133,7 +133,8 @@ argument when no explicit model is supplied).
 The constructor enforces the structural precondition behind the
 argmin-staircase composition used by `DistMatrix::min_plus_product`
 (non-crossing shortest paths in the edit-distance DAG): `match == 0`,
-nonnegative `ins`/`del` and `ins + del >= mismatch`; violating models
+positive `ins`/`del`, nonnegative `mismatch`, and
+`ins + del >= mismatch`; violating models
 throw `std::invalid_argument`.
 
 ```cpp
