@@ -206,38 +206,36 @@ private:
 
 	/** Computes one path's exact distance with buckets indexed by f-score. */
 	int score_path(const std::string &query, int k, std::size_t id) const {
-		const std::string &sequence = dict[id];
-		const std::size_t sequence_length = sequence.size();
-
-		if (sequence_length + k < query.size() || query.size() + k < sequence_length) {
+		const auto &path_index = search_paths[id];
+		const std::size_t sequence_length = path_index.seq_pos.back();
+		const long diag_delta = static_cast<long>(query.size()) - 
+			static_cast<long>(sequence_length);
+		if (std::abs(diag_delta) > k) {
 			return DistMatrix::INF;
 		}
 
-		const auto &path_index = search_paths[id];
+		const long max_shift = (k - std::abs(diag_delta)) / 2;
+		const long min_diag = std::min(0L, diag_delta) - max_shift;
+		const long max_diag = std::max(0L, diag_delta) + max_shift;
+
 		const std::size_t state_count = path_index.label_pos.size();
-		const std::size_t width = static_cast<std::size_t>(k) * 2 + 1;
+		const std::size_t width = max_diag - min_diag + 1;
 		std::vector<int> best(state_count * width, DistMatrix::INF);
 
 		// A net diagonal change requires at least this many indels. Using the
 		// minimum indel cost makes the lower bound consistent for either sign.
-		const int goal_diagonal = static_cast<int>(query.size()) -
-		    static_cast<int>(sequence_length);
-		const int MIN_INDEL_COST = std::min(cost.ins(), cost.del());
 		std::vector<std::vector<SearchState>> buckets(
 		    static_cast<std::size_t>(k) + 1);
 
 		auto relax = [&](std::size_t offset, int diagonal, int candidate) {
-			if (candidate > k || std::abs(diagonal) > static_cast<long>(k))
-				return;
 			const std::size_t query_pos = diagonal + path_index.seq_pos[offset];
 			if (query_pos < 0 || query_pos > query.size())
 				return;
-			const int delta = std::abs(diagonal - goal_diagonal);
-			const int heuristic = static_cast<int>(delta * MIN_INDEL_COST);
-			const int f_score = candidate + heuristic;
+			const int delta = std::abs(diagonal - static_cast<int>(diag_delta));
+			const int f_score = candidate + delta;
 			if (f_score > k)
 				return;
-			const std::size_t d = diagonal + k;
+			const std::size_t d = diagonal - min_diag;
 			int &known = best[offset * width + d];
 			if (candidate < known) {
 				known = candidate;
@@ -259,7 +257,7 @@ private:
 				const std::size_t label_pos = path_index.label_pos[offset];
 				const std::size_t step_len = path_index.step_len[offset];
 
-				const int diagonal = static_cast<int>(diagonal_index) - k;
+				const int diagonal = static_cast<int>(diagonal_index + min_diag);
 				const std::size_t query_pos = diagonal + seq_pos;
 
 				if (query_pos == query.size() && offset == state_count - 1)
@@ -277,8 +275,10 @@ private:
 					std::vector<int> row;
 					std::pair<std::size_t, std::size_t> range;
 					const std::size_t label_shift = next_seq_pos - seq_pos;
-					lifter.jump_point(node, step_len, query_pos, distance,
-					    label_shift, row, range);
+					lifter.jump_point(
+						node, step_len, query_pos, distance,
+						diag_delta - diagonal, label_shift, row, range
+					);
 					for (std::size_t i = 0; i < row.size(); ++i) {
 						const int output_diagonal =
 						    static_cast<int>(range.first + i) -

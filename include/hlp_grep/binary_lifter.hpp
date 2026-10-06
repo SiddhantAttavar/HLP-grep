@@ -310,22 +310,23 @@ public:
 	 * @return The node reached by the block.
 	 */
 	node_id jump_point(node_id u, int l, std::size_t source_pos,
-	                   int source_cost, std::size_t label_shift,
-	                   std::vector<int> &row,
-	                   std::pair<std::size_t, std::size_t> &pos_range) const {
+					int source_cost, int diag_delta, 
+					std::size_t label_shift, std::vector<int> &row,
+					std::pair<std::size_t, std::size_t> &pos_range) const {
 		const std::size_t level = 63 - __builtin_clzll(l);
 		const DistMatrix &mat = up_mat[u][level];
 		const node_id v = *up[u][level];
 
-		const std::size_t target_pos = source_pos + label_shift;
-		assert(source_pos < mat.row_range().second);
 		const auto [col_lo, col_hi] = mat.col_range();
+		const std::size_t target_pos = source_pos + label_shift;
+		const std::size_t shifted_target_pos = std::max(0L, static_cast<long>(target_pos + diag_delta));
+		const long max_shift = (k - source_cost - std::abs(diag_delta)) / 2;
 		const std::size_t lo = std::max(static_cast<long>(col_lo),
-			  static_cast<long>(target_pos) - k);
-		const std::size_t hi = std::max(lo, std::min(col_hi, target_pos + k + 1));
+			  static_cast<long>(std::min(shifted_target_pos, target_pos)) - max_shift);
+		const std::size_t hi = std::min(col_hi, std::max(shifted_target_pos, target_pos) + max_shift + 1);
 
-		row.resize(hi - lo);
 		const std::size_t matrix_row = source_pos - mat.row_range().first;
+		row.resize(hi - lo);
 		for (std::size_t b = lo; b < hi; ++b) {
 			row[b - lo] = source_cost + mat(matrix_row, b - col_lo);
 		}
