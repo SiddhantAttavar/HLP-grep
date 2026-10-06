@@ -271,28 +271,71 @@ private:
 
 				const std::size_t next_offset = offset + 1;
 				const std::size_t next_seq_pos = path_index.seq_pos[next_offset];
-				if (step_len > 0) {
-					std::vector<int> row;
-					std::pair<std::size_t, std::size_t> range;
-					const std::size_t label_shift = next_seq_pos - seq_pos;
-					lifter.jump_point(
-						node, step_len, query_pos, distance,
-						diag_delta - diagonal, label_shift, row, range
-					);
-					for (std::size_t i = 0; i < row.size(); ++i) {
-						const int output_diagonal =
-						    static_cast<int>(range.first + i) -
-						    static_cast<int>(next_seq_pos);
-						relax(next_offset, output_diagonal, row[i]);
-					}
-				}
-				else {
+				if (step_len == 0) {
 					relax(next_offset, diagonal - 1, distance + cost.del());
 					if (query_pos < query.size()) {
 						const int consume_cost =
 							cost.consume(graph.seq(node)[label_pos], query[query_pos]);
 						relax(next_offset, diagonal, distance + consume_cost);
 					}
+					continue;
+				}
+
+				if (diagonal > min_diag && distance - cost.ins() ==
+					best[offset * width + diagonal_index - 1]) {
+					continue;
+				}
+
+				const std::size_t label_shift = next_seq_pos - seq_pos;
+				if (diagonal < max_diag - 1 && distance - cost.ins() ==
+					best[offset * width + diagonal_index + 1]) {
+					relax(next_offset, diagonal - static_cast<int>(label_shift),
+						static_cast<int>(distance + label_shift));
+					continue;
+				}
+
+				// lifter.jump_point(
+				// 	node, step_len, query_pos, distance,
+				// 	diag_delta - diagonal, label_shift, row, range
+				// );
+
+				const DistMatrix &mat = lifter.jump_mat(node, step_len);
+
+				const auto [col_lo, col_hi] = mat.col_range();
+				const std::size_t target_pos = query_pos + label_shift;
+				const int curr_delta = static_cast<int>(diag_delta) - diagonal;
+				const std::size_t shifted_target_pos = 
+					std::max(0L, static_cast<long>(target_pos + curr_delta));
+				const long max_shift = (k - distance - std::abs(curr_delta)) / 2;
+				const std::size_t lo = std::max(static_cast<long>(col_lo),
+					static_cast<long>(std::min(shifted_target_pos, target_pos)) -
+					max_shift);
+				const std::size_t hi = std::min(col_hi,
+					std::max(shifted_target_pos, target_pos) + max_shift + 1);
+
+				bool change = false;
+				const std::size_t matrix_row = query_pos - mat.row_range().first;
+				int output_diagonal = static_cast<int>(lo) - 
+					static_cast<int>(next_seq_pos);
+				for (std::size_t b = lo; b < hi; ++b) {
+					int next_distance = distance + mat(matrix_row, b - col_lo);
+					const int delta = std::abs(output_diagonal -
+						 static_cast<int>(diag_delta));
+					const int f_score = next_distance + delta;
+					if (f_score <= k) {
+						const std::size_t d = output_diagonal - min_diag;
+						int &known = best[next_offset * width + d];
+						if (next_distance < known) {
+							known = next_distance;
+							buckets[static_cast<std::size_t>(f_score)].push_back(
+								{next_offset, d, next_distance});
+							change = true;
+						}
+						else if (change) {
+							break;
+						}
+					}
+					output_diagonal++;
 				}
 			}
 		}
@@ -362,6 +405,10 @@ private:
 				const auto &step = cp.steps[step_index];
 				if (step.type == POAGraph::EdgeType::LIGHT) {
 					current_node = step.next;
+					append_light();
+				}
+				else if (step.label_shift == 1) {
+					current_node = *graph.node(current_node).heavy_neighbour;
 					append_light();
 				}
 				else {

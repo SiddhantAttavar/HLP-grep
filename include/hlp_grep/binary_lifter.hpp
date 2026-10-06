@@ -291,6 +291,11 @@ public:
 		return *up[u][level];
 	}
 
+	const DistMatrix& jump_mat(node_id u, int l) const {
+		const std::size_t level = 63 - __builtin_clzll(l);
+		return up_mat[u][level];
+	}
+
 	/**
 	 * @brief Applies one source cell of a heavy-chain matrix directly.
 	 *
