@@ -948,11 +948,18 @@ int main(int argc, char **argv) {
 #endif
 
 	std::vector<MethodRun> runs;
+	std::vector<std::string> failed_methods;
 	for (const auto &method : method_names) {
 		auto run = measure_method(method, tc, compact_nodes, index_file);
-		if (!run)
-			return 1;
+		if (!run) {
+			failed_methods.push_back(method);
+			continue;
+		}
 		runs.push_back(std::move(*run));
+	}
+	if (runs.empty()) {
+		std::cerr << "no benchmark methods completed successfully\n";
+		return 1;
 	}
 
 	// Dictionary and query lengths, reported alongside the timings.
@@ -995,7 +1002,11 @@ int main(int argc, char **argv) {
 		json << (i ? ", " : "") << query_lens[i];
 	json << "],\n";
 
-	json << "  \"methods\": [\n";
+	json << "  \"failed_methods\": [";
+	for (std::size_t i = 0; i < failed_methods.size(); ++i)
+		json << (i ? ", " : "") << "\"" << failed_methods[i] << "\"";
+	json << "],\n"
+	     << "  \"methods\": [\n";
 	for (std::size_t m = 0; m < runs.size(); ++m) {
 		const auto &r = runs[m];
 		json << "    {\n"
@@ -1034,5 +1045,5 @@ int main(int argc, char **argv) {
 	for (std::size_t m = 0; m < runs.size(); ++m)
 		std::cout << (m ? "," : "") << runs[m].name;
 	std::cout << ")\n";
-	return 0;
+	return failed_methods.empty() ? 0 : 1;
 }

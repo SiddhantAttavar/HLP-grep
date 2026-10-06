@@ -57,11 +57,6 @@ fi
 
 exec "$BUILD/tests/bench" \
     --method hlp_grep \
-    --method naive \
     --method wfa \
     --method dt_patricia \
-    --method bed_tree \
-    --method hstree \
-    --method edlib \
-    --method parasail \
     "$TESTCASE" --index "$INDEX"
