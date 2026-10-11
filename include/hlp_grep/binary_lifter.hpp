@@ -13,6 +13,8 @@
 #pragma once
 #include <hlp_grep/dist_matrix.hpp>
 #include <hlp_grep/poa_graph.hpp>
+#include <hlp_grep/query.hpp>
+#include <hlp_grep/transition.hpp>
 
 #include <omp.h>
 
@@ -20,7 +22,9 @@
 #include <cassert>
 #include <cstddef>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -106,9 +110,7 @@ public:
 	 * @param paths Compressed paths, one per dictionary sequence; modified
 	 *              in place to split heavy runs into jump blocks.
 	 */
-	void decompose(std::vector<POAGraph::CompressedPath> &paths) {
-		const std::size_t n = graph.num_nodes();
-		touched.assign(n, std::vector<char>(max_level, 0));
+	void decompose(std::vector<POAGraph::CompressedPath> &paths) const {
 		for (auto &cp : paths) {
 			node_id cur = cp.start;
 			std::vector<POAGraph::CompressedEdge> decomposed;
@@ -129,7 +131,6 @@ public:
 						block_step.type = POAGraph::EdgeType::HEAVY;
 						block_step.length = static_cast<int>(block);
 						decomposed.push_back(block_step);
-						touched[cur][level] = true;
 						cur = *up[cur][level];
 						rem -= block;
 					}
@@ -139,6 +140,32 @@ public:
 				}
 			}
 			cp.steps = std::move(decomposed);
+		}
+	}
+
+	/** Marks the dependency closure for the selected compressed paths. */
+	std::vector<std::vector<std::size_t>> mark(
+	    const std::vector<POAGraph::CompressedPath> &paths,
+	    const std::vector<std::size_t> &path_ids) {
+		const std::size_t n = graph.num_nodes();
+		std::vector<std::vector<char>> touched(n,
+	                                      std::vector<char>(max_level, 0));
+		for (std::size_t id : path_ids) {
+			if (id >= paths.size())
+				throw std::out_of_range(
+				    "BinaryLifter::mark: path id out of range");
+			const auto &cp = paths[id];
+			node_id cur = cp.start;
+			for (const auto &st : cp.steps) {
+				if (st.type == POAGraph::EdgeType::HEAVY) {
+					const std::size_t level =
+					    static_cast<std::size_t>(__builtin_ctzll(st.length));
+					touched[cur][level] = true;
+					cur = *up[cur][level];
+				} else {
+					cur = st.next;
+				}
+			}
 		}
 		// Dependency closure: (u, t) needs (u, t - 1) and its chain
 		// midpoint's (t - 1) block. One sweep per level from the top
@@ -151,7 +178,7 @@ public:
 				}
 		}
 		// Per-level build lists (ascending node order).
-		build_nodes.assign(max_level, {});
+		std::vector<std::vector<std::size_t>> build_nodes(max_level);
 		for (std::size_t t = 0; t < max_level; ++t) {
 			for (std::size_t u = 0; u < n; ++u)
 				if (touched[u][t])
@@ -163,6 +190,7 @@ public:
 		// the top of that prefix. build() then fills the slots in
 		// place, and build() may not run without decompose().
 		up_mat.assign(n, {});
+		up_transitions.assign(n, {});
 		for (std::size_t u = 0; u < n; ++u) {
 			std::size_t last = 0;
 			for (std::size_t t = max_level; t-- > 0;)
@@ -171,7 +199,9 @@ public:
 					break;
 				}
 			up_mat[u].resize(last, DistMatrix(0, 0));
+			up_transitions[u].resize(last);
 		}
+		return build_nodes;
 	}
 
 	/**
@@ -189,14 +219,21 @@ public:
 	 * @param query Query string the chain distance tables index into.
 	 * @param k     Edit distance threshold widening the windows.
 	 */
-	void build(const std::string &query, int k) {
+	template <typename T>
+	const std::vector<std::vector<T>> &build(
+	    const Query &query,
+	    const std::vector<std::vector<std::size_t>> &build_nodes) {
+		static_assert(std::is_same_v<T, DistMatrix> ||
+		              std::is_same_v<T, Transition>,
+		              "BinaryLifter::build supports DistMatrix or Transition");
+		auto &table = table_for<T>();
 		// The per-node blocks are one task each with uniform cost; past
 		// ~8 threads barrier and spawn overhead dominates the level loop.
 		const int threads = static_cast<int>(
 		    num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
 		                     : num_threads);
-		this->query = query;
-		this->k = k;
+		this->query = query.sequence;
+		this->k = query.k;
 #pragma omp parallel num_threads(threads)
 		{
 			for (std::size_t t = 0; t < max_level; ++t) {
@@ -205,15 +242,13 @@ public:
 				     idx < build_nodes[t].size(); ++idx) {
 					const std::size_t u = build_nodes[t][idx];
 					if (t == 0)
-						up_mat[u][0] =
-						    edge_matrix(u, *up[u][0]);
+						table[u][0] = T(u, *up[u][0], graph, query);
 					else {
 						const std::size_t v =
 						    *up[u][t - 1];
-						up_mat[u][t] =
-						    DistMatrix::min_plus_product(
-						        up_mat[u][t - 1],
-						        up_mat[v][t - 1]);
+						table[u][t] = T::compose(
+						    table[u][t - 1], table[v][t - 1],
+						    graph, u, query);
 					}
 				}
 				// The for's implicit barrier separates
@@ -221,6 +256,22 @@ public:
 				// read by the next one).
 			}
 		}
+		return table;
+	}
+
+	/**
+	 * @brief Returns the node reached after l heavy edges from u.
+	 *
+	 * @pre u is valid, l is a positive power of two, and the block exists.
+	 */
+	node_id jump_node(node_id u, int l) const {
+		assert(u < up.size());
+		assert(l > 0);
+		const std::size_t block = static_cast<std::size_t>(l);
+		assert((block & (block - 1)) == 0);
+		const std::size_t level = 63 - __builtin_clzll(block);
+		assert(level < max_level && up[u][level].has_value());
+		return *up[u][level];
 	}
 
 	/**
@@ -261,13 +312,12 @@ public:
 		const std::size_t block = static_cast<std::size_t>(l);
 		assert((block & (block - 1)) == 0);
 		const std::size_t level = 63 - __builtin_clzll(block);
-		assert(level < max_level && up[u][level].has_value());
+		const node_id v = jump_node(u, l);
 		assert(level < up_mat[u].size() &&
 		       up_mat[u][level].num_cols() > 0);
 		const DistMatrix &mat = up_mat[u][level];
 		std::vector<int> row =
 		    mat.min_plus_apply(cost, pos_range);
-		const node_id v = *up[u][level];
 		pos_range = mat.col_range();
 		assert(pos_range == window(v));
 		clip_row(row, pos_range);
@@ -318,78 +368,41 @@ public:
 	 */
 	void step(node_id u, node_id v, std::vector<int> &cost,
 	          std::pair<std::size_t, std::size_t> &pos_range) const {
-		const std::string &label = graph.seq(v);
-		const std::size_t label_len = label.size();
+		const char c = graph.seq(v);
 		const std::size_t m = query.size();
-		if (label_len == 1) {
-			auto [s_lo, s_hi] = pos_range;
-			if (s_hi <= m) {
-				s_hi++;
-				cost.push_back(DistMatrix::INF);
-			}
-			const int del_c = cost_model.del();
-			const char c = label[0];
-			int cur = cost[0] + del_c;
-			int diag = cost[0], left = cur;
-			cost[0] = cur;
-			const bool first = cur > k;
-			for (long b = s_lo + 1; b < s_hi; ++b) {
-				const int up = cost[b - s_lo];
-				cur = std::min(up + del_c, left + cost_model.ins());
-				cur = std::min(cur,
-				   diag + cost_model.consume(c, query[b - 1]));
-				cost[b - s_lo - first] = cur;
-				left = cur;
-				diag = up;
-			}
-			if (first) {
-				s_lo++;
-				cost.pop_back();
-			}
-			pos_range = {s_lo, s_hi};
-			clip_row(cost, pos_range);
-			return;
+		auto [s_lo, s_hi] = pos_range;
+		if (s_hi <= m) {
+			s_hi++;
+			cost.push_back(DistMatrix::INF);
 		}
-
-		const auto [s_lo, s_hi] = pos_range;
-
-		const long hL = std::min(m + 1, s_hi + label_len);
-		cost.resize(static_cast<std::size_t>(hL - s_lo),
-			  DistMatrix::INF);
-		long li = s_lo;
-		for (long i = 1; i <= label_len; ++i) {
-			const long hi_i = std::min(hL, static_cast<long>(s_hi + i));
-			const char c = label[i - 1];
-			const int del_c = cost_model.del();
-			int cur = cost[li - s_lo] + del_c;
-			int diag = cost[li - s_lo], left = cur;
-			cost[li - s_lo] = cur;
-			for (long b = li + 1; b < hi_i; ++b) {
-				const int up = cost[b - s_lo]; // f[i - 1][b]
-				cur = std::min(up + del_c, left + cost_model.ins());
-				cur = std::min(cur, diag + cost_model.consume(c, query[b - 1]));
-				cost[b - s_lo] = cur;
-				left = cur;
-				diag = up;
-			}
-			while (li < hL && cost[li - s_lo] > k) {
-				li++;
-			}
-			if (li >= hL) {
-				cost.clear();
-				pos_range = {hL, hL};
-				return;
-			}
+		const int del_c = cost_model.del();
+		int cur = cost[0] + del_c;
+		int diag = cost[0], left = cur;
+		cost[0] = cur;
+		const bool first = cur > k;
+		for (long b = s_lo + 1; b < s_hi; ++b) {
+			const int up = cost[b - s_lo];
+			cur = std::min(up + del_c, left + cost_model.ins());
+			cur = std::min(cur, diag + cost_model.consume(c, query[b - 1]));
+			cost[b - s_lo - first] = cur;
+			left = cur;
+			diag = up;
 		}
-		std::move(cost.begin() + (li - s_lo), cost.end(), cost.begin());
-		cost.resize(hL - li);
-		pos_range = {li, hL};
+		if (first) {
+			s_lo++;
+			cost.pop_back();
+		}
+		pos_range = {s_lo, s_hi};
 		clip_row(cost, pos_range);
 	}
 
 	/** Half-open query-position window represented by a node's DP row. */
 	std::pair<std::size_t, std::size_t> window(node_id u) const {
-		const auto [lo, hi] = window(u, graph.seq(u).size());
+		const auto [jmin, jmax] = graph.pos_range(u);
+		const std::size_t mk = static_cast<std::size_t>(k);
+		const std::size_t m = query.size();
+		const std::size_t lo = jmin + 1 >= mk ? jmin + 1 - mk : 0;
+		const std::size_t hi = std::min(m + 1, jmax + mk + 2);
 		return {lo, std::max(hi, lo + 1)};
 	}
 
@@ -420,6 +433,14 @@ public:
 	}
 
 private:
+	template <typename T>
+	auto &table_for() {
+		if constexpr (std::is_same_v<T, DistMatrix>)
+			return up_mat;
+		else
+			return up_transitions;
+	}
+
 	/** Debug-only check that a row matches a subrange of a node window. */
 	void assert_row(
 	    node_id u, const std::vector<int> &row,
@@ -455,101 +476,6 @@ private:
 	 * INF cells (b < a, seeds below the entry band, band-infeasible
 	 * states) being unreachable constants of that DAG.
 	 */
-	DistMatrix edge_matrix(node_id u, node_id v) const {
-		const auto [lo_u, hi_u] = window(u);
-		const auto [lo_v, hi_v] = window(v);
-		const std::string &label = graph.seq(v);
-		DistMatrix mat(static_cast<std::size_t>(hi_u - lo_u),
-		               static_cast<std::size_t>(hi_v - lo_v), DistMatrix::INF,
-		               {lo_u, hi_u}, {lo_v, hi_v});
-		const auto [lL, hL] = window(v, label.size());
-		if (lL >= hL)
-			return mat; // final band empty: every crossing exceeds k
-		const auto [l0, h0] = window(v, 0);
-		const std::size_t label_len = label.size();
-		const std::size_t m = query.size();
-		const std::size_t end = std::min(hi_u, hL);
-		if (label_len == 1) {
-			const char c = label[0];
-			for (std::size_t a = std::max(lo_u, l0); a < end; ++a) {
-				if (a >= lo_v)
-					mat(a - lo_u, a - lo_v) = cost_model.del();
-				int cur = 0, sub = cost_model.mismatch;
-				std::size_t b_max = std::min(hi_v, a + k + 2);
-				for (std::size_t b = a + 1; b < b_max; ++b) {
-					if (query[b - 1] == c)
-						sub = cost_model.match;
-					if (b >= lo_v)
-						mat(a - lo_u, b - lo_v) = cur + sub;
-					cur += cost_model.ins();
-				}
-			}
-			return mat;
-		}
-		// DP row over [l0, hL); band j of the label occupies
-		// window(v, j), and row L's band is exactly [lo_v, hi_v).
-		std::vector<long> f(hL - l0);
-		for (long a = std::max(lo_u, l0); a < end; ++a) {
-			std::fill(f.begin(), f.end(), DistMatrix::INF);
-			// Row 0: seed at a, chain insertions within the entry band.
-			f[a - l0] = 0;
-			for (std::size_t b = a + 1; b < h0; ++b)
-				f[b - l0] = f[b - l0 - 1] + cost_model.ins();
-			for (long i = 1; i <= label_len; ++i) {
-				const long li = std::max(a, static_cast<long>(l0) + i - k);
-				const long hi_i = std::min(hL, h0 + i);
-				if (li >= hi_i) {
-					std::fill(f.begin(), f.end(), DistMatrix::INF);
-					break;
-				}
-				const char c = label[i - 1];
-				const int del_c = cost_model.del();
-				long cur = f[li - l0] + del_c;
-				if (li > static_cast<long>(l0)) {
-					cur = std::min(cur,
-						f[li - l0 - 1] + cost_model.consume(c, query[li - 1]));
-				}
-				long diag = f[li - l0], left = cur;
-				f[li - l0] = cur;
-				for (long b = li + 1; b < hi_i; ++b) {
-					const long up = f[b - l0]; // f[i - 1][b]
-					cur = std::min(up + del_c, left + cost_model.ins());
-					cur = std::min(cur, diag + cost_model.consume(c, query[b - 1]));
-					f[b - l0] = cur;
-					left = cur;
-					diag = up;
-				}
-			}
-			for (long b = std::max(a, static_cast<long>(lo_v)); b < hL; ++b)
-				mat(a - lo_u, b - lo_v) = static_cast<int>(f[b - l0]);
-		}
-		return mat;
-	}
-
-	/**
-	 * @brief Half-open [lo, hi) band of query positions feasible at the
-	 *        state @p offset label characters into u's label (offset 0 =
-	 *        before the label, |label| = after it): the node occurs at
-	 *        path offsets j_min + offset .. j_max + offset (bases
-	 *        consumed up to that state), and any alignment of cost <= k
-	 *        satisfies |b - consumed| <= k, so the band is
-	 *        [j_min + offset - k, j_max + offset + k + 1) clamped to
-	 *        [0, |query|]. Width spread + 2k + 1, independent of the
-	 *        label length — sweeping each label character over its own
-	 *        band keeps the DP linear in |label| times the window width.
-	 *        The band may be empty (label running past |query|); the
-	 *        bands of consecutive offsets overlap so that transitions
-	 *        between them stay covered.
-	 */
-	std::pair<std::size_t, std::size_t> window(node_id u, std::size_t offset) const {
-		const auto [jmin, jmax] = graph.pos_range(u);
-		const std::size_t mk = static_cast<std::size_t>(k);
-		const std::size_t m = query.size();
-		const std::size_t lo = jmin + offset >= mk ? jmin + offset - mk : 0;
-		const std::size_t hi = std::min(m + 1, jmax + offset + mk + 1);
-		return {lo, hi};
-	}
-
 	/// Graph the lifter was built from; its heavy edges must not be
 	/// modified while this object is alive.
 	const POAGraph &graph;
@@ -573,11 +499,8 @@ private:
 	/// slots stay empty. decompose() sizes each node's vector to the top of
 	/// its touched prefix, so build() fills slots in place.
 	std::vector<std::vector<DistMatrix>> up_mat;
-	/// touched[u][t] (mark-time) flags chain blocks the dry run marked;
-	/// consumed into the per-level build lists by decompose().
-	std::vector<std::vector<char>> touched;
-	/// Per-level (ascending node order) list of blocks build() builds.
-	std::vector<std::vector<std::size_t>> build_nodes;
+	/// Query-specific hash/mismatch summaries for heavy blocks.
+	std::vector<std::vector<Transition>> up_transitions;
 };
 
 } // namespace hlp_grep

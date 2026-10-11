@@ -329,7 +329,7 @@ void run_method(int fd, const std::string &method, const Testcase &tc,
 	if (method == "hlp_grep") {
 		if (index_file.empty()) {
 			const auto build_b = std::chrono::steady_clock::now();
-			const Solver solver(tc.dict, tc.cost, compact_nodes);
+			const Solver solver(tc.dict, tc.cost);
 			const auto build_e = std::chrono::steady_clock::now();
 			write_all(fd, "BUILD " + std::to_string(elapsed_ms(build_b, build_e)) +
 			                  "\n");

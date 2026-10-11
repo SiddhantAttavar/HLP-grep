@@ -66,7 +66,7 @@ std::string dot_escape(const std::string &s) {
 
 void emit_graph(const fs::path &file, const Testcase &tc,
                 const Options &opt) {
-	const POAGraph graph(tc.dict, tc.cost, opt.compact);
+	const POAGraph graph(tc.dict, tc.cost);
 	for (const std::size_t seq : opt.paths)
 		if (seq >= graph.num_sequences()) {
 			std::cerr << "--path " << seq << " out of range for " << file
@@ -105,7 +105,7 @@ void emit_graph(const fs::path &file, const Testcase &tc,
 
 	for (POAGraph::node_id u = 0; u < graph.num_nodes(); ++u) {
 		std::string label =
-		    std::to_string(u) + ":" + dot_escape(graph.seq(u));
+		    std::to_string(u) + ":" + dot_escape(std::string(1, graph.seq(u)));
 		if (opt.pos_ranges) {
 			const auto [lo, hi] = graph.pos_range(u);
 			label += "\\n";

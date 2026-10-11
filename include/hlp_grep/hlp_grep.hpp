@@ -13,7 +13,9 @@
 #include <hlp_grep/cost_model.hpp>
 #include <hlp_grep/dist_matrix.hpp>
 #include <hlp_grep/poa_graph.hpp>
+#include <hlp_grep/query.hpp>
 #include <hlp_grep/result.hpp>
+#include <hlp_grep/transition.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -48,18 +50,15 @@ public:
 	 * @param cost Cost model defining the costs of the basic edit operations;
 	 *             defaults to the unit-cost model. The referenced model must
 	 *             outlive the solver.
-	 * @param compact_nodes Whether to merge single-in/single-out node runs
-	 *             into multi-character nodes after graph construction.
 	 * @param num_threads Worker threads for per-query chain-table building
 	 *             and path scoring; 0 means use the OpenMP maximum for scoring
 	 *             (the chain-table build caps automatic parallelism at 8).
 	 */
 	explicit Solver(std::vector<std::string> dict,
 	                const CostModel &cost = DEFAULT_COST_MODEL,
-	                bool compact_nodes = true,
 	                std::size_t num_threads = 0)
 	    : dict(std::move(dict)), cost(cost), num_threads(num_threads),
-	      graph(this->dict, this->cost, compact_nodes),
+	      graph(this->dict, this->cost),
 	      lifter(this->graph, num_threads) {
 		initialize_paths();
 	}
@@ -127,13 +126,44 @@ public:
 	std::vector<Result> query(const std::string &query, int k) const {
 		if (dict.empty())
 			return {};
-		const std::vector<std::size_t> eligible = eligible_paths(query.size(), k);
+		std::vector<std::size_t> eligible = eligible_paths(query.size(), k);
+		const Query query_context(query, k);
+		const auto transition_build_nodes = lifter.mark(compressed_paths, eligible);
+		const auto &transitions =
+		    lifter.build<Transition>(query_context, transition_build_nodes);
+		eligible.erase(std::remove_if(eligible.begin(), eligible.end(),
+		    [&](std::size_t id) {
+			    return filtered(id, transitions, k);
+		    }),
+		    eligible.end());
+		const auto distance_build_nodes = lifter.mark(compressed_paths, eligible);
 		if (!eligible.empty())
-			lifter.build(query, k);
-		return score_paths(query, k, eligible);
+			lifter.build<DistMatrix>(query_context, distance_build_nodes);
+		return score_paths(query, k, eligible, compressed_paths);
 	}
 
-private:
+	private:
+	bool filtered(std::size_t id,
+	              const std::vector<std::vector<Transition>> &transitions,
+	              int threshold) const {
+		int mismatches = 0;
+		const auto &cp = compressed_paths[id];
+		POAGraph::node_id cur = cp.start;
+		for (const auto &step : cp.steps) {
+			if (step.type == POAGraph::EdgeType::HEAVY) {
+				const std::size_t level =
+				    static_cast<std::size_t>(__builtin_ctzll(step.length));
+				mismatches += transitions[cur][level].mismatches;
+				if (mismatches > threshold)
+					return true;
+				cur = lifter.jump_node(cur, step.length);
+			} else {
+				cur = step.next;
+			}
+		}
+		return false;
+	}
+
 	/** Builds solver state around an already-built graph (load path). */
 	explicit Solver(POAGraph graph, const CostModel &cost,
 	                std::size_t num_threads)
@@ -229,7 +259,8 @@ private:
 	/** Scores contiguous batches in parallel, preserving prefix sharing per batch. */
 	std::vector<Result> score_paths(
 	    const std::string &query, int k,
-	    const std::vector<std::size_t> &eligible) const {
+	    const std::vector<std::size_t> &eligible,
+	    const std::vector<POAGraph::CompressedPath> &paths) const {
 		std::vector<int> dist(dict.size(), DistMatrix::INF);
 		if (!eligible.empty()) {
 			const std::size_t thread_count = static_cast<std::size_t>(
@@ -247,7 +278,7 @@ private:
 				    batch * batch_size + std::min(batch, larger_batches);
 				const std::size_t end =
 				    begin + batch_size + (batch < larger_batches ? 1 : 0);
-				score_batch(query, k, eligible, begin, end, dist);
+				score_batch(query, k, eligible, paths, begin, end, dist);
 			}
 		}
 
@@ -257,6 +288,7 @@ private:
 	/** Scores one contiguous range, sharing DP states only within the batch. */
 	void score_batch(const std::string &query, int k,
 	                 const std::vector<std::size_t> &eligible,
+	                 const std::vector<POAGraph::CompressedPath> &paths,
 	                 std::size_t begin, std::size_t end,
 	                 std::vector<int> &dist) const {
 		std::vector<QueryState> stack;
@@ -264,7 +296,7 @@ private:
 
 		for (std::size_t i = begin; i < end; ++i) {
 			const std::size_t id = eligible[i];
-			const auto &cp = compressed_paths[id];
+			const auto &cp = paths[id];
 			std::size_t common =
 			    previous ? common_prefix_states(*previous, cp) : 0;
 			// An earlier path may have stopped after its row became
@@ -357,12 +389,8 @@ private:
 	                         const std::string &query, int k) const {
 		const long m = static_cast<long>(query.size());
 		const long mk = static_cast<long>(k);
-		const std::string &label = graph.seq(start);
-		const long label_len = static_cast<long>(label.size());
-		const long lo = std::max(0L, label_len - mk);
-		const long hL = std::min(m + 1, label_len + mk + 1);
-		// The label is longer than the query by more than k, so no band
-		// position carries a cost within k and the state has no row.
+		const long lo = std::max(0L, 1 - mk);
+		const long hL = std::min(m + 1, 1 + mk + 1);
 		if (lo >= hL)
 			return {start, {}, {static_cast<std::size_t>(lo),
 			                   static_cast<std::size_t>(lo)}};
@@ -373,40 +401,26 @@ private:
 		                 {static_cast<std::size_t>(lo),
 		                  static_cast<std::size_t>(hL)}};
 
-		// Semiglobal DP over (label prefix, query prefix): f[i][b] is the
-		// min cost of consuming the first i label characters against a
-		// query substring ending at b. Row 0 is the pure insertion prefix
-		// from the virtual source at position 0; each label character
-		// sweeps over its own band [max(0, i - k), min(m + 1, i + k + 1))
-		// — mirroring BinaryLifter::sweep_label — so the work stays
-		// O(|label| * k). Consecutive bands overlap, so every cell a band
-		// covers is reachable from the entry row: no entry saturates at
-		// INF.
-		std::vector<long> f(static_cast<std::size_t>(hL),
-		                    DistMatrix::INF);
+		std::vector<long> f(static_cast<std::size_t>(hL), DistMatrix::INF);
 		const long h0 = std::min(m + 1, mk + 1);
 		f[0] = 0;
 		for (long b = 1; b < h0; ++b)
 			f[b] = f[b - 1] + cost.ins();
-		for (long i = 1; i <= label_len; ++i) {
-			const long li = std::max(0L, i - mk);
-			const long hi_i = std::min(m + 1, i + mk + 1);
-			const char c = label[i - 1];
-			const int del_c = cost.del();
-			long cur = f[li] + del_c;
-			if (li > 0) {
-				cur = std::min(cur, f[li - 1] + cost.consume(c, query[li - 1]));
-			}
-			long diag = f[li], left = cur;
-			f[li] = cur;
-			for (long b = li + 1; b < hi_i; ++b) {
-				const long up = f[b]; // f[i - 1][b]
-				cur = std::min(up + del_c, left + cost.ins());
-				cur = std::min(cur, diag + cost.consume(c, query[b - 1]));
-				f[b] = cur;
-				left = cur;
-				diag = up;
-			}
+		const long li = std::max(0L, 1 - mk);
+		const long hi_i = std::min(m + 1, 1 + mk + 1);
+		const char c = graph.seq(start);
+		long cur = f[li] + cost.del();
+		if (li > 0)
+			cur = std::min(cur, f[li - 1] + cost.consume(c, query[li - 1]));
+		long diag = f[li], left = cur;
+		f[li] = cur;
+		for (long b = li + 1; b < hi_i; ++b) {
+			const long up = f[b];
+			cur = std::min(up + cost.del(), left + cost.ins());
+			cur = std::min(cur, diag + cost.consume(c, query[b - 1]));
+			f[b] = cur;
+			left = cur;
+			diag = up;
 		}
 		std::copy(f.begin() + lo, f.begin() + hL, state.row.begin());
 		lifter.clip_row(state.row, state.pos_range);

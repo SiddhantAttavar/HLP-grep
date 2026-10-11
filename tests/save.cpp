@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
 
 	const Testcase tc = parse_testcase(file);
 	try {
-		const Solver solver(tc.dict, tc.cost, compact_nodes);
+		const Solver solver(tc.dict, tc.cost);
 		solver.save_graph(out_path);
 	} catch (const std::exception &e) {
 		std::cerr << "save failed: " << e.what() << '\n';

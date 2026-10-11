@@ -185,7 +185,7 @@ void test_query_prefix_sharing() {
 	std::filesystem::remove(cache_file);
 
 	const CostModel weighted(2, 2, 0, 1);
-	const Solver weighted_solver({"AA"}, weighted, false);
+	const Solver weighted_solver({"AA"}, weighted);
 	const auto over_threshold = weighted_solver.query("AAAA", 2);
 	if (!over_threshold.empty()) {
 		std::cerr << "prefix-sharing: trailing clipped cells changed the query-end score\n";
@@ -202,7 +202,7 @@ void test_query_prefix_sharing() {
 
 void test_lifter_decompose() {
 	const std::vector<std::string> dict(4, "ACGTACGTACGT");
-	const POAGraph graph(dict, DEFAULT_COST_MODEL, false);
+	const POAGraph graph(dict, DEFAULT_COST_MODEL);
 	std::vector<POAGraph::CompressedPath> paths;
 	for (std::size_t i = 0; i < dict.size(); ++i)
 		paths.push_back(graph.compressed_path(i));
@@ -231,7 +231,11 @@ void test_clip_row_two_sided() {
 	BinaryLifter lifter(graph, 1);
 	std::vector<POAGraph::CompressedPath> paths{graph.compressed_path(0)};
 	lifter.decompose(paths);
-	lifter.build("ACGT", 1);
+	const std::vector<std::size_t> path_ids{0};
+	const auto build_nodes = lifter.mark(paths, path_ids);
+	const std::string query = "ACGT";
+	const Query query_data(query, 1);
+	lifter.build<DistMatrix>(query_data, build_nodes);
 
 	auto range = lifter.window(paths[0].start);
 	const auto original_range = range;

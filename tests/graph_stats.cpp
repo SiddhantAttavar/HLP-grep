@@ -59,7 +59,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 
 	const std::chrono::steady_clock::time_point start =
 	    std::chrono::steady_clock::now();
-	const POAGraph graph(tc.dict, tc.cost, compact_nodes);
+	const POAGraph graph(tc.dict, tc.cost);
 	const std::chrono::steady_clock::time_point end =
 	    std::chrono::steady_clock::now();
 
@@ -192,7 +192,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc,
 	          << " widest node " << wide_id << " := ["
 	          << wide_range.first << ", " << wide_range.second
 	          << ") label len "
-	          << graph.node(wide_id).seq.size() << "\n\n";
+	          << 1 << "\n\n";
 
 	// Per-query BinaryLifter: rebuilt per query, its chain tables scale
 	// with nodes * max_level * window width; time its construction.

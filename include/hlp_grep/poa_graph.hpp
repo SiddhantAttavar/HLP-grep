@@ -29,12 +29,10 @@ namespace hlp_grep {
 /**
  * @brief A POA (partial order alignment) graph of a sequence dictionary.
  *
- * Nodes represent aligned base runs, edges are classified heavy/light by
- * visiting frequencies, and each dictionary sequence is represented
- * as a path through the graph. After construction, maximal runs of
- * single-in/single-out nodes are compacted into single multi-character
- * nodes (see compact_chain_nodes()); paths are stored over the compacted
- * nodes. The DAG is kept in a topological order maintained by the graph.
+ * Every node represents exactly one character. Edges are classified
+ * heavy/light by visiting frequencies, and each dictionary sequence is
+ * represented as a path through the graph. The DAG is kept in a topological
+ * order maintained by the graph.
  */
 class POAGraph {
 public:
@@ -72,17 +70,15 @@ public:
 	};
 
 	/**
-	 * @brief A node of the graph: the base-run string it represents and
+	 * @brief A node of the graph: the character it represents and
 	 *        the range of offsets at which it occurs among the sequence
 	 *        paths passing through it (j_min / j_max, counting bases
 	 *        consumed before the label starts). Offsets use
 	 *        START as a "never on a path" sentinel.
 	 */
 	struct Node {
-		/// String of bases represented by this node (a single base for
-		/// nodes that survived compaction unmerged; the concatenation of
-		/// a merged run otherwise).
-		std::string seq;
+		/// Single-character label represented by this node.
+		char seq = '\0';
 		std::size_t pos_min = 0;  ///< Min bases consumed before the label.
 		std::size_t pos_max = 0;  ///< Max bases consumed before the label.
 		/// Destination node of the heaviest outgoing edge, or empty if the
@@ -118,10 +114,9 @@ public:
 	 *             must outlive the graph.
 	 */
 	explicit POAGraph(const std::vector<std::string> &dict,
-	                  const CostModel &cost = DEFAULT_COST_MODEL,
-	                  bool compact_nodes = true)
+	                  const CostModel &cost = DEFAULT_COST_MODEL)
 	    : cost(cost) {
-		build(dict, compact_nodes);
+		build(dict);
 	}
 
 	/** Writes the complete finalized graph in a versioned binary format. */
@@ -135,7 +130,7 @@ public:
 		write_u64(out, static_cast<std::uint64_t>(cost.mismatch));
 		write_u64(out, nodes.size());
 		for (const Node &n : nodes) {
-			write_string(out, n.seq);
+			write_string(out, std::string(1, n.seq));
 			write_u64(out, n.pos_min);
 			write_u64(out, n.pos_max);
 			write_u64(out, n.heavy_neighbour ? *n.heavy_neighbour : START);
@@ -179,7 +174,7 @@ public:
 		graph.nodes.reserve(n);
 		for (std::size_t i = 0; i < n; ++i) {
 			Node node;
-			node.seq = read_string(in);
+			const std::string label = read_string(in);
 			node.pos_min = read_u64(in);
 			node.pos_max = read_u64(in);
 			const auto heavy = read_u64(in);
@@ -189,8 +184,12 @@ public:
 				node.heavy_neighbour = static_cast<node_id>(heavy);
 			}
 			node.heavy_length = read_u64(in);
-			if (node.seq.empty())
+			if (label.empty())
 				throw std::runtime_error("POAGraph::load: empty node label");
+			if (label.size() != 1)
+				throw std::runtime_error(
+				    "POAGraph::load: multi-character nodes are unsupported");
+			node.seq = label[0];
 			graph.nodes.push_back(std::move(node));
 		}
 		graph.out_edges = read_edges(in, n);
@@ -249,11 +248,11 @@ public:
 	}
 
 	/**
-	 * @brief Returns the string of bases represented by a node.
+	 * @brief Returns the character represented by a node.
 	 *
 	 * @param u Node id.
 	 */
-	const std::string &seq(node_id u) const {
+	char seq(node_id u) const {
 		return nodes[u].seq;
 	}
 
@@ -266,7 +265,7 @@ public:
 	}
 
 	/**
-	 * @brief Read-only access to a node's full data: base character,
+	 * @brief Read-only access to a node's full data: character,
 	 *        position range, and its heavy outgoing neighbour (empty if
 	 *        the node has no outgoing edges).
 	 *
@@ -602,7 +601,7 @@ private:
 				if (x == run_end[u])
 					break;
 			}
-			new_nodes.push_back({std::move(label), START, START});
+			new_nodes.push_back({label[0], START, START});
 			for (const Edge &e : in_edges[u])
 				if (!absorbed[e.neighbor]) {
 					const std::size_t id = next_edge_id++;
@@ -639,12 +638,9 @@ private:
 
 	/** Builds the graph from the dictionary, in input order.
 	 *
-	 * @param compact_nodes: whether to merge chains of single-in/
-	 * single-out nodes into multi-character nodes after the last
-	 * alignment (the run compaction pass; see compact_chain_nodes()).
 	 * @throws std::runtime_error if a dictionary sequence is empty.
 	 */
-	void build(const std::vector<std::string> &dict, bool compact_nodes = true) {
+	void build(const std::vector<std::string> &dict) {
 		if (dict.empty())
 			return;
 		for (const std::string &sequence : dict)
@@ -691,8 +687,6 @@ private:
 			band_w = std::max(band_w / 2, 1L);
 		}
 
-		if (compact_nodes)
-			compact_chain_nodes();
 		mark_heavy_edges();
 		compute_pos_ranges();
 		compute_heavy_lengths();
@@ -701,7 +695,7 @@ private:
 	/** Creates a new node with base @p c at the end of the graph. */
 	node_id append_node(char c) {
 		const node_id u = nodes.size();
-		nodes.push_back({std::string(1, c), START, START});
+		nodes.push_back({c, START, START});
 		out_edges.emplace_back();
 		in_edges.emplace_back();
 		return u;
@@ -724,7 +718,7 @@ private:
 				n.pos_min = offset;
 			if (n.pos_max == START || offset > n.pos_max)
 				n.pos_max = offset;
-			offset += nodes[u].seq.size();
+			offset++;
 		}
 	}
 
@@ -964,10 +958,10 @@ private:
 					const int c =
 					    dp[row_off[prow] +
 					       static_cast<std::size_t>(il - 1 - lo[prow])] +
-					    cost.consume(nodes[u].seq[0], s[i - 1]);
+					    cost.consume(nodes[u].seq, s[i - 1]);
 					int pri = 2;
-					if (nodes[u].seq[0] == s[i - 1] &&
-					    cost.consume(nodes[u].seq[0], s[i - 1]) == 0)
+					if (nodes[u].seq == s[i - 1] &&
+					    cost.consume(nodes[u].seq, s[i - 1]) == 0)
 						pri = 3;
 					if (c < best || (c == best && bpri < pri)) {
 						best = c;
@@ -1016,7 +1010,7 @@ private:
 				pri = 1;
 				break;
 			case 3:
-				pri = (m > 0 && nodes[u].seq[0] == s[m - 1]) ? 3 : 2;
+				pri = (m > 0 && nodes[u].seq == s[m - 1]) ? 3 : 2;
 				break;
 			default:
 				break;
@@ -1129,7 +1123,7 @@ private:
 				break;
 			}
 			case AlignmentOp::Type::CONSUME: {
-				const node_id u = (nodes[a.node].seq[0] == a.ch)
+				const node_id u = (nodes[a.node].seq == a.ch)
 				                      ? a.node
 				                      : append_node(a.ch);
 				add_edge(prev, u);
@@ -1225,7 +1219,7 @@ private:
 					n.pos_min = offset;
 				if (n.pos_max == START || offset > n.pos_max)
 					n.pos_max = offset;
-				offset += nodes[u].seq.size();
+				offset++;
 			}
 		}
 	}

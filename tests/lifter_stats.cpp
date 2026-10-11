@@ -47,8 +47,8 @@ std::vector<int> initial_row(const POAGraph &graph, const CostModel &cost,
                              std::pair<std::size_t, std::size_t> &pos_range) {
 	const long m = static_cast<long>(query.size());
 	const long mk = static_cast<long>(k);
-	const std::string &label = graph.seq(start);
-	const long label_len = static_cast<long>(label.size());
+	const char label = graph.seq(start);
+	const long label_len = 1;
 	// After-label output band; see Solver::initial_state.
 	const long lo = std::max(0L, label_len - mk);
 	const long hL = std::min(m + 1, label_len + mk + 1);
@@ -73,7 +73,7 @@ std::vector<int> initial_row(const POAGraph &graph, const CostModel &cost,
 	for (long i = 1; i <= label_len; ++i) {
 		const long li = std::max(0L, i - mk);
 		const long hi_i = std::min(m + 1, i + mk + 1);
-		const char c = label[i - 1];
+		const char c = label;
 		const int del_c = cost.del();
 		long diag = li > 0 ? f[li - 1] : DistMatrix::INF;
 		long left = DistMatrix::INF;
@@ -181,7 +181,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 	// [0, m0] and kept non-empty.
 	auto window_width = [&](std::size_t u) -> std::size_t {
 		const auto [jmin, jmax] = graph.pos_range(u);
-		const long label = static_cast<long>(graph.seq(u).size());
+		const long label = 1;
 		const long lo = std::max(0L, static_cast<long>(jmin) + label -
 		                              static_cast<long>(k0));
 		const long hi =
@@ -216,8 +216,14 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 		cps.push_back(graph.compressed_path(i));
 	lifter.decompose(cps);
 	for (const auto &[k, query] : tc.queries) {
-		lifter.build(query, k);
 		const long m = static_cast<long>(query.size());
+		std::vector<std::size_t> eligible;
+		for (std::size_t i = 0; i < tc.dict.size(); ++i)
+			if (std::abs(static_cast<long>(tc.dict[i].size()) - m) <= k)
+				eligible.push_back(i);
+		const auto build_nodes = lifter.mark(cps, eligible);
+		const Query query_data(query, k);
+		lifter.build<DistMatrix>(query_data, build_nodes);
 		for (std::size_t i = 0; i < tc.dict.size(); ++i) {
 			if (std::abs(static_cast<long>(tc.dict[i].size()) - m) > k)
 				continue;

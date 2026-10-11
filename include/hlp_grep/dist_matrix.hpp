@@ -11,7 +11,10 @@
  */
 #pragma once
 #include <hlp_grep/cost_model.hpp>
+#include <hlp_grep/poa_graph.hpp>
+#include <hlp_grep/query.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <limits>
@@ -59,6 +62,49 @@ public:
 		       row_range.second - row_range.first == rows);
 		assert(col_range.second >= col_range.first &&
 		       col_range.second - col_range.first == cols);
+	}
+
+	/** Constructs the edit-distance matrix for one graph edge (u, v). */
+	DistMatrix(POAGraph::node_id u, POAGraph::node_id v,
+	           const POAGraph &graph, const Query &query) {
+		const auto window = [&](POAGraph::node_id node) {
+			const auto [jmin, jmax] = graph.pos_range(node);
+			const std::size_t k = static_cast<std::size_t>(query.k);
+			const std::size_t lo = jmin + 1 >= k ? jmin + 1 - k : 0;
+			const std::size_t hi = std::min(query.sequence.size() + 1,
+			                                jmax + k + 2);
+			return std::pair<std::size_t, std::size_t>{lo,
+			                                            std::max(hi, lo + 1)};
+		};
+		const auto [lo_u, hi_u] = window(u);
+		const auto [lo_v, hi_v] = window(v);
+		rows = hi_u - lo_u;
+		cols = hi_v - lo_v;
+		row_range_value = {lo_u, hi_u};
+		col_range_value = {lo_v, hi_v};
+		data.assign(rows * cols, INF);
+
+		const char c = graph.seq(v);
+		const auto [jmin, jmax] = graph.pos_range(v);
+		const std::size_t k = static_cast<std::size_t>(query.k);
+		const std::size_t l0 = jmin >= k ? jmin - k : 0;
+		const std::size_t h0 = std::min(query.sequence.size() + 1, jmax + k + 1);
+		const std::size_t hL = std::min(query.sequence.size() + 1, jmax + k + 2);
+		const std::size_t end = std::min(hi_u, hL);
+		for (std::size_t a = std::max(lo_u, l0); a < end; ++a) {
+			if (a >= lo_v)
+				(*this)(a - lo_u, a - lo_v) = graph.cost_model().del();
+			int cur = 0, sub = graph.cost_model().mismatch;
+			const std::size_t b_max =
+			    std::min(hi_v, a + static_cast<std::size_t>(query.k) + 2);
+			for (std::size_t b = a + 1; b < b_max; ++b) {
+				if (query.sequence[b - 1] == c)
+					sub = graph.cost_model().match;
+				if (b >= lo_v)
+					(*this)(a - lo_u, b - lo_v) = cur + sub;
+				cur += graph.cost_model().ins();
+			}
+		}
 	}
 
 	/// Number of rows.
@@ -233,6 +279,12 @@ public:
 			opt_next.swap(opt_cur);
 		}
 		return out;
+	}
+
+	static DistMatrix compose(const DistMatrix &left, const DistMatrix &right,
+	                          const POAGraph &, POAGraph::node_id,
+	                          const Query &) {
+		return min_plus_product(left, right);
 	}
 
 	/**
