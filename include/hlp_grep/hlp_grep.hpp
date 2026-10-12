@@ -128,41 +128,28 @@ public:
 			return {};
 		std::vector<std::size_t> eligible = eligible_paths(query.size(), k);
 		const Query query_context(query, k);
-		const auto transition_build_nodes = lifter.mark(compressed_paths, eligible);
 		const auto &transitions =
-		    lifter.build<Transition>(query_context, transition_build_nodes);
+		    lifter.build<Transition>(query_context, all_build_nodes);
+		std::vector<int> mismatches(dict.size(), 0);
+		for (std::size_t level = 0; level < all_build_nodes.size(); ++level)
+			for (const std::size_t node : all_build_nodes[level]) {
+				const int block_mismatches = transitions[node][level].mismatches;
+				if (block_mismatches == 0)
+					continue;
+				for (const std::size_t path_id : lifter.inv_ind[node][level])
+					mismatches[path_id] += block_mismatches;
+			}
 		eligible.erase(std::remove_if(eligible.begin(), eligible.end(),
-		    [&](std::size_t id) {
-			    return filtered(id, transitions, k);
-		    }),
+		    [&](std::size_t id) { return mismatches[id] > k; }),
 		    eligible.end());
-		const auto distance_build_nodes = lifter.mark(compressed_paths, eligible);
+		const auto distance_build_nodes =
+		    lifter.mark(compressed_paths, eligible, all_build_nodes);
 		if (!eligible.empty())
 			lifter.build<DistMatrix>(query_context, distance_build_nodes);
 		return score_paths(query, k, eligible, compressed_paths);
 	}
 
 	private:
-	bool filtered(std::size_t id,
-	              const std::vector<std::vector<Transition>> &transitions,
-	              int threshold) const {
-		int mismatches = 0;
-		const auto &cp = compressed_paths[id];
-		POAGraph::node_id cur = cp.start;
-		for (const auto &step : cp.steps) {
-			if (step.type == POAGraph::EdgeType::HEAVY) {
-				const std::size_t level =
-				    static_cast<std::size_t>(__builtin_ctzll(step.length));
-				mismatches += transitions[cur][level].mismatches;
-				if (mismatches > threshold)
-					return true;
-				cur = lifter.jump_node(cur, step.length);
-			} else {
-				cur = step.next;
-			}
-		}
-		return false;
-	}
 
 	/** Builds solver state around an already-built graph (load path). */
 	explicit Solver(POAGraph graph, const CostModel &cost,
@@ -185,6 +172,9 @@ public:
 		build_compressed_paths();
 		lifter.decompose(compressed_paths);
 		sort_compressed_paths();
+		std::vector<std::size_t> all_path_ids(dict.size());
+		std::iota(all_path_ids.begin(), all_path_ids.end(), std::size_t{0});
+		all_build_nodes = lifter.mark(compressed_paths, all_path_ids);
 	}
 
 	// -- implementation ----------------------------------------------------
@@ -437,6 +427,8 @@ public:
 	/// Query-independent lifter: up table + decomposed-block set filled
 	/// at construction; build(current_query, k) runs per query() call.
 	mutable BinaryLifter lifter;
+	/// Full-dictionary block set used as the prior mark for query eligibility.
+	std::vector<std::vector<std::size_t>> all_build_nodes;
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
 	/// Dictionary ids in lexicographic compressed-path order.

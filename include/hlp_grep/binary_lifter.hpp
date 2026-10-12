@@ -39,16 +39,18 @@ namespace hlp_grep {
  * is used, so the table cannot be confused with POAGraph's internal
  * markers.
  *
- * The lifter is built in two stages. The constructor builds only the
- * query-independent node table; decompose() expands the dictionary's
- * compressed heavy runs into the exact blocks used by jump() and records
- * which (node, level) chain blocks queries can need. build(query, k)
- * materializes only those blocks for one (query, k) pair.
+ * The constructor builds the query-independent node table. decompose()
+ * splits compressed heavy runs into power-of-two blocks, mark() selects the
+ * blocks needed by a set of paths, and build() materializes those blocks for
+ * one query.
  */
 class BinaryLifter {
 public:
 	/// Id of a graph node (mirrors POAGraph::node_id).
 	using node_id = POAGraph::node_id;
+
+	/// Dictionary path ids using each (node, heavy-block level).
+	std::vector<std::vector<std::vector<std::size_t>>> inv_ind;
 
 	/**
 	 * @brief Constructs the lifter's query-independent top half.
@@ -60,9 +62,8 @@ public:
 	 * up[u][t] = up[up[u][t - 1]][t - 1] whenever up[u][t - 1] is set, so
 	 * no topological order is needed.
 	 *
-	 * The chain tables are NOT built here: decompose() records which blocks
-	 * queries touch and build(query, k) materializes exactly those. jump
-	 * and step must not be called before build().
+	 * Chain tables are built on demand from the nodes returned by mark().
+	 * jump() and step() must not be called before build().
 	 *
 	 * @param graph POAGraph whose heavy chains are indexed; must outlive
 	 *              this object and must not be modified while it is alive.
@@ -78,6 +79,8 @@ public:
 		while ((std::size_t{1} << max_level) <= n)
 			++max_level; // floor(log2(n)) + 1; 0 for n == 0
 		up.assign(n, std::vector<std::optional<node_id>>(max_level));
+		inv_ind.assign(n,
+		                std::vector<std::vector<std::size_t>>(max_level));
 		for (std::size_t u = 0; u < n; ++u)
 			up[u][0] = graph.node(u).heavy_neighbour;
 		for (std::size_t t = 1; t < max_level; ++t)
@@ -87,31 +90,23 @@ public:
 	}
 
 	/**
-	 * @brief Decomposes heavy runs in the paths and records which (node,
-	 *        level) chain blocks queries touch.
+	 * @brief Splits heavy runs in paths into power-of-two blocks.
 	 *
 	 * Each HEAVY step is replaced in-place by the greedy blocks jump()
 	 * applies: at node v with rem steps left, the level is the smaller of
 	 * the lowest set bit of heavy_length(v) and the highest set bit of rem.
-	 * This depends only on the graph/path structure, so the decomposition
-	 * and touched set are query-independent. Scoring can abort rows whose
-	 * minimum exceeds k; decompose() cannot evaluate that, so it records
-	 * the abort-free superset for the dictionary. The
-	 * dependency closure is included: block (u, t) needs (u, t - 1) and
-	 * (*up[u][t - 1], t - 1), recursively down to level 0, so the
-	 * per-level build lists contain exactly the blocks the products
-	 * read. decompose() must run before build(); it can be called again
-	 * because already decomposed power-of-two steps are fixed points. It
-	 * also pre-sizes up_mat: node
-	 * u's matrix vector holds levels 0 .. its largest touched level, so
-	 * build() fills slots in place instead of re-assigning the whole
-	 * structure per query.
+	 * Decomposition depends only on graph/path structure. Block selection
+	 * and product dependency closure are performed separately by mark().
 	 *
 	 * @param paths Compressed paths, one per dictionary sequence; modified
 	 *              in place to split heavy runs into jump blocks.
 	 */
-	void decompose(std::vector<POAGraph::CompressedPath> &paths) const {
-		for (auto &cp : paths) {
+	void decompose(std::vector<POAGraph::CompressedPath> &paths) {
+		for (auto &node_levels : inv_ind)
+			for (auto &sequence_ids : node_levels)
+				sequence_ids.clear();
+		for (std::size_t path_id = 0; path_id < paths.size(); ++path_id) {
+			auto &cp = paths[path_id];
 			node_id cur = cp.start;
 			std::vector<POAGraph::CompressedEdge> decomposed;
 			decomposed.reserve(cp.steps.size());
@@ -131,6 +126,7 @@ public:
 						block_step.type = POAGraph::EdgeType::HEAVY;
 						block_step.length = static_cast<int>(block);
 						decomposed.push_back(block_step);
+						inv_ind[cur][level].push_back(path_id);
 						cur = *up[cur][level];
 						rem -= block;
 					}
@@ -143,63 +139,86 @@ public:
 		}
 	}
 
-	/** Marks the dependency closure for the selected compressed paths. */
+	/**
+	 * Marks the blocks and product dependencies used by selected paths.
+	 * When @p prev_build_nodes is supplied, only its per-level nodes are
+	 * scanned. This is intended for marking a survivor subset of a prior mark.
+	 */
 	std::vector<std::vector<std::size_t>> mark(
 	    const std::vector<POAGraph::CompressedPath> &paths,
-	    const std::vector<std::size_t> &path_ids) {
+	    const std::vector<std::size_t> &path_ids,
+	    const std::vector<std::vector<std::size_t>> &prev_build_nodes = {}) {
 		const std::size_t n = graph.num_nodes();
-		std::vector<std::vector<char>> touched(n,
-	                                      std::vector<char>(max_level, 0));
-		for (std::size_t id : path_ids) {
+		std::vector<std::vector<std::size_t>> build_nodes(max_level);
+		if (path_ids.empty())
+			return build_nodes;
+		const bool has_previous = prev_build_nodes.size() == max_level;
+		for (std::size_t id : path_ids)
 			if (id >= paths.size())
 				throw std::out_of_range(
 				    "BinaryLifter::mark: path id out of range");
+		std::vector<std::vector<char>> touched(n,
+	                                      std::vector<char>(max_level, 0));
+		const int threads = static_cast<int>(
+		    num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
+		                     : num_threads);
+#pragma omp parallel for schedule(dynamic) num_threads(threads)
+		for (std::ptrdiff_t path_idx = 0;
+		     path_idx < static_cast<std::ptrdiff_t>(path_ids.size()); ++path_idx) {
+			const std::size_t id = path_ids[static_cast<std::size_t>(path_idx)];
 			const auto &cp = paths[id];
 			node_id cur = cp.start;
 			for (const auto &st : cp.steps) {
 				if (st.type == POAGraph::EdgeType::HEAVY) {
 					const std::size_t level =
 					    static_cast<std::size_t>(__builtin_ctzll(st.length));
-					touched[cur][level] = true;
+					#pragma omp atomic write
+					touched[cur][level] = 1;
 					cur = *up[cur][level];
 				} else {
 					cur = st.next;
 				}
 			}
 		}
-		// Dependency closure: (u, t) needs (u, t - 1) and its chain
-		// midpoint's (t - 1) block. One sweep per level from the top
-		// catches every transitive requirement.
-		for (std::size_t t = max_level; t-- > 1;) {
-			for (std::size_t u = 0; u < n; ++u)
-				if (touched[u][t]) {
-					touched[u][t - 1] = true;
-					touched[*up[u][t - 1]][t - 1] = true;
+		// Dependency closure: each touched block needs its two half blocks.
+		// If this is a survivor re-mark, visit only parent candidates from
+		// the previous build lists; otherwise consume the locally collected
+		// touched list instead of sweeping every graph node.
+#pragma omp parallel num_threads(threads)
+		{
+			for (std::size_t t = max_level; t-- > 1;) {
+				if (has_previous) {
+#pragma omp parallel for schedule(static)
+					for (node_id u : prev_build_nodes[t])
+						if (touched[u][t]) {
+							touched[u][t - 1] = true;
+							touched[*up[u][t - 1]][t - 1] = true;
+						}
+				} else {
+#pragma omp parallel for schedule(static)
+					for (std::size_t u = 0; u < n; u++) {
+						if (touched[u][t]) {
+							touched[u][t - 1] = true;
+							touched[*up[u][t - 1]][t - 1] = true;
+						}
+					}
 				}
+			}
 		}
-		// Per-level build lists (ascending node order).
-		std::vector<std::vector<std::size_t>> build_nodes(max_level);
-		for (std::size_t t = 0; t < max_level; ++t) {
-			for (std::size_t u = 0; u < n; ++u)
-				if (touched[u][t])
-					build_nodes[t].push_back(u);
-		}
-		// Pre-size up_mat: since (u, t) touched drags (u, t - 1) into
-		// the closure, each node's touched levels form a prefix of
-		// 0..its largest touched level; one vector per node sized to
-		// the top of that prefix. build() then fills the slots in
-		// place, and build() may not run without decompose().
-		up_mat.assign(n, {});
-		up_transitions.assign(n, {});
-		for (std::size_t u = 0; u < n; ++u) {
-			std::size_t last = 0;
-			for (std::size_t t = max_level; t-- > 0;)
-				if (touched[u][t]) {
-					last = t + 1;
-					break;
+
+		for (std::size_t t = max_level; t-- > 0;) {
+			if (has_previous) {
+				for (node_id u : prev_build_nodes[t])
+					if (touched[u][t]) {
+						build_nodes[t].push_back(u);
+					}
+			} else {
+				for (std::size_t u = 0; u < n; u++) {
+					if (touched[u][t]) {
+						build_nodes[t].push_back(u);
+					}
 				}
-			up_mat[u].resize(last, DistMatrix(0, 0));
-			up_transitions[u].resize(last);
+			}
 		}
 		return build_nodes;
 	}
@@ -207,14 +226,13 @@ public:
 	/**
 	 * @brief Materializes the chain tables for one (query, k) pair.
 	 *
-	 * Only the blocks marked by decompose() are built — level 0 holds the
+	 * Only the blocks marked by mark() are built — level 0 holds the
 	 * per-edge blocks of the touched heavy outgoing edges (the edge
 	 * transition plus the destination node's label), and each higher
 	 * level is the min-plus product of two adjacent level (t - 1) blocks
 	 * sharing a chain midpoint. Untouched (u, t) slots stay empty.
-	 * Must be called after decompose() (which pre-sizes up_mat) and before
-	 * jump()/step()/window() reads; rebuilds every marked slot
-	 * unconditionally on every call.
+	 * Must be called after mark() and before jump()/step()/window() reads.
+	 * Resizes selected table storage and rebuilds the marked entries.
 	 *
 	 * @param query Query string the chain distance tables index into.
 	 * @param k     Edit distance threshold widening the windows.
@@ -227,6 +245,20 @@ public:
 		              std::is_same_v<T, Transition>,
 		              "BinaryLifter::build supports DistMatrix or Transition");
 		auto &table = table_for<T>();
+		const std::size_t n = graph.num_nodes();
+		if (table.size() != n)
+			table.resize(n);
+		std::vector<std::size_t> last_level(n, 0);
+		for (std::size_t t = 0; t < build_nodes.size(); ++t)
+			for (std::size_t u : build_nodes[t])
+				last_level[u] = t + 1;
+		for (std::size_t u = 0; u < n; ++u)
+			if (table[u].size() < last_level[u]) {
+				if constexpr (std::is_same_v<T, DistMatrix>)
+					table[u].resize(last_level[u], DistMatrix(0, 0));
+				else
+					table[u].resize(last_level[u]);
+			}
 		// The per-node blocks are one task each with uniform cost; past
 		// ~8 threads barrier and spawn overhead dominates the level loop.
 		const int threads = static_cast<int>(

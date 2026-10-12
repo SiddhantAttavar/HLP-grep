@@ -33,9 +33,7 @@ struct Transition {
 	                          const Query &query) {
 		Transition result;
 		result.label_len = left.label_len + right.label_len;
-		std::uint64_t power = 1;
-		for (std::size_t i = 0; i < left.label_len; ++i)
-			power = (power * Query::HASH_BASE) % Query::HASH_MOD;
+		const std::uint64_t power = Query::power_of_base(left.label_len);
 		result.label_hash =
 		    (left.label_hash + right.label_hash * power) % Query::HASH_MOD;
 
@@ -44,6 +42,12 @@ struct Transition {
 		const std::size_t lo = jmin + 1 > k ? jmin + 1 - k : 0;
 		const std::size_t hi = std::min(query.sequence.size() + 1,
 		                                jmax + 1 + k + 1);
+
+		if (left.mismatches + right.mismatches > 0) {
+			result.mismatches = left.mismatches + right.mismatches;
+			return result;
+		}
+
 		bool found = false;
 		if (result.label_len <= query.sequence.size()) {
 			const std::size_t level =
@@ -57,8 +61,7 @@ struct Transition {
 						break;
 					}
 		}
-		result.mismatches = found ? 0 : std::max(
-		    1, left.mismatches + right.mismatches);
+		result.mismatches = !found;
 		return result;
 	}
 };
