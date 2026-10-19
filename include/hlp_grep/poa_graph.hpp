@@ -3,10 +3,10 @@
  * @brief Partial order alignment (POA) graph built from a dictionary of DNA
  *        sequences.
  *
- * Constructs a POA graph incrementally: each dictionary sequence
- * is aligned to the current graph (min-cost alignment under CostModel) and its
- * alignment is merged into the graph. Every dictionary sequence is stored as
- * an explicit path of node ids, as required by heavy-light path compression.
+ * Constructs a POA graph incrementally: each dictionary sequence is
+ * represented by a maximum-supported path through the current DAG, with
+ * fresh nodes used where needed. Every dictionary sequence is stored as an
+ * explicit path of node ids, as required by heavy-light path compression.
  */
 #pragma once
 #include <hlp_grep/cost_model.hpp>
@@ -96,22 +96,22 @@ public:
 	/**
 	 * @brief Builds the POA graph from the given dictionary.
 	 * Sequences are added in input order. The first sequence seeds the graph;
-	 * each subsequent sequence is aligned to the current graph and merged.
-	 * After the last sequence the heavy/light edge classification is finalized.
+	 * each subsequent sequence chooses a path spelling it that maximizes the
+	 * current sum of traversed edge supports. After the last sequence the
+	 * heavy/light edge classification is finalized.
 	 *
-	 * The sequence-to-graph alignments use a dynamic doubling band: starting
-	 * from `w = 1`, a sequence is re-aligned with doubled `w` until the
-	 * alignment succeeds strictly inside the band at an edit distance
-	 * `<= w` (see align_to_graph()). Per node the band spans a fixed total
-	 * width `2w` centered on the node's position range (see band_bounds()).
-	 * Successful alignments halve `w` for the next sequence.
+	 * Path search uses per-node position bands centered on the node's stored
+	 * position range (see band_bounds()). If the selected path touches a
+	 * truncated band boundary, the band is widened; full sequence-position
+	 * ranges are used as the final fallback. The successful width is reduced
+	 * for the next sequence.
 	 *
 	 * @param dict Dictionary of DNA sequences to index. Every sequence must
 	 *             be non-empty: an empty sequence has no path to store and
 	 *             is rejected with std::runtime_error.
-	 * @param cost Cost model used for the sequence-to-graph alignments.
-	 *             Defaults to the unit-cost model. The referenced model
-	 *             must outlive the graph.
+	 * @param cost Cost model retained for query-side edit-distance operations.
+	 *             Defaults to the unit-cost model. The referenced model must
+	 *             outlive the graph.
 	 */
 	explicit POAGraph(const std::vector<std::string> &dict,
 	                  const CostModel &cost = DEFAULT_COST_MODEL)
@@ -222,6 +222,7 @@ public:
 			graph.paths.push_back(std::move(path));
 		}
 		graph.validate_loaded(rank);
+		graph.recount_edge_weights();
 		return graph;
 	}
 
@@ -464,32 +465,48 @@ private:
 				throw std::runtime_error("POAGraph::load: unused edge id");
 	}
 
-	/**
-	 * @brief One step of a sequence-to-graph alignment.
-	 */
+	struct DPParent {
+		static constexpr unsigned char NONE = 0;
+		static constexpr unsigned char PREFIX = 1;
+		static constexpr unsigned char EDGE = 2;
+		unsigned char type = NONE;
+		node_id node = static_cast<node_id>(-1);
+		std::size_t pos = 0;
+	};
+
+	struct DPCell {
+		std::size_t score = 0;
+		bool valid = false;
+		DPParent parent;
+	};
+
+	struct TCell {
+		std::size_t score = 0;
+		node_id node = static_cast<node_id>(-1);
+		std::size_t pos = 0;
+	};
+
+	struct PathChoice {
+		std::vector<node_id> nodes; // START denotes a fresh node at that position.
+		bool touched_band_boundary = false;
+	};
+
+	// Retained temporarily for source compatibility with the old private
+	// alignment helpers; construction no longer uses edit-distance alignment.
 	struct AlignmentOp {
 		enum class Type : unsigned char { INSERT, DELETE, CONSUME };
-
 		Type type;
-		node_id node; ///< Graph node referenced by DELETE/CONSUME.
-		char ch;      ///< Inserted or consumed character.
+		node_id node;
+		char ch;
 	};
-
-	/**
-	 * @brief Result of a sequence-to-graph alignment.
-	 */
 	struct Alignment {
-		int cost = 0;                 ///< Minimum alignment cost.
-		std::vector<AlignmentOp> ops; ///< Alignment steps, in sequence order.
+		int cost = 0;
+		std::vector<AlignmentOp> ops;
 	};
-
-	/**
-	 * @brief Outcome of one banded sequence-to-graph alignment attempt.
-	 */
 	struct AlignOutcome {
-		bool found = false;  ///< Some alignment endpoint reached column |s|.
-		bool strict = false; ///< Traceback stayed strictly inside the band.
-		Alignment al;        ///< Alignment found (valid when found).
+		bool found = false;
+		bool strict = false;
+		Alignment al;
 	};
 
 	/**
@@ -510,15 +527,15 @@ private:
 	std::vector<std::vector<Edge>> in_edges;
 	/// Id assigned to the next created edge.
 	std::size_t next_edge_id = 0;
+	/// Number of stored dictionary paths traversing each edge.
+	std::vector<std::size_t> edge_weights;
 	/// Per dictionary sequence: node ids visited by that sequence.
 	std::vector<std::vector<node_id>> paths;
 	/// Node ids in topological order of the DAG.
 	std::vector<node_id> topo;
 
 	const CostModel &cost; ///< Cost model of the graph alignments; must outlive the graph.
-	/// Band half-width carried between consecutive sequence alignments.
-	/// Doubled while a sequence fails to align strictly inside the band,
-	/// halved (min 1) after a success; starts at 1.
+	/// Band half-width carried between consecutive sequence insertions.
 	long band_w = 1;
 
 	// -- construction ---------------------------------------------------------
@@ -633,6 +650,7 @@ private:
 			}
 			path = std::move(remapped);
 		}
+		recount_edge_weights();
 		rebuild_topo();
 	}
 
@@ -660,31 +678,22 @@ private:
 		paths.push_back(std::move(seed));
 		update_pos_ranges(paths.back());
 		rebuild_topo();
+		increment_path_weights(paths.back());
 
 		for (std::size_t id = 1; id < dict.size(); ++id) {
-			// Dynamic band: double until the alignment cost fits the band,
-			// i.e. the found alignment reaches column |s| strictly inside
-			// the band at an edit distance <= w (a band narrower than the
-			// sequence's divergence cannot express the alignment, so the
-			// cost signal says when the width suffices). The width cap |s|
-			// makes every row band cover [0, |s|] (band_bounds clamps), so
-			// retries terminate; at the cap any outcome is accepted as-is.
-			const long cap =
-			    std::max<long>(static_cast<long>(dict[id].size()), 1);
-			AlignOutcome out;
+			const std::size_t cap = dict[id].size();
+			PathChoice choice;
+			long width = std::max(band_w, 1L);
 			while (true) {
-				out = align_to_graph(dict[id], band_w);
-				const bool proper =
-				    out.found && out.strict && out.al.cost <= band_w;
-				if (band_w >= cap || proper)
+				choice = support_path(dict[id], width, width >=
+				                      static_cast<long>(cap));
+				if (!choice.touched_band_boundary ||
+				    width >= static_cast<long>(cap))
 					break;
-				band_w = std::min(2 * band_w, cap);
+				width = std::min(2 * width, static_cast<long>(cap));
 			}
-			if (out.found)
-				add_alignment(out.al.ops);
-			else
-				add_alignment(fresh_alignment(dict[id]).ops);
-			band_w = std::max(band_w / 2, 1L);
+			add_path(choice.nodes, dict[id]);
+			band_w = std::max(width / 2, 1L);
 		}
 
 		mark_heavy_edges();
@@ -783,6 +792,7 @@ private:
 			const std::size_t id = next_edge_id++;
 			out_edges[u].push_back({EdgeType::LIGHT, v, id});
 			in_edges[v].push_back({EdgeType::LIGHT, u, id});
+			edge_weights.push_back(0);
 		}
 	}
 
@@ -1138,6 +1148,211 @@ private:
 		rebuild_topo();
 	}
 
+	/** Finds the maximum-support path spelling s using bounded DP cells. */
+	PathChoice support_path(const std::string &s, long width,
+	                        bool full_band) const {
+		const std::size_t V = nodes.size();
+		const std::size_t m = s.size();
+		PathChoice choice;
+		choice.nodes.assign(m, START);
+		if (m == 0)
+			return choice;
+
+		std::vector<long> lo(V), hi(V);
+		std::vector<std::vector<DPCell>> dp(V);
+		for (const node_id u : topo) {
+			if (full_band) {
+				lo[u] = 0;
+				hi[u] = static_cast<long>(m - 1);
+			} else {
+				const auto [band_lo, band_hi] =
+				    band_bounds(u, static_cast<long>(m - 1), width);
+				lo[u] = band_lo;
+				hi[u] = std::min(band_hi, static_cast<long>(m - 1));
+			}
+			if (lo[u] <= hi[u])
+				dp[u].resize(static_cast<std::size_t>(hi[u] - lo[u] + 1));
+		}
+
+		const auto better_t = [](const TCell &a, const TCell &b) {
+			if (a.score != b.score)
+				return a.score > b.score;
+			if (a.node == START)
+				return false;
+			if (b.node == START)
+				return true;
+			return a.node < b.node || (a.node == b.node && a.pos < b.pos);
+		};
+		// Fenwick tree stores best existing-node endpoints by position. A
+		// prefix query is the equivalent of t[i]: any earlier endpoint can
+		// be extended to i using fresh nodes, at zero additional support.
+		std::vector<TCell> best_by_position(m + 1, TCell{});
+		const auto prefix_best = [&](std::size_t pos) {
+			TCell best{}; // score-zero all-fresh path
+			std::size_t ix = pos + 1;
+			while (ix > 0) {
+				if (better_t(best_by_position[ix], best))
+					best = best_by_position[ix];
+				ix -= ix & (~ix + 1);
+			}
+			return best;
+		};
+		const auto update_best = [&](const TCell &candidate) {
+			std::size_t ix = candidate.pos + 1;
+			while (ix <= m) {
+				if (better_t(candidate, best_by_position[ix]))
+					best_by_position[ix] = candidate;
+				ix += ix & (~ix + 1);
+			}
+		};
+		const auto better_dp = [](const DPCell &a, const DPCell &b) {
+			if (!a.valid)
+				return false;
+			if (!b.valid)
+				return true;
+			if (a.score != b.score)
+				return a.score > b.score;
+			if (a.parent.type != b.parent.type)
+				return a.parent.type == DPParent::EDGE;
+			return a.parent.node < b.parent.node;
+		};
+		const auto get_dp = [&](node_id u, std::size_t i) -> const DPCell * {
+			if (u >= V || lo[u] > hi[u] || i < static_cast<std::size_t>(lo[u]) ||
+			    i > static_cast<std::size_t>(hi[u]))
+				return nullptr;
+			return &dp[u][i - static_cast<std::size_t>(lo[u])];
+		};
+
+		for (const node_id u : topo) {
+			if (lo[u] > hi[u])
+				continue;
+			const std::size_t first = static_cast<std::size_t>(lo[u]);
+			const std::size_t last = static_cast<std::size_t>(hi[u]);
+			for (std::size_t i = first; i <= last; ++i) {
+				DPCell &cell = dp[u][i - first];
+				if (nodes[u].seq != s[i]) {
+					cell = DPCell{};
+				} else if (i == 0) {
+					cell = {0, true, {DPParent::NONE, START, 0}};
+				} else {
+					const TCell prefix = prefix_best(i - 1);
+					cell = {prefix.score, true,
+					        {DPParent::PREFIX, prefix.node, prefix.pos}};
+					for (const Edge &e : in_edges[u]) {
+						const DPCell *previous = get_dp(e.neighbor, i - 1);
+						if (!previous || !previous->valid)
+							continue;
+						const DPCell candidate{
+						    previous->score + edge_weights[e.edge_id], true,
+						    {DPParent::EDGE, e.neighbor, i - 1}};
+						if (better_dp(candidate, cell))
+							cell = candidate;
+					}
+				}
+			}
+
+			// Publish this node's endpoints only after its DP row is complete;
+			// subsequent nodes can then use them via the prefix maximum.
+			for (std::size_t i = first; i <= last; ++i) {
+				const DPCell &cell = dp[u][i - first];
+				if (cell.valid)
+					update_best({cell.score, u, i});
+			}
+		}
+
+		// Trace back through existing-node states; gaps between those states
+		// are exactly the fresh wildcard nodes.
+		std::size_t cursor = m - 1;
+		const TCell selected = prefix_best(cursor);
+		node_id u = selected.node;
+		std::size_t pos = selected.pos;
+		while (u != START) {
+			while (cursor > pos) {
+				choice.nodes[cursor] = START;
+				--cursor;
+			}
+			if (cursor != pos)
+				throw std::logic_error("support traceback position mismatch");
+			choice.nodes[cursor] = u;
+			const DPCell *cell = get_dp(u, pos);
+			if (!cell || !cell->valid)
+				throw std::logic_error("support traceback reached invalid cell");
+			const DPParent parent = cell->parent;
+			if (parent.type == DPParent::NONE)
+				break;
+			if (cursor == 0)
+				throw std::logic_error("support traceback underflow");
+			--cursor;
+			if (parent.node == START) {
+				while (true) {
+					choice.nodes[cursor] = START;
+					if (cursor == 0)
+						break;
+					--cursor;
+				}
+				break;
+			}
+			u = parent.node;
+			pos = parent.pos;
+		}
+		while (cursor > 0) {
+			--cursor;
+			choice.nodes[cursor] = START;
+		}
+
+		for (std::size_t i = 0; i < m; ++i) {
+			const node_id v = choice.nodes[i];
+			if (v != START && !full_band &&
+			    ((lo[v] > 0 && static_cast<long>(i) == lo[v]) ||
+			     (hi[v] < static_cast<long>(m - 1) &&
+			      static_cast<long>(i) == hi[v])))
+				choice.touched_band_boundary = true;
+		}
+		return choice;
+	}
+
+	void add_path(const std::vector<node_id> &chosen, const std::string &s) {
+		if (chosen.size() != s.size())
+			throw std::logic_error("support path length mismatch");
+		std::vector<node_id> path;
+		path.reserve(s.size());
+		node_id prev = START;
+		for (std::size_t i = 0; i < s.size(); ++i) {
+			node_id u = chosen[i];
+			if (u == START)
+				u = append_node(s[i]);
+			else if (u >= nodes.size() || nodes[u].seq != s[i])
+				throw std::logic_error("support path contains invalid node");
+			add_edge(prev, u);
+			if (prev != START) {
+				const Edge *e = find_edge(out_edges[prev], u);
+				if (!e)
+					throw std::logic_error("support path edge missing after insert");
+				++edge_weights[e->edge_id];
+			}
+			path.push_back(u);
+			prev = u;
+		}
+		paths.push_back(std::move(path));
+		update_pos_ranges(paths.back());
+		rebuild_topo();
+	}
+
+	void increment_path_weights(const std::vector<node_id> &path) {
+		for (std::size_t i = 1; i < path.size(); ++i) {
+			const Edge *e = find_edge(out_edges[path[i - 1]], path[i]);
+			if (!e)
+				throw std::logic_error("stored path contains a missing edge");
+			++edge_weights[e->edge_id];
+		}
+	}
+
+	void recount_edge_weights() {
+		edge_weights.assign(next_edge_id, 0);
+		for (const auto &path : paths)
+			increment_path_weights(path);
+	}
+
 	/**
 	 * @brief Classifies each node's outgoing edges from temporary visiting
 	 *        frequencies.
@@ -1154,24 +1369,19 @@ private:
 	 * keep no heavy edge at all, so their chains end there.
 	 */
 	void mark_heavy_edges() {
-		std::vector<std::size_t> weight(next_edge_id, 0);
-		for (const auto &path : paths)
-			for (std::size_t i = 1; i < path.size(); ++i)
-				weight[find_edge(out_edges[path[i - 1]], path[i])
-				           ->edge_id]++;
-
 		const std::size_t trunk = paths.size() / 2;
 		for (std::size_t u = 0; u < out_edges.size(); ++u) {
 			auto &edges = out_edges[u];
 			Edge *heavy = nullptr;
 			for (Edge &e : edges) {
 				e.type = EdgeType::LIGHT;
-				if (!heavy || weight[e.edge_id] > weight[heavy->edge_id] ||
-				    (weight[e.edge_id] == weight[heavy->edge_id] &&
+				if (!heavy || edge_weights[e.edge_id] >
+				                   edge_weights[heavy->edge_id] ||
+				    (edge_weights[e.edge_id] == edge_weights[heavy->edge_id] &&
 				     e.neighbor > heavy->neighbor))
 					heavy = &e;
 			}
-			if (heavy && weight[heavy->edge_id] >= trunk)
+			if (heavy && edge_weights[heavy->edge_id] >= trunk)
 				heavy->type = EdgeType::HEAVY;
 			else
 				heavy = nullptr;

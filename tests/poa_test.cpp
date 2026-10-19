@@ -199,6 +199,23 @@ int main() {
 		std::cout << "PASS duplicate\n";
 	}
 
+	// Support-maximizing insertion should leave a low-support alternate
+	// prefix, then rejoin the well-supported suffix path.
+	{
+		const std::vector<std::string> dict = {"ACGT", "TCGT"};
+		const POAGraph g(dict);
+		check_paths(g, dict, "support-rejoin");
+		const auto &trunk = g.path(0);
+		const auto &variant = g.path(1);
+		check(variant[0] != trunk[0],
+		      "support-rejoin: alternate first base should use its own node");
+		for (std::size_t i = 1; i < trunk.size(); ++i)
+			check(variant[i] == trunk[i],
+			      "support-rejoin: path failed to reuse supported suffix at " +
+			          std::to_string(i));
+		std::cout << "PASS support-rejoin\n";
+	}
+
 	// Deletion: second sequence skips the G node. A and C merge into
 	// one node (C's two out-edges keep the skip edge intact); G and T
 	// cannot merge (T has two in-edges).
