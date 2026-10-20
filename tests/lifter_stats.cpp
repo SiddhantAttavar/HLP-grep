@@ -223,7 +223,7 @@ void stats_testcase(const fs::path &file, const Testcase &tc) {
 				eligible.push_back(i);
 		const auto build_nodes = lifter.mark(cps, eligible);
 		const Query query_data(query, k);
-		lifter.build<DistMatrix>(query_data, build_nodes);
+		lifter.build(query_data, build_nodes);
 		for (std::size_t i = 0; i < tc.dict.size(); ++i) {
 			if (std::abs(static_cast<long>(tc.dict[i].size()) - m) > k)
 				continue;

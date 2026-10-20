@@ -14,7 +14,6 @@
 #include <hlp_grep/dist_matrix.hpp>
 #include <hlp_grep/poa_graph.hpp>
 #include <hlp_grep/query.hpp>
-#include <hlp_grep/transition.hpp>
 
 #include <omp.h>
 
@@ -24,7 +23,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -237,14 +235,10 @@ public:
 	 * @param query Query string the chain distance tables index into.
 	 * @param k     Edit distance threshold widening the windows.
 	 */
-	template <typename T>
-	const std::vector<std::vector<T>> &build(
+	const std::vector<std::vector<DistMatrix>> &build(
 	    const Query &query,
 	    const std::vector<std::vector<std::size_t>> &build_nodes) {
-		static_assert(std::is_same_v<T, DistMatrix> ||
-		              std::is_same_v<T, Transition>,
-		              "BinaryLifter::build supports DistMatrix or Transition");
-		auto &table = table_for<T>();
+		auto &table = up_mat;
 		const std::size_t n = graph.num_nodes();
 		if (table.size() != n)
 			table.resize(n);
@@ -253,12 +247,8 @@ public:
 			for (std::size_t u : build_nodes[t])
 				last_level[u] = t + 1;
 		for (std::size_t u = 0; u < n; ++u)
-			if (table[u].size() < last_level[u]) {
-				if constexpr (std::is_same_v<T, DistMatrix>)
-					table[u].resize(last_level[u], DistMatrix(0, 0));
-				else
-					table[u].resize(last_level[u]);
-			}
+			if (table[u].size() < last_level[u])
+				table[u].resize(last_level[u], DistMatrix(0, 0));
 		// The per-node blocks are one task each with uniform cost; past
 		// ~8 threads barrier and spawn overhead dominates the level loop.
 		const int threads = static_cast<int>(
@@ -274,11 +264,11 @@ public:
 				     idx < build_nodes[t].size(); ++idx) {
 					const std::size_t u = build_nodes[t][idx];
 					if (t == 0)
-						table[u][0] = T(u, *up[u][0], graph, query);
+						table[u][0] = DistMatrix(u, *up[u][0], graph, query);
 					else {
 						const std::size_t v =
 						    *up[u][t - 1];
-						table[u][t] = T::compose(
+						table[u][t] = DistMatrix::compose(
 						    table[u][t - 1], table[v][t - 1],
 						    graph, u, query);
 					}
@@ -465,14 +455,6 @@ public:
 	}
 
 private:
-	template <typename T>
-	auto &table_for() {
-		if constexpr (std::is_same_v<T, DistMatrix>)
-			return up_mat;
-		else
-			return up_transitions;
-	}
-
 	/** Debug-only check that a row matches a subrange of a node window. */
 	void assert_row(
 	    node_id u, const std::vector<int> &row,
@@ -531,8 +513,6 @@ private:
 	/// slots stay empty. decompose() sizes each node's vector to the top of
 	/// its touched prefix, so build() fills slots in place.
 	std::vector<std::vector<DistMatrix>> up_mat;
-	/// Query-specific hash/mismatch summaries for heavy blocks.
-	std::vector<std::vector<Transition>> up_transitions;
 };
 
 } // namespace hlp_grep

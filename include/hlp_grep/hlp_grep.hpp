@@ -15,7 +15,7 @@
 #include <hlp_grep/poa_graph.hpp>
 #include <hlp_grep/query.hpp>
 #include <hlp_grep/result.hpp>
-#include <hlp_grep/transition.hpp>
+#include <hlp_grep/string_hash.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -94,10 +94,9 @@ public:
 	 * @brief Finds all dictionary sequences within edit distance k of the
 	 *        query.
 	 *
-	 * Rebuilds the per-query chain tables of the pre-marked BinaryLifter
-	 * (build(query, k) over the blocks decompose() touched — the touched set is
-	 * query-independent, so every query fills the same blocks), then scores
-	 * the length-filtered compressed paths in lexicographic order, divided
+	 * Applies a conservative substring-hash filter after the length bound,
+	 * builds chain tables only for surviving paths, then scores those
+	 * compressed paths in lexicographic order, divided
 	 * into contiguous batches scored in parallel. Each batch keeps its own
 	 * stack of DP rows for shared prefixes and computes only each path's
 	 * unmatched suffix across heavy blocks (jump) or light edges (step).
@@ -112,9 +111,9 @@ public:
 	 * models make the check unsound and must not rely on it.
 	 *
 	 * Sequences whose length differs from the query by more than k are
-	 * skipped without scoring: their length difference is a lower bound
-	 * on the edit distance, and their DP states need not fit the windows
-	 * the lifter precomputes.
+	 * skipped without scoring. A second conservative filter rejects a
+	 * sequence only after finding k + 1 disjoint substrings absent from the
+	 * query; each such substring requires at least one unit-cost edit.
 	 *
 	 * @param query The query DNA sequence.
 	 * @param k     Maximum allowed edit distance (threshold).
@@ -126,26 +125,17 @@ public:
 	std::vector<Result> query(const std::string &query, int k) const {
 		if (dict.empty())
 			return {};
-		std::vector<std::size_t> eligible = eligible_paths(query.size(), k);
+		std::vector<std::size_t> eligible = sorted_path_ids;
 		const Query query_context(query, k);
-		const auto &transitions =
-		    lifter.build<Transition>(query_context, all_build_nodes);
-		std::vector<int> mismatches(dict.size(), 0);
-		for (std::size_t level = 0; level < all_build_nodes.size(); ++level)
-			for (const std::size_t node : all_build_nodes[level]) {
-				const int block_mismatches = transitions[node][level].mismatches;
-				if (block_mismatches == 0)
-					continue;
-				for (const std::size_t path_id : lifter.inv_ind[node][level])
-					mismatches[path_id] += block_mismatches;
-			}
-		eligible.erase(std::remove_if(eligible.begin(), eligible.end(),
-		    [&](std::size_t id) { return mismatches[id] > k; }),
-		    eligible.end());
+		eligible.erase(std::remove_if(eligible.begin(), eligible.end(), [&](std::size_t id) {
+			return !filter_sequence(id, query_context);
+		}), eligible.end());
+		if (eligible.empty())
+			return {};
 		const auto distance_build_nodes =
 		    lifter.mark(compressed_paths, eligible, all_build_nodes);
 		if (!eligible.empty())
-			lifter.build<DistMatrix>(query_context, distance_build_nodes);
+			lifter.build(query_context, distance_build_nodes);
 		return score_paths(query, k, eligible, compressed_paths);
 	}
 
@@ -169,12 +159,14 @@ public:
 				dict.push_back(std::move(sequence));
 			}
 		}
+		dictionary_hashes.clear();
+		dictionary_hashes.reserve(dict.size());
+		for (const std::string &sequence : dict)
+			dictionary_hashes.emplace_back(sequence);
 		build_compressed_paths();
 		lifter.decompose(compressed_paths);
 		sort_compressed_paths();
-		std::vector<std::size_t> all_path_ids(dict.size());
-		std::iota(all_path_ids.begin(), all_path_ids.end(), std::size_t{0});
-		all_build_nodes = lifter.mark(compressed_paths, all_path_ids);
+		all_build_nodes = lifter.mark(compressed_paths, sorted_path_ids);
 	}
 
 	// -- implementation ----------------------------------------------------
@@ -209,6 +201,51 @@ public:
 			return a.steps.size() < b.steps.size();
 		return lhs < rhs;
 	}
+
+	bool filter_sequence(std::size_t id, const Query &query) const {
+		const std::size_t query_len = query.sequence.size();
+		const int k = query.k;
+		const int diag_delta = ((int) query_len) - ((int) dict[id].size());
+		if (std::abs(diag_delta) > k) return false;
+		const int min_diag = std::min(diag_delta, 0) - (k - std::abs(diag_delta)) / 2;
+		const int max_diag = std::max(diag_delta, 0) + (k - std::abs(diag_delta)) / 2;
+
+		const StringHash &text_hash = dictionary_hashes[id];
+		const auto occurs = [&](std::size_t start, std::size_t length) -> bool {
+			if (length > query_len) return false;
+			const std::size_t lo = start >= (std::size_t) -min_diag ? start + min_diag : 0;
+			const std::size_t hi = std::min(start + max_diag, query_len - length + 1);
+			const StringHash::hash_type hash = text_hash.hash(start, length);
+			for (std::size_t i = lo; i <= hi; i++) {
+				if (query.hash.hash(i, length) == hash) {
+					return true;
+				}
+			}
+			return false;
+		};
+		std::size_t start = 0;
+		std::size_t absent = 0;
+		const std::size_t limit = static_cast<std::size_t>(k);
+		while (start < text_hash.size() && absent < limit) {
+			std::size_t low = 1;
+			std::size_t high = text_hash.size() - start;
+			std::size_t first_absent = high + 1;
+			while (low <= high) {
+				const std::size_t mid = (low + high) / 2;
+				if (occurs(start, mid))
+					low = mid + 1;
+				else {
+					first_absent = mid;
+					high = mid - 1;
+				}
+			}
+			if (first_absent > text_hash.size() - start)
+				return true;
+			++absent;
+			start += first_absent;
+		}
+		return occurs(start, text_hash.size() - start);
+	};
 
 	/** Number of saved states shared by two canonical path prefixes. */
 	static std::size_t common_prefix_states(
@@ -418,6 +455,7 @@ public:
 	}
 
 	std::vector<std::string> dict; ///< Dictionary of DNA sequences to search.
+	std::vector<StringHash> dictionary_hashes;
 	/// Cost model used for the edit distance computations; must outlive
 	/// the solver.
 	const CostModel &cost;
@@ -427,12 +465,11 @@ public:
 	/// Query-independent lifter: up table + decomposed-block set filled
 	/// at construction; build(current_query, k) runs per query() call.
 	mutable BinaryLifter lifter;
-	/// Full-dictionary block set used as the prior mark for query eligibility.
-	std::vector<std::vector<std::size_t>> all_build_nodes;
 	/// Compressed (heavy-chain / light-step) representation of each dict path.
 	std::vector<POAGraph::CompressedPath> compressed_paths;
 	/// Dictionary ids in lexicographic compressed-path order.
 	std::vector<std::size_t> sorted_path_ids;
+	std::vector<std::vector<size_t>> all_build_nodes;
 
 	/** Builds the merged compressed representation of every dictionary path. */
 	void build_compressed_paths() {

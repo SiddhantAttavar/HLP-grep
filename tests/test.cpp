@@ -235,7 +235,7 @@ void test_clip_row_two_sided() {
 	const auto build_nodes = lifter.mark(paths, path_ids);
 	const std::string query = "ACGT";
 	const Query query_data(query, 1);
-	lifter.build<DistMatrix>(query_data, build_nodes);
+	lifter.build(query_data, build_nodes);
 
 	auto range = lifter.window(paths[0].start);
 	const auto original_range = range;
