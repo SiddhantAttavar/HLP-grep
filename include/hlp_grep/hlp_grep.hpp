@@ -127,8 +127,18 @@ public:
 			return {};
 		std::vector<std::size_t> eligible = sorted_path_ids;
 		const Query query_context(query, k);
+		std::vector<char> filtered(sorted_path_ids.size());
+		{
+			const std::size_t threads = static_cast<std::size_t>(
+				num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
+				: num_threads);
+#pragma omp parallel for schedule(dynamic) num_threads(threads)
+			for (std::size_t i = 0; i < sorted_path_ids.size(); i++) {
+				filtered[sorted_path_ids[i]] = filter_sequence(sorted_path_ids[i], query_context);
+			}
+		}
 		eligible.erase(std::remove_if(eligible.begin(), eligible.end(), [&](std::size_t id) {
-			return !filter_sequence(id, query_context);
+			return !filtered[id];
 		}), eligible.end());
 		if (eligible.empty())
 			return {};

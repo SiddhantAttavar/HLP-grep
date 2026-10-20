@@ -170,7 +170,6 @@ public:
 				if (st.type == POAGraph::EdgeType::HEAVY) {
 					const std::size_t level =
 					    static_cast<std::size_t>(__builtin_ctzll(st.length));
-					#pragma omp atomic write
 					touched[cur][level] = 1;
 					cur = *up[cur][level];
 				} else {
@@ -186,14 +185,14 @@ public:
 		{
 			for (std::size_t t = max_level; t-- > 1;) {
 				if (has_previous) {
-#pragma omp parallel for schedule(static)
+#pragma omp for schedule(static)
 					for (node_id u : prev_build_nodes[t])
 						if (touched[u][t]) {
 							touched[u][t - 1] = true;
 							touched[*up[u][t - 1]][t - 1] = true;
 						}
 				} else {
-#pragma omp parallel for schedule(static)
+#pragma omp for schedule(static)
 					for (std::size_t u = 0; u < n; u++) {
 						if (touched[u][t]) {
 							touched[u][t - 1] = true;
