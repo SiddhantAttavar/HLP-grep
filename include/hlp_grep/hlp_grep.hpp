@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <iostream>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -125,21 +127,8 @@ public:
 	std::vector<Result> query(const std::string &query, int k) const {
 		if (dict.empty())
 			return {};
-		std::vector<std::size_t> eligible = sorted_path_ids;
 		const Query query_context(query, k);
-		std::vector<char> filtered(sorted_path_ids.size());
-		{
-			const std::size_t threads = static_cast<std::size_t>(
-				num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
-				: num_threads);
-#pragma omp parallel for schedule(dynamic) num_threads(threads)
-			for (std::size_t i = 0; i < sorted_path_ids.size(); i++) {
-				filtered[sorted_path_ids[i]] = filter_sequence(sorted_path_ids[i], query_context);
-			}
-		}
-		eligible.erase(std::remove_if(eligible.begin(), eligible.end(), [&](std::size_t id) {
-			return !filtered[id];
-		}), eligible.end());
+		std::vector<std::size_t> eligible = filter_sequences(query_context);
 		if (eligible.empty())
 			return {};
 		const auto distance_build_nodes =
@@ -177,6 +166,26 @@ public:
 		lifter.decompose(compressed_paths);
 		sort_compressed_paths();
 		all_build_nodes = lifter.mark(compressed_paths, sorted_path_ids);
+		build_inv_list();
+	}
+
+	void build_inv_list() {
+		std::size_t max_len = 0;
+		for (std::size_t id : sorted_path_ids) {
+			max_len = std::max(max_len, dict[id].size());
+		}
+		std::size_t max_level = 63 - __builtin_clzll(max_len);
+		inv_list.resize(max_level + 1);
+		for (std::size_t level = 0; level <= max_level; level++) {
+			std::size_t level_len = 1 << level;
+			for (std::size_t id : sorted_path_ids) {
+				inv_list[level].resize(std::max(inv_list[level].size(), dict[id].size() >> level));
+				for (std::size_t j = 0, pos = 0; pos + level_len <= dict[id].size(); j++, pos += level_len) {
+					StringHash::hash_t hash = dictionary_hashes[id].hash(pos, level_len);
+					inv_list[level][j][hash].push_back(id);
+				}
+			}
+		}
 	}
 
 	// -- implementation ----------------------------------------------------
@@ -212,26 +221,58 @@ public:
 		return lhs < rhs;
 	}
 
-	bool filter_sequence(std::size_t id, const Query &query) const {
-		const StringHash &text_hash = dictionary_hashes[id];
-		const std::size_t query_len = query.sequence.size();
-		const std::size_t text_len = text_hash.size();
-		const int k = query.k;
-		const int diag_delta = ((int) query_len) - ((int) text_len);
-		if (std::abs(diag_delta) > k) return false;
-
-		const int l = query.max_level - (64 - __builtin_clzll(k));
-		if (l < 0) return true;
-		int mismatches = 0;
-		for (std::size_t i = 0; i + (1 << l) <= text_len; i += 1 << l) {
-			StringHash::hash_type hash_val = text_hash.hash(i, 1 << l);
-			mismatches += query.hash_sets[l].find(hash_val) == query.hash_sets[l].end();
-			if (mismatches > k) {
-				return false;
+	std::vector<std::size_t> filter_sequences(const Query &query) const {
+		std::vector<int> matches(sorted_path_ids.size(), 0);
+		int level = -1, k = query.k;
+		std::size_t query_len = query.sequence.size();
+		for (std::size_t i = inv_list.size() - 1; i >= 0; i--) {
+			if (inv_list[i].size() > static_cast<std::size_t>(k)) {
+				level = static_cast<int>(i) - 1;
+				break;
 			}
 		}
-		return true;
-	};
+		if (level < 0) {
+			std::vector<std::size_t> eligible;
+			eligible.reserve(sorted_path_ids.size());
+			for (std::size_t id : sorted_path_ids) {
+				const int diag_delta = std::abs(static_cast<int>(query_len)
+										- static_cast<int>(dict[id].size()));
+				if (std::abs(diag_delta) <= k) {
+					eligible.push_back(id);
+				}
+			}
+			return eligible;
+		}
+		const int level_len = 1 << level;
+		for (std::size_t i = 0, pos = 0; i < inv_list[level].size() and
+			pos + level_len <= query_len; i++, pos += level_len) {
+			const std::size_t lo = pos >= static_cast<std::size_t>(k) ? pos - k : 0;
+			const std::size_t hi = std::min(query_len - level_len, pos + k);
+			for (std::size_t j = lo; j <= hi; j++) {
+				StringHash::hash_t hash = query.hash.hash(j, level_len);
+				const auto it = inv_list[level][i].find(hash);
+				if (it != inv_list[level][i].end()) {
+					for (std::size_t id : it->second) {
+						matches[id]++;
+					}
+				}
+			}
+		}
+
+		std::vector<std::size_t> eligible;
+		eligible.reserve(sorted_path_ids.size());
+		for (std::size_t id : sorted_path_ids) {
+			const int diag_delta = std::abs(static_cast<int>(query_len)
+									- static_cast<int>(dict[id].size()));
+			std::size_t threshold = std::max(query_len, dict[id].size()) >> level;
+			if (std::abs(diag_delta) <= k and
+				matches[id] >= static_cast<int>(threshold) - k) {
+				eligible.push_back(id);
+			}
+		}
+		std::cerr << eligible.size() << ' ' << level << ' ' << inv_list[level].size() << std::endl;
+		return eligible;
+	}
 
 	/** Number of saved states shared by two canonical path prefixes. */
 	static std::size_t common_prefix_states(
@@ -456,6 +497,7 @@ public:
 	/// Dictionary ids in lexicographic compressed-path order.
 	std::vector<std::size_t> sorted_path_ids;
 	std::vector<std::vector<size_t>> all_build_nodes;
+	std::vector<std::vector<std::unordered_map<StringHash::hash_t, std::vector<std::size_t>>>> inv_list;
 
 	/** Builds the merged compressed representation of every dictionary path. */
 	void build_compressed_paths() {

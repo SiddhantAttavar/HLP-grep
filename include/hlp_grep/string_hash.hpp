@@ -14,12 +14,12 @@ namespace hlp_grep {
 
 /** Immutable string with O(1) hash queries for arbitrary substrings. */
 struct StringHash {
-	using hash_type = std::uint64_t;
+	using hash_t = std::uint64_t;
 
 	explicit StringHash(const std::string &text) : text_size(text.size()) {
 		assert(text.size() <= MAX_LEN);
 		prefix_hash.resize(text_size + 1, 0);
-		hash_type z = 1;
+		hash_t z = 1;
 		for (std::size_t i = 0; i < text_size; ++i) {
 			prefix_hash[i + 1] = prefix_hash[i] + static_cast<unsigned char>(text[i]) * z;
 			z = z * HASH_BASE;
@@ -35,7 +35,7 @@ struct StringHash {
 	}
 
 	/** Hashes text[start..start + length) in O(1). */
-	hash_type hash(std::size_t start, std::size_t length) const {
+	hash_t hash(std::size_t start, std::size_t length) const {
 		assert(start <= text_size && length <= text_size - start);
 		const std::size_t end = start + length;
 		return (prefix_hash[end] - prefix_hash[start]) * inv_pow[start];
@@ -44,12 +44,12 @@ struct StringHash {
 	std::size_t size() const { return text_size; }
 
 private:
-	static constexpr hash_type HASH_BASE = 257ULL;
-	static constexpr hash_type INV_HASH_BASE = 18374966859414961921ULL;
+	static constexpr hash_t HASH_BASE = 257ULL;
+	static constexpr hash_t INV_HASH_BASE = 18374966859414961921ULL;
 
 	std::size_t text_size;
-	std::vector<hash_type> prefix_hash;
-	inline static std::vector<hash_type> inv_pow{1};
+	std::vector<hash_t> prefix_hash;
+	inline static std::vector<hash_t> inv_pow{1};
 };
 
 } // namespace hlp_grep
