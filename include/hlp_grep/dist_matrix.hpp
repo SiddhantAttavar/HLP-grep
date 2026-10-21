@@ -318,6 +318,10 @@ public:
 				static_cast<int>(input_range.first) - (k - vec.front()) + label_shift)),
 			std::min(col_range_value.second, input_range.second + (k - vec.back()) + label_shift)
 		};
+		if (output_range.first >= output_range.second) {
+			output_range = {output_range.second, output_range.second};
+			return {};
+		}
 		std::size_t col_offset = output_range.first - col_range_value.first;
 		std::vector<int> out(output_range.second - output_range.first, INF);
 		dnc_row(vec.data(), *this, out.data(), 0, out.size() - 1,

@@ -339,7 +339,10 @@ public:
 		const DistMatrix &mat = up_mat[u][level];
 		std::vector<int> row =
 		    mat.min_plus_apply(cost, k, pos_range, pos_range);
-		assert(pos_range == window(v));
+		assert(pos_range.first >= destination_window.first &&
+		       pos_range.second <= destination_window.second &&
+		       pos_range.first <= pos_range.second &&
+		       row.size() == pos_range.second - pos_range.first);
 		clip_row(row, pos_range);
 		cost = std::move(row);
 		return v;

@@ -224,7 +224,7 @@ public:
 		const auto occurs = [&](std::size_t start, std::size_t length) -> bool {
 			if (length > query_len) return false;
 			const std::size_t lo = start >= (std::size_t) -min_diag ? start + min_diag : 0;
-			const std::size_t hi = std::min(start + max_diag, query_len - length + 1);
+			const std::size_t hi = std::min(start + max_diag, query_len - length);
 			const StringHash::hash_type hash = text_hash.hash(start, length);
 			for (std::size_t i = lo; i <= hi; i++) {
 				if (query.hash.hash(i, length) == hash) {
