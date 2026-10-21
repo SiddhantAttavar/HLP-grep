@@ -247,7 +247,7 @@ public:
 				last_level[u] = t + 1;
 		for (std::size_t u = 0; u < n; ++u)
 			if (table[u].size() < last_level[u])
-				table[u].resize(last_level[u], DistMatrix(0, 0));
+				table[u].resize(last_level[u], DistMatrix(0, 0, 0));
 		// The per-node blocks are one task each with uniform cost; past
 		// ~8 threads barrier and spawn overhead dominates the level loop.
 		const int threads = static_cast<int>(
@@ -338,8 +338,7 @@ public:
 		       up_mat[u][level].num_cols() > 0);
 		const DistMatrix &mat = up_mat[u][level];
 		std::vector<int> row =
-		    mat.min_plus_apply(cost, pos_range);
-		pos_range = mat.col_range();
+		    mat.min_plus_apply(cost, k, pos_range, pos_range);
 		assert(pos_range == window(v));
 		clip_row(row, pos_range);
 		cost = std::move(row);

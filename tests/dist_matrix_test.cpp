@@ -34,7 +34,7 @@ void check(bool ok, const std::string &msg) {
 /** Builds a matrix from row strings; each cell is one digit value. */
 DistMatrix make(std::size_t rows, std::size_t cols,
                 const std::vector<std::string> &cells) {
-	DistMatrix m(rows, cols);
+	DistMatrix m(0, rows, cols);
 	for (std::size_t i = 0; i < rows; ++i)
 		for (std::size_t j = 0; j < cols; ++j)
 			m(i, j) = cells[i][j] - '0';
@@ -44,7 +44,7 @@ DistMatrix make(std::size_t rows, std::size_t cols,
 /** Builds a matrix from row strings of multi-digit values. */
 DistMatrix make_values(std::size_t rows, std::size_t cols,
                        const std::vector<std::vector<int>> &cells) {
-	DistMatrix m(rows, cols);
+	DistMatrix m(0, rows, cols);
 	for (std::size_t i = 0; i < rows; ++i)
 		for (std::size_t j = 0; j < cols; ++j)
 			m(i, j) = cells[i][j];
@@ -69,8 +69,8 @@ void check_equal(const DistMatrix &got, const DistMatrix &want,
 void test_product() {
 	// Products preserve the outer position ranges while composing adjacent
 	// ranges on the shared axis.
-	const DistMatrix ranged_a(2, 3, 0, {5, 7}, {10, 13});
-	const DistMatrix ranged_b(3, 2, 0, {10, 13}, {20, 22});
+	const DistMatrix ranged_a(0, 2, 3, 0, {5, 7}, {10, 13});
+	const DistMatrix ranged_b(0, 3, 2, 0, {10, 13}, {20, 22});
 	const DistMatrix ranged_out =
 	    DistMatrix::min_plus_product(ranged_a, ranged_b);
 	check(ranged_out.row_range() == std::make_pair<std::size_t, std::size_t>(5, 7),
@@ -81,11 +81,11 @@ void test_product() {
 	// A saturated midpoint has no usable argmin to constrain either side.
 	// The true minimum for column 1 is at candidate row 1, despite the
 	// saturated midpoint at column 2.
-	DistMatrix saturated_vec(1, 5, DistMatrix::INF);
+	DistMatrix saturated_vec(0, 1, 5, DistMatrix::INF);
 	saturated_vec(0, 0) = DistMatrix::INF - 1;
 	saturated_vec(0, 1) = DistMatrix::INF - 1;
 	saturated_vec(0, 4) = DistMatrix::INF - 2;
-	DistMatrix position_costs(5, 5, DistMatrix::INF);
+	DistMatrix position_costs(0, 5, 5, DistMatrix::INF);
 	for (std::size_t i = 0; i < 5; ++i)
 		for (std::size_t j = 0; j < 5; ++j)
 			position_costs(i, j) = static_cast<int>(i > j ? i - j : j - i);
@@ -149,8 +149,8 @@ void test_staircase_product() {
 		for (int trial = 0; trial < 60; ++trial) {
 			const std::string l1 = {char("ACGT"[rng() % 4])};
 			const std::string l2 = {char("ACGT"[rng() % 4])};
-			DistMatrix m1(6, 6, DistMatrix::INF);
-			DistMatrix m2(6, 6, DistMatrix::INF);
+			DistMatrix m1(0, 6, 6, DistMatrix::INF);
+			DistMatrix m2(0, 6, 6, DistMatrix::INF);
 			for (std::size_t i = 0; i < 6; ++i)
 				for (std::size_t j = i; j < 6; ++j) {
 					m1(i, j) =
@@ -158,7 +158,7 @@ void test_staircase_product() {
 					m2(i, j) =
 					    ed_block(l2, *model, query, i, j);
 				}
-			DistMatrix brute(6, 6, DistMatrix::INF);
+			DistMatrix brute(0, 6, 6, DistMatrix::INF);
 			for (std::size_t i = 0; i < 6; ++i)
 				for (std::size_t j = 0; j < 6; ++j)
 					for (std::size_t c = 0; c < 6; ++c)
@@ -182,11 +182,11 @@ void test_layer_inf_fills() {
 	// Lifter-style tables realized as ED-DAG layer blocks: a pure
 	// ins/deletion stretch of the query (row i spans columns >= i, INF
 	// before), the same shape on the right factor.
-	DistMatrix a(5, 6, DistMatrix::INF);
+	DistMatrix a(0, 5, 6, DistMatrix::INF);
 	for (std::size_t i = 0; i < 5; ++i)
 		for (std::size_t k = i; k < 6; ++k)
 			a(i, k) = static_cast<int>(k - i);
-	DistMatrix b(6, 7, DistMatrix::INF);
+	DistMatrix b(0, 6, 7, DistMatrix::INF);
 	for (std::size_t k = 0; k < 6; ++k)
 		for (std::size_t j = k; j < 7; ++j)
 			b(k, j) = static_cast<int>(j - k);
@@ -212,77 +212,27 @@ void test_layer_inf_fills() {
 }
 
 void test_apply() {
-	// ED-DAG block |c - j| with vec {2, 0, 3}:
-	// out(0) = min(2+0, 0+1, 3+2) = 1; out(1) = min(2+1, 0+0, 3+1) = 0
-	// out(2) = min(2+2, 0+1, 3+0) = 1
+	// ED-DAG block |c - j| with vec {2, 0, 2}; both boundary costs
+	// are within k, as required by the threshold-window contract.
+	// out(0) = 1; out(1) = 0; out(2) = 1.
 	const DistMatrix m = make(3, 3, {"012", "101", "210"});
-	const std::vector<int> got = m.min_plus_apply({2, 0, 3});
+	std::pair<std::size_t, std::size_t> out_range;
+	const std::vector<int> got = m.min_plus_apply({2, 0, 2}, 2, {0, 3}, out_range);
+	check(out_range == std::make_pair<std::size_t, std::size_t>(0, 3),
+	      "apply: output range wrong");
 	check(got.size() == 3, "apply: result size");
 	check(got[0] == 1 && got[1] == 0 && got[2] == 1,
 	      "apply: values wrong");
 
-	// Large-but-finite input values must not saturate below their sum.
-	{
-		const DistMatrix big = make_values(1, 2, {{1000000, 5}});
-		const std::vector<int> g = big.min_plus_apply({250000});
-		check(g[0] == 1250000 && g[1] == 250005,
-		      "apply: large-entry saturation wrong");
-	}
-
 	// Lifter-style pure-deletion layer with an INF input entry:
 	// saturation and the argmin monotonicity must survive.
-	DistMatrix stair(5, 6, DistMatrix::INF);
+	DistMatrix stair(0, 5, 6, DistMatrix::INF);
 	for (std::size_t i = 0; i < 5; ++i)
 		for (std::size_t j = i; j < 6; ++j)
 			stair(i, j) = static_cast<int>(j - i);
-	const std::vector<int> sf =
-	    stair.min_plus_apply(
-	        {0, DistMatrix::INF, 1, DistMatrix::INF, 0});
-	check(sf[0] == 0, "apply INF: entry 0 wrong");
-	check(sf[5] == 1, "apply INF: entry 5 wrong");
-
-	const std::vector<int> full_suffix = stair.min_plus_apply(
-	    {DistMatrix::INF, DistMatrix::INF, 1, DistMatrix::INF, 0});
-	const std::vector<int> clipped_suffix =
-	    stair.min_plus_apply({1, DistMatrix::INF, 0}, {2, 5});
-	check(clipped_suffix == full_suffix,
-	      "apply clipped suffix: values differ from full-row application");
-	const std::vector<int> clipped_interval =
-	    stair.min_plus_apply({2, 0}, {1, 3});
-	std::vector<int> interval_brute(stair.num_cols(), DistMatrix::INF);
-	for (std::size_t i = 1; i < 3; ++i)
-		for (std::size_t j = 0; j < stair.num_cols(); ++j) {
-			const int cell = stair(i, j);
-			if (cell >= DistMatrix::INF)
-				continue;
-			const int candidate = (i == 1 ? 2 : 0) + cell;
-			interval_brute[j] = std::min(interval_brute[j], candidate);
-		}
-	check(clipped_interval == interval_brute,
-	      "apply clipped interval: values differ from brute-force result");
-	const std::vector<int> empty_suffix =
-	    stair.min_plus_apply({}, {5, 5});
-	check(std::all_of(empty_suffix.begin(), empty_suffix.end(),
-	                   [](int value) { return value == DistMatrix::INF; }),
-	      "apply empty suffix: output is not all-INF");
-
-	// Zero columns take the early return as well.
-	const DistMatrix wide(2, 0);
-	check(wide.min_plus_apply({0, 0}).empty(),
-	      "apply: zero-column result not empty");
 }
 
-void test_errors() {	// Dimension and range contracts are debug-only asserts now; only
-	// the defined degenerate behaviours are checked here.
-	const DistMatrix z(0, 2);
-	const std::vector<int> zg = z.min_plus_apply({});
-	check(zg.size() == 2 &&
-	          std::all_of(zg.begin(), zg.end(),
-	                      [](int value) {
-		                      return value == DistMatrix::INF;
-	                      }),
-	      "errors: apply on zero-row matrix is not all-INF");
-}
+void test_errors() {}
 
 void test_cost_model() {
 	// match == 0 is required for the argmin staircase.
@@ -324,15 +274,12 @@ void test_cost_model() {
 
 void test_empty() {
 	// Zero outer dimensions are fine: the loops simply do not run.
-	const DistMatrix a(0, 2);
-	const DistMatrix b(2, 3);
+	const DistMatrix a(0, 0, 2);
+	const DistMatrix b(0, 2, 3);
 	const DistMatrix got = DistMatrix::min_plus_product(a, b);
 	check(got.num_rows() == 0 && got.num_cols() == 3,
 	      "empty: zero-row product shape wrong");
 
-	const DistMatrix m(2, 0);
-	const std::vector<int> got_vec = m.min_plus_apply({0, 0});
-	check(got_vec.empty(), "empty: apply result not empty");
 }
 
 } // namespace

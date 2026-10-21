@@ -40,8 +40,8 @@ public:
 	 * @param cols Number of columns.
 	 * @param fill Initial value for every entry (defaults to 0).
 	 */
-	DistMatrix(std::size_t rows, std::size_t cols, int fill = INF)
-	    : DistMatrix(rows, cols, fill, {0, rows}, {0, cols}) {}
+	DistMatrix(int label_shift, std::size_t rows, std::size_t cols, int fill = INF)
+	    : DistMatrix(label_shift, rows, cols, fill, {0, rows}, {0, cols}) {}
 
 	/**
 	 * @brief Constructs a matrix with explicit query-position ranges.
@@ -52,11 +52,11 @@ public:
 	 * @param row_range Half-open query-position range represented by rows.
 	 * @param col_range Half-open query-position range represented by columns.
 	 */
-	DistMatrix(std::size_t rows, std::size_t cols, int fill,
+	DistMatrix(int label_shift, std::size_t rows, std::size_t cols, int fill,
 	           std::pair<std::size_t, std::size_t> row_range,
 	           std::pair<std::size_t, std::size_t> col_range)
-	    : rows(rows), cols(cols), row_range_value(row_range),
-	      col_range_value(col_range),
+	    : label_shift(label_shift),rows(rows), cols(cols),
+		  row_range_value(row_range), col_range_value(col_range),
 	      data(rows * cols, fill) {
 		assert(row_range.second >= row_range.first &&
 		       row_range.second - row_range.first == rows);
@@ -78,6 +78,7 @@ public:
 		};
 		const auto [lo_u, hi_u] = window(u);
 		const auto [lo_v, hi_v] = window(v);
+		label_shift = 1;
 		rows = hi_u - lo_u;
 		cols = hi_v - lo_v;
 		row_range_value = {lo_u, hi_u};
@@ -194,7 +195,8 @@ public:
 		assert(a.cols == b.rows && a.cols > 0);
 		assert(a.col_range() == b.row_range());
 
-		DistMatrix out(a.rows, b.cols, INF, a.row_range(), b.col_range());
+		DistMatrix out(a.label_shift + b.label_shift,
+			a.rows, b.cols, INF, a.row_range(), b.col_range());
 		if (a.rows == 0 || b.cols == 0)
 			return out;
 		const std::size_t E = a.rows;
@@ -288,29 +290,6 @@ public:
 	}
 
 	/**
-	 * @brief Min-plus product of a row vector with this matrix.
-	 *
-	 * Computes `out(j) = min_i (vec(i) + (*this)(i, j))` with plain integer
-	 * addition. Candidates saturate at INF, so entries never exceed INF.
-	 *
-	 * This matrix must be a layer of an edit-distance DAG driven by a
-	 * CostModel-validated cost assignment, so for a fixed vec the
-	 * leftmost argmins of vec(i) + (*this)(i, j) are monotone in j (the
-	 * same non-crossing shortest-path argument as
-	 * min_plus_product): the result is found with divide-and-conquer in
-	 * O((rows + cols) log cols) argmin steps instead of the full
-	 * rows x cols scan.
-	 *
-	 * @param vec Row vector of costs, one per row of this matrix; entries
-	 *            must not exceed INF.
-	 * @return The resulting row vector, one entry per column.
-	 * @pre vec.size() == rows.
-	 */
-	std::vector<int> min_plus_apply(const std::vector<int> &vec) const {
-		return min_plus_apply(vec, row_range_value);
-	}
-
-	/**
 	 * @brief Applies this matrix to a contiguous subrange of its row range.
 	 *
 	 * The first element of @p vec corresponds to input_range.first. Rows
@@ -324,21 +303,25 @@ public:
 	 *      matches its width.
 	 */
 	std::vector<int> min_plus_apply(
-	    const std::vector<int> &vec,
-	    std::pair<std::size_t, std::size_t> input_range) const {
+	    const std::vector<int> &vec, int k,
+	    std::pair<std::size_t, std::size_t> input_range,
+		std::pair<std::size_t, std::size_t> &output_range) const {
 		assert(input_range.first >= row_range_value.first &&
 		       input_range.second <= row_range_value.second &&
 		       input_range.first <= input_range.second);
-		const std::size_t offset = input_range.first - row_range_value.first;
+		const std::size_t row_offset = input_range.first - row_range_value.first;
 		assert(vec.size() == input_range.second - input_range.first);
+		assert(!vec.empty() and vec.front() <= k and vec.back() <= k);
 
-		std::vector<int> out(cols, INF);
-		if (cols == 0)
-			return out;
-		if (vec.empty())
-			return out;
-		dnc_row(vec.data(), *this, out.data(), 0, cols - 1,
-		           offset, offset + vec.size() - 1, nullptr, offset);
+		output_range = {
+			static_cast<std::size_t>(std::max(static_cast<int>(col_range_value.first),
+				static_cast<int>(input_range.first) - (k - vec.front()) + label_shift)),
+			std::min(col_range_value.second, input_range.second + (k - vec.back()) + label_shift)
+		};
+		std::size_t col_offset = output_range.first - col_range_value.first;
+		std::vector<int> out(output_range.second - output_range.first, INF);
+		dnc_row(vec.data(), *this, out.data(), 0, out.size() - 1,
+		    row_offset, row_offset + vec.size() - 1, nullptr, row_offset, col_offset);
 		return out;
 	}
 
@@ -397,14 +380,15 @@ private:
 	                       std::size_t j_lo, std::size_t j_hi,
 	                       std::size_t k_lo, std::size_t k_hi,
 	                       std::vector<std::size_t> *found = nullptr,
-	                       std::size_t a_offset = 0, int k = INF - 1) {
+	                       std::size_t a_offset = 0, std::size_t b_offset = 0) {
 		assert(j_lo <= j_hi && k_lo <= k_hi);
 		const std::size_t j_mid = (j_lo + j_hi) / 2;
+		const std::size_t j_act = j_mid + b_offset;
 		std::size_t best_k = k_lo;
 		int best = std::min(INF,
-			arow[k_lo - a_offset] + b.data[k_lo * b.cols + j_mid]);
+			arow[k_lo - a_offset] + b.data[k_lo * b.cols + j_act]);
 		for (std::size_t k = k_lo + 1; k <= k_hi; ++k) {
-			int cand = arow[k - a_offset] + b.data[k * b.cols + j_mid];
+			int cand = arow[k - a_offset] + b.data[k * b.cols + j_act];
 			if (cand < best) {
 				best = cand;
 				best_k = k;
@@ -423,12 +407,13 @@ private:
 		const std::size_t right_k_lo = has_argmin ? best_k : k_lo;
 		if (j_mid > j_lo)
 			dnc_row(arow, b, orow, j_lo, j_mid - 1, k_lo, left_k_hi,
-			           found, a_offset, k);
+			           found, a_offset, b_offset);
 		if (j_mid < j_hi)
 			dnc_row(arow, b, orow, j_mid + 1, j_hi, right_k_lo, k_hi,
-			           found, a_offset, k);
+			           found, a_offset, b_offset);
 	}
 
+	int label_shift;       ///< Label shift
 	std::size_t rows;      ///< Number of rows.
 	std::size_t cols;      ///< Number of columns.
 	/// Half-open query-position ranges represented by rows and columns.
