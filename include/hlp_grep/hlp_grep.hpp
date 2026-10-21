@@ -213,29 +213,24 @@ public:
 	}
 
 	bool filter_sequence(std::size_t id, const Query &query) const {
+		const StringHash &text_hash = dictionary_hashes[id];
 		const std::size_t query_len = query.sequence.size();
+		const std::size_t text_len = text_hash.size();
 		const int k = query.k;
-		const int diag_delta = ((int) query_len) - ((int) dict[id].size());
+		const int diag_delta = ((int) query_len) - ((int) text_len);
 		if (std::abs(diag_delta) > k) return false;
 
-		const StringHash &text_hash = dictionary_hashes[id];
-		std::size_t start = 0;
-		for (int i = 0; i < k; i++) {
-			bool flag = false;
-			for (int j = 0; j <= query.max_level and start + (1 << j) <= text_hash.size(); j++) {
-				StringHash::hash_type hash = text_hash.hash(start, 1 << j);
-				if (query.hash_sets[j].find(hash) == query.hash_sets[j].end()) {
-					flag = true;
-					start += 1 << j;
-					break;
-				}
+		const int l = query.max_level - (64 - __builtin_clzll(k));
+		if (l < 0) return true;
+		int mismatches = 0;
+		for (std::size_t i = 0; i + (1 << l) <= text_len; i += 1 << l) {
+			StringHash::hash_type hash_val = text_hash.hash(i, 1 << l);
+			mismatches += query.hash_sets[l].find(hash_val) == query.hash_sets[l].end();
+			if (mismatches > k) {
+				return false;
 			}
-			if (!flag or start >= text_hash.size())
-				return true;
 		}
-		int j = std::min(query.max_level, 63 - __builtin_clzll(text_hash.size() - start));
-		StringHash::hash_type hash = text_hash.hash(start, 1 << j);
-		return query.hash_sets[j].find(hash) != query.hash_sets[j].end();
+		return true;
 	};
 
 	/** Number of saved states shared by two canonical path prefixes. */
