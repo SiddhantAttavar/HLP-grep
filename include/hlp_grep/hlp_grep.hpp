@@ -217,44 +217,25 @@ public:
 		const int k = query.k;
 		const int diag_delta = ((int) query_len) - ((int) dict[id].size());
 		if (std::abs(diag_delta) > k) return false;
-		const int min_diag = std::min(diag_delta, 0) - (k - std::abs(diag_delta)) / 2;
-		const int max_diag = std::max(diag_delta, 0) + (k - std::abs(diag_delta)) / 2;
 
 		const StringHash &text_hash = dictionary_hashes[id];
-		const auto occurs = [&](std::size_t start, std::size_t length) -> bool {
-			if (length > query_len) return false;
-			const std::size_t lo = start >= (std::size_t) -min_diag ? start + min_diag : 0;
-			const std::size_t hi = std::min(start + max_diag, query_len - length);
-			const StringHash::hash_type hash = text_hash.hash(start, length);
-			for (std::size_t i = lo; i <= hi; i++) {
-				if (query.hash.hash(i, length) == hash) {
-					return true;
-				}
-			}
-			return false;
-		};
 		std::size_t start = 0;
-		std::size_t absent = 0;
-		const std::size_t limit = static_cast<std::size_t>(k);
-		while (start < text_hash.size() && absent < limit) {
-			std::size_t low = 1;
-			std::size_t high = text_hash.size() - start;
-			std::size_t first_absent = high + 1;
-			while (low <= high) {
-				const std::size_t mid = (low + high) / 2;
-				if (occurs(start, mid))
-					low = mid + 1;
-				else {
-					first_absent = mid;
-					high = mid - 1;
+		for (int i = 0; i < k; i++) {
+			bool flag = false;
+			for (int j = 0; j <= query.max_level and start + (1 << j) <= text_hash.size(); j++) {
+				StringHash::hash_type hash = text_hash.hash(start, 1 << j);
+				if (query.hash_sets[j].find(hash) == query.hash_sets[j].end()) {
+					flag = true;
+					start += 1 << j;
+					break;
 				}
 			}
-			if (first_absent > text_hash.size() - start)
+			if (!flag or start >= text_hash.size())
 				return true;
-			++absent;
-			start += first_absent;
 		}
-		return occurs(start, text_hash.size() - start);
+		int j = std::min(query.max_level, 63 - __builtin_clzll(text_hash.size() - start));
+		StringHash::hash_type hash = text_hash.hash(start, 1 << j);
+		return query.hash_sets[j].find(hash) != query.hash_sets[j].end();
 	};
 
 	/** Number of saved states shared by two canonical path prefixes. */
