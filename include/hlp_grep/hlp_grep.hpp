@@ -288,7 +288,6 @@ public:
 				eligible.push_back(id);
 			}
 		}
-		std::cerr << eligible.size() << ' ' << level << ' ' << inv_list[level].size() << std::endl;
 		return eligible;
 	}
 
@@ -523,6 +522,8 @@ public:
 					} else if (change) {
 						break;
 					}
+				} else if (change) {
+					break;
 				}
 				++output_diagonal;
 			}
