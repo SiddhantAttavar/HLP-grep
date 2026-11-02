@@ -6,6 +6,7 @@
  *
  * Usage: bench --method hlp_grep [--method naive ...] <testcase-file>
  *              [--out out.json] [--index graph.hlpg]
+ *              [--scorer default|a-star]
  *
  * The hlp_grep method accepts a prebuilt index file (written by `save`)
  * via --index: the solver is reconstructed from it without building the
@@ -160,11 +161,12 @@ std::vector<Result> from_dt_patricia(
 #endif
 
 /** Answers every testcase query with an hlp_grep solver and reports it. */
-void report_hlp_queries(int fd, const Solver &solver, const Testcase &tc) {
+void report_hlp_queries(int fd, const Solver &solver, const Testcase &tc,
+                        Solver::Scorer scorer) {
 	for (std::size_t i = 0; i < tc.queries.size(); ++i) {
 		const auto [k, query] = tc.queries[i];
 		const auto b = std::chrono::steady_clock::now();
-		const auto results = solver.query(query, k);
+		const auto results = solver.query(query, k, scorer);
 		const auto e = std::chrono::steady_clock::now();
 		report_query(fd, i, k, results, b, e);
 	}
@@ -325,7 +327,8 @@ private:
  * zero build time like the index-free methods.
  */
 void run_method(int fd, const std::string &method, const Testcase &tc,
-                bool compact_nodes, const std::string &index_file) {
+                bool compact_nodes, const std::string &index_file,
+                Solver::Scorer scorer) {
 	if (method == "hlp_grep") {
 		if (index_file.empty()) {
 			const auto build_b = std::chrono::steady_clock::now();
@@ -333,11 +336,11 @@ void run_method(int fd, const std::string &method, const Testcase &tc,
 			const auto build_e = std::chrono::steady_clock::now();
 			write_all(fd, "BUILD " + std::to_string(elapsed_ms(build_b, build_e)) +
 			                  "\n");
-			report_hlp_queries(fd, solver, tc);
+			report_hlp_queries(fd, solver, tc, scorer);
 		} else {
 			const Solver solver = load_hlp_index(index_file, tc);
 			write_all(fd, "BUILD 0\n");
-			report_hlp_queries(fd, solver, tc);
+			report_hlp_queries(fd, solver, tc, scorer);
 		}
 #ifdef HLP_GREP_WITH_WFA2
 	} else if (method == "wfa") {
@@ -676,7 +679,8 @@ void run_method(int fd, const std::string &method, const Testcase &tc,
 std::optional<MethodRun> measure_method(const std::string &method,
                                          const Testcase &tc,
                                          bool compact_nodes,
-                                         const std::string &index_file) {
+                                         const std::string &index_file,
+                                         Solver::Scorer scorer) {
 	int pipefd[2];
 	if (pipe(pipefd) != 0) {
 		std::cerr << "pipe() failed\n";
@@ -689,8 +693,8 @@ std::optional<MethodRun> measure_method(const std::string &method,
 	}
 	if (pid == 0) {
 		close(pipefd[0]);
-		run_method(pipefd[1], method, tc, compact_nodes,
-		           index_file); // never returns
+		run_method(pipefd[1], method, tc, compact_nodes, index_file,
+		           scorer); // never returns
 	}
 	close(pipefd[1]);
 
@@ -756,7 +760,7 @@ std::optional<MethodRun> measure_method(const std::string &method,
 	std::cerr << "usage: " << argv0
 	          << " --method hlp_grep [--method naive|wfa|dt_patricia|bed_tree|hstree|edlib|parasail ...]"
 	          << " <testcase-file> [--out out.json] [--no-compact]"
-	          << " [--index graph.hlpg]\n";
+	          << " [--index graph.hlpg] [--scorer default|a-star]\n";
 	std::exit(1);
 }
 
@@ -794,6 +798,8 @@ int main(int argc, char **argv) {
 	std::vector<std::string> method_names;
 	std::string testcase, out_path, index_file;
 	bool compact_nodes = true;
+	Solver::Scorer scorer = Solver::Scorer::DEFAULT;
+	bool scorer_explicit = false;
 	for (int i = 1; i < argc; ++i) {
 		const std::string arg = argv[i];
 		if (arg == "--method") {
@@ -808,6 +814,19 @@ int main(int argc, char **argv) {
 			if (i + 1 >= argc)
 				usage(argv[0]);
 			index_file = argv[++i];
+		} else if (arg == "--scorer") {
+			if (i + 1 >= argc)
+				usage(argv[0]);
+			const std::string value = argv[++i];
+			scorer_explicit = true;
+			if (value == "default")
+				scorer = Solver::Scorer::DEFAULT;
+			else if (value == "a-star")
+				scorer = Solver::Scorer::A_STAR;
+			else {
+				std::cerr << "unknown scorer: '" << value << "'\n";
+				usage(argv[0]);
+			}
 		} else if (arg == "--no-compact") {
 			compact_nodes = false; // POAGraph run compaction off
 		} else if (!arg.empty() && arg[0] != '-' && testcase.empty()) {
@@ -820,6 +839,12 @@ int main(int argc, char **argv) {
 	if (method_names.empty()) {
 		std::cerr << "missing --method (repeatable)\n";
 		usage(argv[0]);
+	}
+	if (scorer_explicit &&
+	    std::find(method_names.begin(), method_names.end(), "hlp_grep") ==
+	        method_names.end()) {
+		std::cerr << "--scorer applies only to --method hlp_grep\n";
+		return 1;
 	}
 	for (const auto &method : method_names) {
 		if (method != "hlp_grep" && method != "naive" && method != "wfa" &&
@@ -949,7 +974,8 @@ int main(int argc, char **argv) {
 
 	std::vector<MethodRun> runs;
 	for (const auto &method : method_names) {
-		auto run = measure_method(method, tc, compact_nodes, index_file);
+		auto run = measure_method(method, tc, compact_nodes, index_file,
+		                          scorer);
 		if (!run)
 			return 1;
 		runs.push_back(std::move(*run));
@@ -972,8 +998,13 @@ int main(int argc, char **argv) {
 	json << std::fixed << std::setprecision(6);
 	json << "{\n"
 	     << "  \"testcase\": \"" << file.string() << "\",\n"
-	     << "  \"compact_nodes\": " << (compact_nodes ? "true" : "false" ) << ",\n"
-	     << "  \"dict_size\": " << tc.dict.size() << ",\n"
+	     << "  \"compact_nodes\": " << (compact_nodes ? "true" : "false" ) << ",\n";
+	if (std::find(method_names.begin(), method_names.end(), "hlp_grep") !=
+	    method_names.end())
+		json << "  \"hlp_grep_scorer\": \""
+		     << (scorer == Solver::Scorer::DEFAULT ? "default" : "a-star")
+		     << "\",\n";
+	json << "  \"dict_size\": " << tc.dict.size() << ",\n"
 	     << "  \"num_queries\": " << tc.queries.size() << ",\n";
 	if (sorted.empty()) {
 		json << "  \"dict_len_min\": 0, \"dict_len_max\": 0,\n"

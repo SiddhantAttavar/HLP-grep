@@ -70,6 +70,22 @@ int main() {
 }
 ```
 
+Queries use the default row-based scorer unless explicitly selected otherwise.
+The A* scorer can also be selected through the API:
+
+```cpp
+auto matches = solver.query(query, k, hlp_grep::Solver::Scorer::A_STAR);
+```
+
+The `bench` and `load` helpers accept `--scorer default|a-star`; `default` is
+used when the option is omitted. For example:
+
+```sh
+build/tests/bench --method hlp_grep tests/testcases/manual/01_basic.txt \
+  --scorer a-star
+build/tests/load testcase.txt graph.hlpg --scorer a-star
+```
+
 ### Save and load the graph
 
 `Solver::save_graph()` writes the finalized POA graph, including node labels,
@@ -133,8 +149,8 @@ argument when no explicit model is supplied).
 The constructor enforces the structural precondition behind the
 argmin-staircase composition used by `DistMatrix::min_plus_product`
 (non-crossing shortest paths in the edit-distance DAG): `match == 0`,
-nonnegative `ins`/`del` and `ins + del >= mismatch`; violating models
-throw `std::invalid_argument`.
+positive `ins`/`del`/`mismatch`, and `ins + del >= mismatch`;
+violating models throw `std::invalid_argument`.
 
 ```cpp
 // Heavier noise operations: alignments prefer matching bases and

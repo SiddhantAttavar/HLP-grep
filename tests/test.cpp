@@ -108,6 +108,19 @@ void test_testcase(const fs::path &file, const Testcase &tc,
 	for (std::size_t q = 0; q < tc.queries.size(); ++q) {
 		const auto &[k, query] = tc.queries[q];
 		const auto results = solver.query(query, k);
+		const auto astar_results = solver.query(query, k, Solver::Scorer::A_STAR);
+		if (astar_results.size() != results.size()) {
+			std::cerr << file << ": A* returned a different match count for query "
+			          << q << '\n';
+			std::exit(1);
+		}
+		for (std::size_t i = 0; i < results.size(); ++i)
+			if (astar_results[i].id != results[i].id ||
+			    astar_results[i].dist != results[i].dist) {
+				std::cerr << file << ": A* result mismatch for query " << q
+				          << " at result " << i << '\n';
+				std::exit(1);
+			}
 
 		if (results.size() != expected[q].ids.size()) {
 			std::cerr << file << ": query " << q << " (\"" << query << "\", k=" << k
@@ -172,14 +185,26 @@ void test_query_prefix_sharing() {
 	}
 	const Solver loaded = Solver::load_graph(cache_file.string());
 	const auto loaded_results = loaded.query("ACGT", 1);
+	const auto loaded_astar_results =
+	    loaded.query("ACGT", 1, Solver::Scorer::A_STAR);
 	if (loaded_results.size() != results.size()) {
 		std::cerr << "persistence: loaded solver returned different result count\n";
+		std::exit(1);
+	}
+	if (loaded_astar_results.size() != results.size()) {
+		std::cerr << "persistence: loaded A* solver returned different result count\n";
 		std::exit(1);
 	}
 	for (std::size_t i = 0; i < results.size(); ++i)
 		if (loaded_results[i].id != results[i].id ||
 		    loaded_results[i].dist != results[i].dist) {
 			std::cerr << "persistence: loaded solver result differs\n";
+			std::exit(1);
+		}
+	for (std::size_t i = 0; i < results.size(); ++i)
+		if (loaded_astar_results[i].id != results[i].id ||
+		    loaded_astar_results[i].dist != results[i].dist) {
+			std::cerr << "persistence: loaded A* solver result differs\n";
 			std::exit(1);
 		}
 	std::filesystem::remove(cache_file);
@@ -196,6 +221,35 @@ void test_query_prefix_sharing() {
 	    within_threshold[0].dist != 2) {
 		std::cerr << "prefix-sharing: two-sided row clipping lost an endpoint match\n";
 		std::exit(1);
+	}
+	const auto weighted_astar =
+	    weighted_solver.query("AAA", 2, Solver::Scorer::A_STAR);
+	if (weighted_astar.size() != within_threshold.size() ||
+	    weighted_astar.empty() ||
+	    weighted_astar[0].id != within_threshold[0].id ||
+	    weighted_astar[0].dist != within_threshold[0].dist) {
+		std::cerr << "A*: weighted-cost result differs from default scorer\n";
+		std::exit(1);
+	}
+	const std::vector<std::string> weighted_dict{
+	    "ACGTACGT", "ACGTACGT", "ACGTTCGT", "ACGTCGT", "TCGTACGT"};
+	const Solver weighted_paths(weighted_dict, weighted);
+	for (const auto &[query, threshold] :
+	     std::vector<std::pair<std::string, int>>{
+	         {"ACGTACGT", 0}, {"ACGTTCGT", 3}, {"ACGACGT", 4},
+	         {"TCGTACG", 5}, {"AAAA", 6}}) {
+		const auto expected = weighted_paths.query(query, threshold);
+		const auto got = weighted_paths.query(
+		    query, threshold, Solver::Scorer::A_STAR);
+		if (got.size() != expected.size()) {
+			std::cerr << "A*: weighted path query returned a different match count\n";
+			std::exit(1);
+		}
+		for (std::size_t i = 0; i < got.size(); ++i)
+			if (got[i].id != expected[i].id || got[i].dist != expected[i].dist) {
+				std::cerr << "A*: weighted path query result differs\n";
+				std::exit(1);
+		}
 	}
 	std::cout << "PASS query-prefix-sharing\n";
 }

@@ -14,6 +14,7 @@
  * dictionary (its stored cost model must also match the testcase's).
  *
  * Usage: load <testcase-file> <graph-file> [--out <sol-file>]
+ *             [--scorer default|a-star]
  */
 
 #include <hlp_grep/hlp_grep.hpp>
@@ -34,7 +35,8 @@ namespace {
 
 [[noreturn]] void usage(const char *argv0) {
 	std::cerr << "usage: " << argv0
-	          << " <testcase-file> <graph-file> [--out <sol-file>]\n";
+	          << " <testcase-file> <graph-file> [--out <sol-file>]"
+	          << " [--scorer default|a-star]\n";
 	std::exit(1);
 }
 
@@ -53,12 +55,25 @@ int main(int argc, char **argv) {
 	std::string testcase;
 	std::string graph_file;
 	std::string out_path;
+	Solver::Scorer scorer = Solver::Scorer::DEFAULT;
 	for (int i = 1; i < argc; ++i) {
 		const std::string arg = argv[i];
 		if (arg == "--out") {
 			if (i + 1 >= argc)
 				usage(argv[0]);
 			out_path = argv[++i];
+		} else if (arg == "--scorer") {
+			if (i + 1 >= argc)
+				usage(argv[0]);
+			const std::string value = argv[++i];
+			if (value == "default")
+				scorer = Solver::Scorer::DEFAULT;
+			else if (value == "a-star")
+				scorer = Solver::Scorer::A_STAR;
+			else {
+				std::cerr << "unknown scorer: '" << value << "'\n";
+				usage(argv[0]);
+			}
 		} else if (!arg.empty() && arg[0] != '-' && testcase.empty()) {
 			testcase = arg;
 		} else if (!arg.empty() && arg[0] != '-' && graph_file.empty()) {
@@ -95,7 +110,7 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	for (const auto &[k, query] : tc.queries) {
-		const auto results = solver.query(query, k);
+		const auto results = solver.query(query, k, scorer);
 
 		out << results.size() << '\n';
 		for (std::size_t i = 0; i < results.size(); ++i)

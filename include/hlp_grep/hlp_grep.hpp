@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
+#include <limits>
 #include <iostream>
 #include <numeric>
 #include <string>
@@ -42,6 +44,7 @@ namespace hlp_grep {
  */
 class Solver {
 public:
+	enum class Scorer { DEFAULT, A_STAR };
 	/**
 	 * @brief Constructs the solver over the given sequence dictionary.
 	 *
@@ -94,7 +97,7 @@ public:
 
 	/**
 	 * @brief Finds all dictionary sequences within edit distance k of the
-	 *        query.
+	 *        query using the default row-based scorer.
 	 *
 	 * Applies a conservative substring-hash filter after the length bound,
 	 * builds chain tables only for surviving paths, then scores those
@@ -125,6 +128,18 @@ public:
 	 *         ascending order.
 	 */
 	std::vector<Result> query(const std::string &query, int k) const {
+		return this->query(query, k, Scorer::DEFAULT);
+	}
+
+	/**
+	 * @brief Finds matches using the selected path-scoring algorithm.
+	 *
+	 * Both scorers share candidate filtering and query-specific lifter-table
+	 * construction. A_STAR expands sparse path states with bounded distance
+	 * buckets; DEFAULT scores rows while sharing common compressed prefixes.
+	 */
+	std::vector<Result> query(const std::string &query, int k,
+	                          Scorer scorer) const {
 		if (dict.empty())
 			return {};
 		const Query query_context(query, k);
@@ -135,6 +150,8 @@ public:
 		    lifter.mark(compressed_paths, eligible, all_build_nodes);
 		if (!eligible.empty())
 			lifter.build(query_context, distance_build_nodes);
+		if (scorer == Scorer::A_STAR)
+			return score_paths_astar(query, k, eligible);
 		return score_paths(query, k, eligible, compressed_paths);
 	}
 
@@ -164,6 +181,7 @@ public:
 			dictionary_hashes.emplace_back(sequence);
 		build_compressed_paths();
 		lifter.decompose(compressed_paths);
+		build_search_paths();
 		sort_compressed_paths();
 		all_build_nodes = lifter.mark(compressed_paths, sorted_path_ids);
 		build_inv_list();
@@ -222,9 +240,9 @@ public:
 	}
 
 	std::vector<std::size_t> filter_sequences(const Query &query) const {
-		std::vector<int> matches(sorted_path_ids.size(), 0);
 		int level = -1, k = query.k;
 		std::size_t query_len = query.sequence.size();
+		std::vector<int> matches(sorted_path_ids.size(), 0);
 		for (std::size_t i = inv_list.size() - 1; i >= 0; i--) {
 			if (inv_list[i].size() > static_cast<std::size_t>(k)) {
 				level = static_cast<int>(i) - 1;
@@ -337,6 +355,217 @@ public:
 		}
 
 		return collect_results(dist, k);
+	}
+
+	struct SearchState {
+		std::size_t offset;
+		std::size_t diagonal_index;
+		int distance;
+	};
+
+	struct PathSearchIndex {
+		std::vector<std::size_t> step_len;
+		std::vector<std::size_t> seq_pos;
+		std::vector<POAGraph::node_id> node;
+	};
+
+	/** Scores eligible paths independently with bounded A* distance buckets. */
+	std::vector<Result> score_paths_astar(
+	    const std::string &query, int k,
+	    const std::vector<std::size_t> &eligible) const {
+		std::vector<int> dist(dict.size(), DistMatrix::INF);
+		if (!eligible.empty()) {
+			const std::size_t thread_count = static_cast<std::size_t>(
+			    num_threads == 0 ? std::max(omp_get_max_threads() / 2, 1)
+			                    : num_threads);
+			const std::size_t active_threads =
+			    std::min(thread_count, eligible.size());
+#pragma omp parallel for schedule(dynamic) num_threads(active_threads)
+			for (std::size_t i = 0; i < eligible.size(); ++i)
+				dist[eligible[i]] = score_path_astar(query, k, eligible[i]);
+		}
+		return collect_results(dist, k);
+	}
+
+	/** Computes one exact path distance using bounded A* state expansion. */
+	int score_path_astar(const std::string &query, int k,
+	                     std::size_t id) const {
+		const PathSearchIndex &path = search_paths[id];
+		const std::size_t sequence_length = path.seq_pos.back();
+		const long diag_delta = static_cast<long>(query.size()) -
+		                        static_cast<long>(sequence_length);
+		if (std::abs(diag_delta) > k)
+			return DistMatrix::INF;
+
+		const long max_shift = (k - std::abs(diag_delta)) / 2;
+		const long min_diag = std::min(0L, diag_delta) - max_shift;
+		const long max_diag = std::max(0L, diag_delta) + max_shift;
+		const std::size_t state_count = path.seq_pos.size();
+		const std::size_t width = static_cast<std::size_t>(max_diag - min_diag + 1);
+		std::vector<int> best(state_count * width, DistMatrix::INF);
+		std::vector<std::vector<SearchState>> buckets(
+		    static_cast<std::size_t>(k) + 1);
+
+		auto relax = [&](std::size_t offset, int diagonal, int candidate) {
+			const long query_pos = static_cast<long>(path.seq_pos[offset]) + diagonal;
+			if (query_pos < 0 || query_pos > static_cast<long>(query.size()))
+				return;
+			const int heuristic = static_cast<int>(
+			    std::abs(diagonal - static_cast<int>(diag_delta)));
+			if (candidate > k - heuristic)
+				return;
+			const int f_score = candidate + heuristic;
+			const std::size_t diagonal_index =
+			    static_cast<std::size_t>(diagonal - min_diag);
+			int &known = best[offset * width + diagonal_index];
+			if (candidate < known) {
+				known = candidate;
+				buckets[static_cast<std::size_t>(f_score)].push_back(
+				    {offset, diagonal_index, candidate});
+			}
+		};
+		relax(0, 0, 0);
+
+		for (int f_score = 0; f_score <= k; ++f_score) {
+			auto &bucket = buckets[static_cast<std::size_t>(f_score)];
+			for (std::size_t cursor = 0; cursor < bucket.size(); ++cursor) {
+				const SearchState state = bucket[cursor];
+				if (best[state.offset * width + state.diagonal_index] !=
+				    state.distance)
+					continue;
+
+				const int diagonal = static_cast<int>(
+				    static_cast<long>(state.diagonal_index) + min_diag);
+				const long query_pos =
+				    static_cast<long>(path.seq_pos[state.offset]) + diagonal;
+				if (state.offset + 1 == state_count &&
+				    query_pos == static_cast<long>(query.size()))
+					return state.distance;
+
+				relax(state.offset, diagonal + 1,
+				      state.distance + cost.ins());
+				if (state.offset + 1 == state_count)
+					continue;
+
+				const std::size_t next_offset = state.offset + 1;
+				if (path.step_len[state.offset] == 0) {
+					relax(next_offset, diagonal - 1,
+					      state.distance + cost.del());
+					if (query_pos < static_cast<long>(query.size())) {
+						const auto node = path.node[state.offset];
+						const int substitution = cost.consume(
+						    graph.seq(node),
+						    query[static_cast<std::size_t>(query_pos)]);
+						relax(next_offset, diagonal,
+						      state.distance + substitution);
+					}
+					continue;
+				}
+
+				const std::size_t best_index =
+				    state.offset * width + state.diagonal_index;
+				if (state.diagonal_index > 0 &&
+				    state.distance - cost.ins() == best[best_index - 1])
+					continue;
+
+				const std::size_t label_shift =
+				    path.seq_pos[next_offset] - path.seq_pos[state.offset];
+				if (diagonal < max_diag - 1 &&
+				    state.distance - cost.ins() == best[best_index + 1]) {
+					const long deletion_cost =
+					    static_cast<long>(label_shift) * cost.del();
+					if (deletion_cost <= std::numeric_limits<int>::max() -
+					                         state.distance)
+						relax(next_offset,
+						      diagonal - static_cast<int>(label_shift),
+						      state.distance + static_cast<int>(deletion_cost));
+					continue;
+				}
+
+				const auto node = path.node[state.offset];
+				const DistMatrix &mat = lifter.jump_mat(
+				    node, static_cast<int>(path.step_len[state.offset]));
+				const auto [col_lo, col_hi] = mat.col_range();
+				const std::size_t target_pos =
+				    static_cast<std::size_t>(query_pos) + label_shift;
+				const int curr_delta = static_cast<int>(diag_delta) - diagonal;
+				const std::size_t shifted_target_pos = std::max(
+				    0L, static_cast<long>(target_pos + curr_delta));
+				const long jump_max_shift =
+				    (k - state.distance - std::abs(curr_delta)) / 2;
+				const std::size_t lo = std::max(
+				    static_cast<long>(col_lo),
+				    static_cast<long>(std::min(shifted_target_pos, target_pos)) -
+				        jump_max_shift);
+				const std::size_t hi = std::min(
+				    col_hi,
+				    std::max(shifted_target_pos, target_pos) + jump_max_shift + 1);
+				bool change = false;
+				const std::size_t matrix_row =
+				    static_cast<std::size_t>(query_pos) - mat.row_range().first;
+			int output_diagonal =
+			    static_cast<int>(lo) -
+			    static_cast<int>(path.seq_pos[next_offset]);
+			for (std::size_t b = lo; b < hi; ++b) {
+				const int next_distance =
+				    state.distance + mat(matrix_row, b - col_lo);
+				const int delta =
+				    std::abs(output_diagonal - static_cast<int>(diag_delta));
+				const int f_score = next_distance + delta;
+				if (f_score <= k) {
+					const std::size_t d = output_diagonal - min_diag;
+					int &known = best[next_offset * width + d];
+					if (next_distance < known) {
+						known = next_distance;
+						buckets[static_cast<std::size_t>(f_score)].push_back(
+						    {next_offset, d, next_distance});
+						change = true;
+					} else if (change) {
+						break;
+					}
+				}
+				++output_diagonal;
+			}
+			}
+		}
+		return DistMatrix::INF;
+	}
+
+	/** Builds A* coordinates once from the already-decomposed paths. */
+	void build_search_paths() {
+		search_paths.clear();
+		search_paths.resize(compressed_paths.size());
+		for (std::size_t id = 0; id < compressed_paths.size(); ++id) {
+			const auto &cp = compressed_paths[id];
+			auto &index = search_paths[id];
+			POAGraph::node_id current = cp.start;
+			std::size_t sequence_offset = 0;
+			auto append_label = [&](POAGraph::node_id node) {
+				index.step_len.push_back(0);
+				index.seq_pos.push_back(sequence_offset++);
+				index.node.push_back(node);
+			};
+			append_label(current);
+			for (const auto &step : cp.steps) {
+				if (step.type == POAGraph::EdgeType::LIGHT) {
+					current = step.next;
+					append_label(current);
+				} else if (step.length == 1) {
+					current = *graph.node(current).heavy_neighbour;
+					append_label(current);
+				} else {
+					index.step_len.push_back(step.length);
+					index.seq_pos.push_back(sequence_offset);
+					index.node.push_back(current);
+					sequence_offset += static_cast<std::size_t>(step.length);
+					current = lifter.jump_node(current, step.length);
+				}
+			}
+			index.step_len.push_back(0);
+			index.seq_pos.push_back(sequence_offset);
+			index.node.push_back(current);
+			assert(sequence_offset == dict[id].size());
+		}
 	}
 
 	/** Scores one contiguous range, sharing DP states only within the batch. */
@@ -497,6 +726,7 @@ public:
 	/// Dictionary ids in lexicographic compressed-path order.
 	std::vector<std::size_t> sorted_path_ids;
 	std::vector<std::vector<size_t>> all_build_nodes;
+	std::vector<PathSearchIndex> search_paths;
 	std::vector<std::vector<std::unordered_map<StringHash::hash_t, std::vector<std::size_t>>>> inv_list;
 
 	/** Builds the merged compressed representation of every dictionary path. */

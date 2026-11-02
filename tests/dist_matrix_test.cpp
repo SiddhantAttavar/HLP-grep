@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -251,10 +252,13 @@ void test_cost_model() {
 		          "," + std::to_string(match) + "," +
 		          std::to_string(mismatch) + ")");
 	}
-	// Negative ins/del individually, and ins+de < mismatch.
+	// Positive indels and mismatch costs are required; the sum bound
+	// must be checked without overflowing int.
 	for (const auto &[ins, del, match, mismatch] :
 	     std::vector<std::tuple<int, int, int, int>>{
-	         {-1, 3, 0, 1}, {2, -3, 0, 1}, {1, 1, 0, 3}}) {
+	         {-1, 3, 0, 1}, {2, -3, 0, 1}, {0, 1, 0, 1},
+	         {1, 0, 0, 1}, {1, 1, 0, -1}, {1, 1, 0, 0},
+	         {1, 1, 0, 3}}) {
 		bool threw = false;
 		try {
 			CostModel bad(ins, del, match, mismatch);
@@ -269,6 +273,9 @@ void test_cost_model() {
 	}
 	// Valid models must construct.
 	static_cast<void>(CostModel(2, 3, 0, 1));
+	static_cast<void>(CostModel(std::numeric_limits<int>::max(),
+	                            std::numeric_limits<int>::max(), 0,
+	                            std::numeric_limits<int>::max()));
 	static_cast<void>(DEFAULT_COST_MODEL);
 }
 

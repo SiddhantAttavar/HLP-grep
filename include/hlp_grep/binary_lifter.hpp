@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -293,6 +294,61 @@ public:
 		const std::size_t level = 63 - __builtin_clzll(block);
 		assert(level < max_level && up[u][level].has_value());
 		return *up[u][level];
+	}
+
+	/** Returns the already-built distance matrix for a heavy-chain block. */
+	const DistMatrix &jump_mat(node_id u, int l) const {
+		assert(u < up.size() && l > 0);
+		const std::size_t block = static_cast<std::size_t>(l);
+		assert((block & (block - 1)) == 0);
+		const std::size_t level = 63 - __builtin_clzll(block);
+		assert(level < up_mat[u].size() && up[u][level].has_value());
+		return up_mat[u][level];
+	}
+
+	/**
+	 * @brief Applies one source cell of a heavy-chain matrix directly.
+	 *
+	 * Only destination positions in the threshold-feasible diagonal band are
+	 * materialized. This is useful to state-based scorers that expand one
+	 * source state at a time instead of applying a matrix to a full DP row.
+	 *
+	 * @param u Source node of the heavy block.
+	 * @param l Number of heavy edges in the power-of-two block.
+	 * @param source_pos Query position at the source after-label boundary.
+	 * @param source_cost Distance accumulated before applying the matrix.
+	 * @param diag_delta Terminal diagonal minus the current diagonal.
+	 * @param label_shift Number of sequence characters consumed by the block.
+	 * @param row Receives costs at the reachable destination query positions.
+	 * @param pos_range Receives the half-open query-position range in @p row.
+	 * @return The node reached by the block.
+	 */
+	node_id jump_point(node_id u, int l, std::size_t source_pos,
+	                   int source_cost, int diag_delta,
+	                   std::size_t label_shift, std::vector<int> &row,
+	                   std::pair<std::size_t, std::size_t> &pos_range) const {
+		const std::size_t level = 63 - __builtin_clzll(l);
+		const DistMatrix &mat = up_mat[u][level];
+		const node_id v = *up[u][level];
+		const auto [col_lo, col_hi] = mat.col_range();
+		const std::size_t target_pos = source_pos + label_shift;
+		const std::size_t shifted_target_pos =
+		    std::max(0L, static_cast<long>(target_pos + diag_delta));
+		const long max_shift = (k - source_cost - std::abs(diag_delta)) / 2;
+		const std::size_t lo = std::max(
+		    static_cast<long>(col_lo),
+		    static_cast<long>(std::min(shifted_target_pos, target_pos)) -
+		        max_shift);
+		const std::size_t hi = std::min(
+		    col_hi,
+		    std::max(shifted_target_pos, target_pos) + max_shift + 1);
+
+		const std::size_t matrix_row = source_pos - mat.row_range().first;
+		row.resize(hi - lo);
+		for (std::size_t b = lo; b < hi; ++b)
+			row[b - lo] = source_cost + mat(matrix_row, b - col_lo);
+		pos_range = {lo, hi};
+		return v;
 	}
 
 	/**
