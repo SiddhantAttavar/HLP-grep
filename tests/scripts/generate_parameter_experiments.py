@@ -4,6 +4,7 @@
 Usage:
     python3 tests/scripts/generate_parameter_experiments.py OUTPUT_DIR
     python3 tests/scripts/generate_parameter_experiments.py OUTPUT_DIR --quick
+    python3 tests/scripts/generate_parameter_experiments.py OUTPUT_DIR --overwrite
 
 The full profile follows the planned 1,000 bp synthetic experiments. ``--quick``
 reduces sizes for smoke testing. Existing HLA FASTA records under
@@ -31,7 +32,7 @@ def random_sequence(rng, length):
 def mutate(rng, sequence, rate):
     """Apply substitutions at an exact rounded per-base mutation rate."""
     result = list(sequence)
-    edits = min(len(result), round(len(result) * rate))
+    edits = min(len(result), max(1, round(len(result) * rate))) if rate > 0 else 0
     for position in rng.sample(range(len(result)), edits):
         old = result[position]
         result[position] = rng.choice([base for base in DNA if base != old])
@@ -51,11 +52,15 @@ def fresh_queries(rng, base, count, rate):
     return [mutate(rng, base, rate) for _ in range(count)]
 
 
-def add_case(out_dir, manifest, name, dictionary, queries, details):
+def add_case(out_dir, manifest, name, dictionary, queries, details,
+             overwrite=False):
     path = os.path.join(out_dir, name + ".txt")
-    write_case(path, dictionary, queries)
+    if os.path.exists(path) and not overwrite:
+        print(f"skip existing {path}")
+    else:
+        write_case(path, dictionary, queries)
+        print(f"wrote {path} (dict={len(dictionary)} queries={len(queries)})")
     manifest.append((name, details))
-    print(f"wrote {path} (dict={len(dictionary)} queries={len(queries)})")
 
 
 def read_fasta(path):
@@ -78,7 +83,8 @@ def read_fasta(path):
             if sequence and all(base in DNA for base in sequence)]
 
 
-def add_match_cases(out_dir, manifest, rng, base, n, length, query_count):
+def add_match_cases(out_dir, manifest, rng, base, n, length, query_count,
+                    overwrite=False):
     """Create five one-query cases with controlled exact-match cardinality."""
     for fraction in (0.0, 0.01, 0.1, 0.5, 1.0):
         target = round(n * fraction)
@@ -91,7 +97,8 @@ def add_match_cases(out_dir, manifest, rng, base, n, length, query_count):
         queries = [(0, query)]
         name = f"matches-{int(fraction * 100):03d}pct"
         add_case(out_dir, manifest, name, dictionary, queries,
-                 f"n={n}; L={length}; target_matches={target}; k=0")
+                 f"n={n}; L={length}; target_matches={target}; k=0",
+                 overwrite)
 
 
 def main():
@@ -100,6 +107,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--quick", action="store_true",
                         help="small profile for smoke tests; not the full planned matrix")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="replace existing testcase, index, and manifest files")
     parser.add_argument("--length", type=int, default=1_000,
                         help="synthetic sequence length (default: 1000)")
     parser.add_argument("--queries", type=int, default=100,
@@ -134,7 +143,7 @@ def main():
     for size in sizes:
         add_case(args.output_dir, manifest, f"size-{size}",
                  size_master[:size], size_queries,
-                 f"n={size}; L={length}; mutation=1%; k=10")
+                 f"n={size}; L={length}; mutation=1%; k=10", args.overwrite)
 
     # Mutation-rate sweep holds n, L, k, and query count constant.
     mutation_n = 1_000 if not args.quick else 50
@@ -146,9 +155,11 @@ def main():
                    fresh_queries(rng, mutation_base, query_count, rate)]
         label = f"{rate * 100:g}pct".replace(".", "p")
         add_case(args.output_dir, manifest, f"mutation-{label}", dictionary,
-                 queries, f"n={mutation_n}; L={length}; mutation={rate:.1%}; k=10")
+                 queries, f"n={mutation_n}; L={length}; mutation={rate:.1%}; k=10",
+                 args.overwrite)
 
-    # Threshold sweep: the same dictionary and query sequences at every k.
+    # Threshold sweep uses generated synthetic data only (never real-validation
+    # records), with the same dictionary and queries at every threshold.
     threshold_n = 1_000 if not args.quick else 50
     threshold_base = random_sequence(rng, length)
     threshold_dict = [threshold_base] + [mutate(rng, threshold_base, 0.01)
@@ -158,7 +169,22 @@ def main():
                        for sequence in threshold_queries]
     add_case(args.output_dir, manifest, "threshold-sweep", threshold_dict,
              threshold_pairs,
-             f"n={threshold_n}; L={length}; mutation=1%; k={THRESHOLDS}")
+             f"n={threshold_n}; L={length}; mutation=1%; k={THRESHOLDS}",
+             args.overwrite)
+
+    # Sequence-length sweep holds n, mutation rate, k, and query count fixed.
+    length_levels = (40, 75, 100) if args.quick else (100, 500, 1_000, 5_000)
+    length_n = 50 if args.quick else 500
+    for seq_length in length_levels:
+        base = random_sequence(rng, seq_length)
+        dictionary = [base] + [mutate(rng, base, 0.01)
+                               for _ in range(length_n - 1)]
+        queries = [(10, sequence) for sequence in
+                   fresh_queries(rng, base, query_count, 0.01)]
+        add_case(args.output_dir, manifest, f"length-{seq_length}",
+                 dictionary, queries,
+                 f"n={length_n}; L={seq_length}; mutation=1%; k=10",
+                 args.overwrite)
 
     # 2x2x2 interaction matrix.
     combined_n = (25, 50) if args.quick else (500, 10_000)
@@ -171,7 +197,8 @@ def main():
                            fresh_queries(rng, base, query_count, rate)]
                 name = f"combined-{size_name}-{mutation_name}-{threshold_name}"
                 add_case(args.output_dir, manifest, name, dictionary, queries,
-                         f"n={n}; L={length}; mutation={rate:.1%}; k={k}")
+                         f"n={n}; L={length}; mutation={rate:.1%}; k={k}",
+                         args.overwrite)
 
     # Match-density cases keep n and L fixed; each query has the target number
     # of exact dictionary copies. Distinct random query sequences prevent
@@ -179,7 +206,7 @@ def main():
     match_n = 1_000 if not args.quick else 50
     match_base = random_sequence(rng, length)
     add_match_cases(args.output_dir, manifest, rng, match_base, match_n,
-                    length, query_count)
+                    length, query_count, args.overwrite)
 
     # Real HLA validation is optional on installations without the raw FASTA.
     hla_files = sorted(glob.glob(os.path.join(
@@ -196,7 +223,8 @@ def main():
                        for sequence in heldout]
             add_case(args.output_dir, manifest, "real-validation-hla",
                      dictionary, queries,
-                     f"source=raw/hla; n={len(dictionary)}; q={len(heldout)}; k=0,1,5,10,20")
+                     f"source=raw/hla; n={len(dictionary)}; q={len(heldout)}; k=0,1,5,10,20",
+                     args.overwrite)
     else:
         manifest.append(("real-validation-hla", "NOT GENERATED: add HLA FASTA under repository raw/hla/"))
         print("note: skipped real HLA validation (no usable raw HLA FASTA found)",
@@ -208,8 +236,15 @@ def main():
         testcase = os.path.join(args.output_dir, name + ".txt")
         if not os.path.isfile(testcase):
             continue
+        index = os.path.splitext(testcase)[0] + ".hlpg"
+        if os.path.exists(index) and not args.overwrite:
+            print(f"skip existing {index}")
+            continue
         try:
-            subprocess.run([save_bin, testcase], check=True)
+            save_env = os.environ.copy()
+            save_env["OMP_NUM_THREADS"] = "1"
+            save_env["OMP_DYNAMIC"] = "FALSE"
+            subprocess.run([save_bin, testcase], check=True, env=save_env)
         except subprocess.CalledProcessError as error:
             print(f"failed to save index for {testcase} (exit {error.returncode})",
                   file=sys.stderr)
@@ -217,6 +252,10 @@ def main():
 
     # Keep the human-readable summary separate from testcase generation.
     summary_path = os.path.join(args.output_dir, "MANIFEST.md")
+    if os.path.exists(summary_path) and not args.overwrite:
+        print(f"skip existing {summary_path}")
+        print(f"datasets are in {args.output_dir}")
+        return 0
     with open(summary_path, "w", encoding="utf-8") as output:
         output.write("# Parameter experiment datasets\n\n")
         output.write(f"Seed: `{args.seed}`. Sequence length: `{length}`. "

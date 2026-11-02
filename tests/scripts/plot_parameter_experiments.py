@@ -40,6 +40,7 @@ def load_rows(results_dir):
                 row["peak_memory_bytes"] = int(row["peak_memory_bytes"])
                 row["query_length"] = int(row["query_length"])
                 row["repeat"] = int(row["repeat"])
+                row["thread_count"] = int(row.get("thread_count", 1))
                 rows.append(row)
     return rows, paths
 
@@ -205,6 +206,39 @@ def plot_build_resources(rows, output_dir):
     return True
 
 
+def plot_thread_scaling(rows, output):
+    grouped = {}
+    for row in rows:
+        if row["mode"] != "threads":
+            continue
+        grouped.setdefault(row["thread_count"], []).append(
+            row["query_runtime_ms"])
+    if not grouped:
+        return False
+    workers = sorted(grouped)
+    latency = [statistics.median(grouped[count]) for count in workers]
+    baseline = latency[workers.index(1)]
+    speedup = [baseline / value for value in latency]
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    ax.plot(workers, latency, marker="o", color="#1f77b4",
+            label="Median query latency")
+    ax.set_xlabel("Worker threads")
+    ax.set_ylabel("Median query latency (ms)", color="#1f77b4")
+    ax.set_yscale("log")
+    ax.grid(True, which="both", linestyle=":", alpha=0.45)
+    ax2 = ax.twinx()
+    ax2.plot(workers, speedup, marker="s", linestyle="--", color="#d62728",
+             label="Speedup vs 1 thread")
+    ax2.set_ylabel("Speedup", color="#d62728")
+    ax2.axhline(1.0, color="#777777", linewidth=0.8, linestyle=":")
+    ax.set_title("Thread scaling")
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc="best")
+    save(fig, output)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results_dir", help="run folder or parent containing summary.csv files")
@@ -230,6 +264,9 @@ def main():
         ("query-latency-by-mutation", "Mutation-rate sweep",
          "Mutation rate (%)", "mutation-",
          lambda name: float(name.removeprefix("mutation-").removesuffix("pct").replace("p", "."))),
+        ("query-latency-by-length", "Sequence-length sweep",
+         "Sequence length (bp)", "length-",
+         lambda name: int(name.split("-")[1])),
     ]
     for filename, title, xlabel, prefix, key in definitions:
         if line_plot(rows, os.path.join(output_dir, filename), title, xlabel,
@@ -243,6 +280,8 @@ def main():
         figures.append("scorer-comparison")
     if mode == "build" and plot_build_resources(rows, output_dir):
         figures.append("build-memory-by-size")
+    if plot_thread_scaling(rows, os.path.join(output_dir, "thread-scaling")):
+        figures.append("thread-scaling")
     if not figures:
         parser.error(f"no plot-compatible rows found for mode={mode}")
     with open(os.path.join(output_dir, "PLOTS.txt"), "w", encoding="utf-8") as output:
