@@ -260,7 +260,7 @@ def main():
         output.write("# Parameter experiment datasets\n\n")
         output.write(f"Seed: `{args.seed}`. Sequence length: `{length}`. "
                      f"Queries per workload: `{query_count}`.\n\n")
-        output.write("A* vs DnC scoring and thread-count comparisons reuse the same testcase inputs.\n\n")
+        output.write("Algorithm comparisons use the same inputs; the direct A* vs default scorer comparison is isolated to the thread-count experiment.\n\n")
         output.write("Each generated `.txt` testcase has a sibling `.hlpg` index created by `save`.\n\n")
         output.write("Match-density cases contain one query each so the target cardinality is exact.\n\n")
         output.write("| Dataset | Parameters |\n|---|---|\n")

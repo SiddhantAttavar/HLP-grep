@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Run HLP-grep parameter/scorer experiments and save raw and summary results.
+"""Run parameter experiments against HLP-grep and save benchmark results.
 
 Usage:
     python3 tests/scripts/run_parameter_experiments.py DATASET_DIR RESULTS_DIR
     python3 tests/scripts/run_parameter_experiments.py DATASET_DIR RESULTS_DIR --quick
 
-Each testcase is benchmarked with both the default (shared-prefix/DnC) and A*
-scorers. When a sibling .hlpg exists, both fresh-build and prebuilt-index query
-runs are measured. Raw bench JSON files and a flattened CSV are saved beneath
-RESULTS_DIR. All parameter/scorer runs use one worker; a separate thread sweep
-uses increasing worker counts on a representative prebuilt index. Results from
-both scorers and worker counts are checked for identical query output.
+Each testcase compares HLP-grep with the selected baseline methods. When a
+sibling .hlpg exists, both fresh-build and prebuilt-index query runs are
+measured. Parameter runs use one worker. A separate scorer/thread experiment
+compares HLP-grep's default and A* scorers over increasing worker counts on a
+representative prebuilt index. Results are checked for identical query output.
 """
 
 import argparse
@@ -22,12 +21,16 @@ import subprocess
 import sys
 
 
-def signatures(data):
-    """Return query result signatures by index for cross-scorer validation."""
-    method = next(item for item in data["methods"]
-                  if item["method"] == "hlp_grep")
-    return [(query["index"], query["k"], query["num_matches"],
-             query["results_hash"]) for query in method["queries"]]
+def method_signatures(data):
+    """Return each benchmark method's result signature by query index."""
+    return {
+        method["method"]: [
+            (query["index"], query["k"], query["num_matches"],
+             query["results_hash"])
+            for query in method["queries"]
+        ]
+        for method in data["methods"]
+    }
 
 
 def main():
@@ -36,13 +39,19 @@ def main():
     parser.add_argument("results_dir", help="folder in which run JSON and CSV results are saved")
     parser.add_argument("--bench-bin", default=None,
                         help="path to bench executable (default: <repo>/build/tests/bench)")
+    parser.add_argument("--methods", default="hlp_grep,wfa,hstree,dt_patricia,bed_tree,edlib,parasail",
+                        help="comma-separated methods to compare (default: all supported methods)")
     parser.add_argument("--repeats", type=int, default=3,
-                        help="runs per testcase/scorer/mode (default: 3)")
+                        help="runs per testcase/method/mode (default: 3)")
     parser.add_argument("--quick", action="store_true",
                         help="run one repeat; same datasets and scorer/mode coverage")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
+    methods = tuple(dict.fromkeys(name.strip() for name in args.methods.split(",")
+                                  if name.strip()))
+    if "hlp_grep" not in methods:
+        parser.error("--methods must include hlp_grep for exact-result cross-checks")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
@@ -70,12 +79,19 @@ def main():
     run_metadata = []
     baseline_signatures = {}
 
-    def execute(testcase, name, mode, scorer, repeat, workers, index_path=None):
+    def execute(testcase, name, mode, repeat, workers, selected_methods,
+                index_path=None, scorer=None):
         worker_tag = f".t{workers}" if mode == "threads" else ""
-        out_json = os.path.join(
-            run_dir, f"{name}.{mode}{worker_tag}.{scorer}.rep{repeat}.json")
-        command = [bench_bin, "--method", "hlp_grep", testcase,
-                   "--scorer", scorer, "--out", out_json]
+        scorer_tag = f".{scorer}" if scorer else ""
+        out_json = os.path.join(run_dir,
+                                f"{name}.{mode}{worker_tag}{scorer_tag}.rep{repeat}.json")
+        command = [bench_bin]
+        for method_name in selected_methods:
+            command.extend(("--method", method_name))
+        command.append(testcase)
+        if scorer:
+            command.extend(("--scorer", scorer))
+        command.extend(("--out", out_json))
         if index_path:
             command.extend(("--index", index_path))
         env = os.environ.copy()
@@ -87,35 +103,38 @@ def main():
         subprocess.run(command, check=True, env=env)
         with open(out_json, encoding="utf-8") as source:
             data = json.load(source)
-        signature = signatures(data)
-        method = next(item for item in data["methods"]
-                      if item["method"] == "hlp_grep")
-        for query in method["queries"]:
-            summary_rows.append({
-                "testcase": name,
-                "mode": mode,
-                "scorer": scorer,
-                "repeat": repeat,
-                "thread_count": workers,
-                "build_time_ms": method["build_time_ms"],
-                "peak_memory_bytes": method["peak_memory_bytes"],
-                "query_index": query["index"],
-                "k": query["k"],
-                "query_length": query["len"],
-                "query_runtime_ms": query["runtime_ms"],
-                "num_matches": query["num_matches"],
-                "results_hash": query["results_hash"],
-                "json_file": os.path.basename(out_json),
-            })
+        signatures = method_signatures(data)
+        for method in data["methods"]:
+            method_name = method["method"]
+            for query in method["queries"]:
+                summary_rows.append({
+                    "testcase": name,
+                    "mode": mode,
+                    "method": method_name,
+                    "scorer": scorer if method_name == "hlp_grep" and scorer else
+                              ("default" if method_name == "hlp_grep" else "n/a"),
+                    "repeat": repeat,
+                    "thread_count": workers,
+                    "build_time_ms": method["build_time_ms"],
+                    "peak_memory_bytes": method["peak_memory_bytes"],
+                    "query_index": query["index"],
+                    "k": query["k"],
+                    "query_length": query["len"],
+                    "query_runtime_ms": query["runtime_ms"],
+                    "num_matches": query["num_matches"],
+                    "results_hash": query["results_hash"],
+                    "json_file": os.path.basename(out_json),
+                })
         run_metadata.append({
             "testcase": name,
             "mode": mode,
+            "methods": selected_methods,
             "scorer": scorer,
             "repeat": repeat,
             "thread_count": workers,
             "json_file": os.path.basename(out_json),
         })
-        return signature
+        return signatures
 
     for testcase in testcase_paths:
         name = os.path.splitext(os.path.basename(testcase))[0]
@@ -127,22 +146,26 @@ def main():
             print(f"note: no prebuilt index for {name}; skipping prebuilt mode",
                   file=sys.stderr)
 
-        by_scorer_mode = {}
+        by_mode_repeat = {}
         for mode, index_path in modes:
-            for scorer in scorers:
-                for repeat in range(1, repeats + 1):
-                    signature = execute(testcase, name, mode, scorer, repeat,
-                                        1, index_path)
-                    by_scorer_mode[(mode, repeat, scorer)] = signature
-                    if mode == "prebuilt" and scorer == "default":
-                        baseline_signatures[(name, repeat)] = signature
+            for repeat in range(1, repeats + 1):
+                signatures = execute(testcase, name, mode, repeat, 1,
+                                     methods, index_path)
+                hlp_signature = signatures["hlp_grep"]
+                mismatches = [method for method, signature in signatures.items()
+                              if signature != hlp_signature]
+                if mismatches:
+                    raise RuntimeError(
+                        f"result mismatch for {name}, {mode}, repeat {repeat}: "
+                        f"{', '.join(mismatches)} differ from hlp_grep")
+                by_mode_repeat[(mode, repeat)] = hlp_signature
+                if mode == "prebuilt":
+                    baseline_signatures[(name, repeat)] = hlp_signature
 
         for mode, _index_path in modes:
             for repeat in range(1, repeats + 1):
-                if (by_scorer_mode[(mode, repeat, "default")] !=
-                        by_scorer_mode[(mode, repeat, "a-star")]):
-                    raise RuntimeError(
-                        f"scorer result mismatch for {name}, {mode}, repeat {repeat}")
+                if by_mode_repeat[(mode, repeat)] != by_mode_repeat[("build", repeat)]:
+                    raise RuntimeError(f"result mismatch between build/prebuilt modes for {name}")
 
     # Explicit thread-scaling experiment on a representative indexed workload.
     indexed = {
@@ -170,18 +193,21 @@ def main():
             workers *= 2
         for workers in thread_counts:
             for repeat in range(1, repeats + 1):
-                signature = execute(thread_testcase, thread_case, "threads",
-                                    "default", repeat, workers, thread_index)
-                if signature != baseline_signatures.get((thread_case, repeat)):
-                    raise RuntimeError(
-                        f"threaded result mismatch for {thread_case}, "
-                        f"workers={workers}, repeat={repeat}")
+                for scorer in scorers:
+                    signatures = execute(
+                        thread_testcase, thread_case, "threads", repeat,
+                        workers, ("hlp_grep",), thread_index, scorer)
+                    if signatures["hlp_grep"] != baseline_signatures.get(
+                            (thread_case, repeat)):
+                        raise RuntimeError(
+                            f"thread/scorer result mismatch for {thread_case}, "
+                            f"scorer={scorer}, workers={workers}, repeat={repeat}")
     else:
         print("note: no indexed size/length testcase; skipping thread sweep",
               file=sys.stderr)
 
     csv_path = os.path.join(run_dir, "summary.csv")
-    columns = ("testcase", "mode", "scorer", "repeat", "thread_count", "build_time_ms",
+    columns = ("testcase", "mode", "method", "scorer", "repeat", "thread_count", "build_time_ms",
                "peak_memory_bytes", "query_index", "k", "query_length",
                "query_runtime_ms", "num_matches", "results_hash", "json_file")
     with open(csv_path, "w", newline="", encoding="utf-8") as output:
@@ -195,6 +221,7 @@ def main():
             "dataset_dir": dataset_dir,
             "bench_bin": bench_bin,
             "repeats": repeats,
+            "methods": methods,
             "scorers": scorers,
             "single_thread_workers": 1,
             "thread_sweep_testcase": thread_case,

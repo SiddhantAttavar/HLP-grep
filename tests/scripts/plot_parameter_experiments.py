@@ -23,6 +23,24 @@ import matplotlib.pyplot as plt
 
 SCORER_LABELS = {"default": "Default / DnC", "a-star": "A*"}
 SCORER_COLORS = {"default": "#1f77b4", "a-star": "#ff7f0e"}
+METHOD_LABELS = {
+    "hlp_grep": "HLP-Grep",
+    "wfa": "WFA2",
+    "hstree": "HSTree",
+    "dt_patricia": "DT-Patricia",
+    "bed_tree": "BED-tree",
+    "edlib": "Edlib",
+    "parasail": "Parasail",
+}
+METHOD_COLORS = {
+    "hlp_grep": "#1f77b4",
+    "wfa": "#ff7f0e",
+    "hstree": "#2ca02c",
+    "dt_patricia": "#d62728",
+    "bed_tree": "#9467bd",
+    "edlib": "#8c564b",
+    "parasail": "#e377c2",
+}
 
 
 def load_rows(results_dir):
@@ -41,6 +59,8 @@ def load_rows(results_dir):
                 row["query_length"] = int(row["query_length"])
                 row["repeat"] = int(row["repeat"])
                 row["thread_count"] = int(row.get("thread_count", 1))
+                row.setdefault("method", "hlp_grep")
+                row.setdefault("scorer", "default")
                 rows.append(row)
     return rows, paths
 
@@ -57,23 +77,28 @@ def grouped_runtime(rows, mode="prebuilt"):
     for row in rows:
         if row["mode"] != mode:
             continue
-        key = (row["testcase"], row["scorer"])
+        key = (row["testcase"], row["method"], row["scorer"])
         grouped.setdefault(key, []).append(row["query_runtime_ms"])
     return {key: statistics.median(values) for key, values in grouped.items()}
 
 
 def line_plot(rows, output, title, xlabel, prefix, order_key, mode="prebuilt"):
     values = grouped_runtime(rows, mode)
-    names = sorted({name for name, _scorer in values if name.startswith(prefix)},
+    names = sorted({name for name, _method, _scorer in values if name.startswith(prefix)},
                    key=order_key)
     if not names:
         return False
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    for scorer in ("default", "a-star"):
-        y = [values.get((name, scorer)) for name in names]
+    methods = sorted({method for _name, method, _scorer in values
+                      if method != "hlp_grep" or "default" in _scorer},
+                     key=lambda method: (method != "hlp_grep", method))
+    for method in methods:
+        scorer = "default" if method == "hlp_grep" else "n/a"
+        y = [values.get((name, method, scorer)) for name in names]
         xs = [order_key(name) for name in names]
         ax.plot(xs, y, marker="o", linewidth=1.8,
-                label=SCORER_LABELS[scorer], color=SCORER_COLORS[scorer])
+                label=METHOD_LABELS.get(method, method),
+                color=METHOD_COLORS.get(method))
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Median query runtime (ms)")
@@ -89,17 +114,19 @@ def plot_threshold(rows, output, mode="prebuilt"):
     for row in rows:
         if row["mode"] != mode or row["testcase"] != "threshold-sweep":
             continue
-        grouped.setdefault((row["scorer"], row["k"]), []).append(
+        grouped.setdefault((row["method"], row["scorer"], row["k"]), []).append(
             row["query_runtime_ms"])
     if not grouped:
         return False
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    ks = sorted({key[1] for key in grouped})
-    for scorer in ("default", "a-star"):
+    ks = sorted({key[2] for key in grouped})
+    for method in sorted({key[0] for key in grouped}):
+        scorer = "default" if method == "hlp_grep" else "n/a"
         ax.plot(ks,
-                [statistics.median(grouped[(scorer, k)]) for k in ks],
-                marker="o", linewidth=1.8, label=SCORER_LABELS[scorer],
-                color=SCORER_COLORS[scorer])
+                [statistics.median(grouped[(method, scorer, k)]) for k in ks],
+                marker="o", linewidth=1.8,
+                label=METHOD_LABELS.get(method, method),
+                color=METHOD_COLORS.get(method))
     ax.set_title("Query latency by edit-distance threshold")
     ax.set_xlabel("Threshold k")
     ax.set_ylabel("Median query runtime (ms)")
@@ -116,16 +143,19 @@ def plot_matches(rows, output, mode="prebuilt"):
         if row["mode"] != mode or not row["testcase"].startswith("matches-"):
             continue
         pct = int(row["testcase"].split("-")[1].removesuffix("pct"))
-        grouped.setdefault((row["scorer"], pct), []).append(row["query_runtime_ms"])
+        grouped.setdefault((row["method"], row["scorer"], pct), []).append(
+            row["query_runtime_ms"])
     if not grouped:
         return False
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    pcts = sorted({key[1] for key in grouped})
-    for scorer in ("default", "a-star"):
+    pcts = sorted({key[2] for key in grouped})
+    for method in sorted({key[0] for key in grouped}):
+        scorer = "default" if method == "hlp_grep" else "n/a"
         ax.plot(pcts,
-                [statistics.median(grouped[(scorer, pct)]) for pct in pcts],
-                marker="o", linewidth=1.8, label=SCORER_LABELS[scorer],
-                color=SCORER_COLORS[scorer])
+                [statistics.median(grouped[(method, scorer, pct)]) for pct in pcts],
+                marker="o", linewidth=1.8,
+                label=METHOD_LABELS.get(method, method),
+                color=METHOD_COLORS.get(method))
     ax.set_title("Query latency by target match fraction")
     ax.set_xlabel("Target matching dictionary entries (%)")
     ax.set_ylabel("Query runtime (ms)")
@@ -136,25 +166,40 @@ def plot_matches(rows, output, mode="prebuilt"):
     return True
 
 
-def plot_scorer_scatter(rows, output, mode="prebuilt"):
+def plot_method_scatter(rows, output, mode="prebuilt"):
     values = grouped_runtime(rows, mode)
-    names = sorted({name for name, scorer in values
-                    if scorer == "default" and (name, "a-star") in values})
-    if not names:
+    names = sorted({name for name, _method, _scorer in values
+                    if (name, "hlp_grep", "default") in values})
+    methods = sorted({method for _name, method, _scorer in values
+                      if method != "hlp_grep"})
+    if not names or not methods:
         return False
-    x = [values[(name, "default")] for name in names]
-    y = [values[(name, "a-star")] for name in names]
-    low = min(x + y)
-    high = max(x + y)
+    points = {
+        method: ([values[(name, "hlp_grep", "default")] for name in names],
+                 [values[(name, method, "n/a")] for name in names
+                  if (name, method, "n/a") in values])
+        for method in methods
+    }
+    methods = [method for method in methods
+               if len(points[method][1]) == len(points[method][0])]
+    if not methods:
+        return False
+    all_values = [value for method in methods for series in points[method]
+                  for value in series]
+    low = min(all_values)
+    high = max(all_values)
     fig, ax = plt.subplots(figsize=(6.4, 6.0))
-    ax.scatter(x, y, alpha=0.8, color="#2ca02c")
+    for method in methods:
+        x, y = points[method]
+        ax.scatter(x, y, alpha=0.8, color=METHOD_COLORS.get(method),
+                   label=METHOD_LABELS.get(method, method))
     ax.plot([low, high], [low, high], linestyle="--", color="#555555",
             label="Equal latency")
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Default / DnC median latency (ms)")
-    ax.set_ylabel("A* median latency (ms)")
-    ax.set_title("Scorer latency comparison by testcase")
+    ax.set_xlabel("HLP-Grep median latency (ms)")
+    ax.set_ylabel("Baseline median latency (ms)")
+    ax.set_title("Baseline method latency vs HLP-Grep")
     ax.grid(True, which="both", linestyle=":", alpha=0.45)
     ax.legend()
     save(fig, output)
@@ -163,13 +208,13 @@ def plot_scorer_scatter(rows, output, mode="prebuilt"):
 
 def plot_build_resources(rows, output_dir):
     # Each build measurement is repeated once per query in summary.csv; reduce
-    # duplicate rows to one value per testcase/scorer/repeat before aggregation.
+    # duplicate rows to one value per testcase/method/repeat before aggregation.
     builds = {}
     memories = {}
     for row in rows:
         if row["mode"] != "build" or not row["testcase"].startswith("size-"):
             continue
-        key = (row["testcase"], row["scorer"], row["repeat"])
+        key = (row["testcase"], row["method"], row["repeat"])
         builds[key] = row["build_time_ms"]
         memories[key] = row["peak_memory_bytes"] / (1024 * 1024)
     names = sorted({key[0] for key in builds},
@@ -177,21 +222,25 @@ def plot_build_resources(rows, output_dir):
     if not names:
         return False
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.8))
-    for scorer in ("default", "a-star"):
+    methods = sorted({key[1] for key in builds},
+                     key=lambda method: (method != "hlp_grep", method))
+    for method in methods:
         build_medians = []
         memory_medians = []
         for name in names:
             build_medians.append(statistics.median(
-                value for (case, method, _repeat), value in builds.items()
-                if case == name and method == scorer))
+                value for (case, method_name, _repeat), value in builds.items()
+                if case == name and method_name == method))
             memory_medians.append(statistics.median(
-                value for (case, method, _repeat), value in memories.items()
-                if case == name and method == scorer))
+                value for (case, method_name, _repeat), value in memories.items()
+                if case == name and method_name == method))
         sizes = [int(name.split("-")[1]) for name in names]
         axes[0].plot(sizes, build_medians, marker="o",
-                     label=SCORER_LABELS[scorer], color=SCORER_COLORS[scorer])
+                     label=METHOD_LABELS.get(method, method),
+                     color=METHOD_COLORS.get(method))
         axes[1].plot(sizes, memory_medians, marker="o",
-                     label=SCORER_LABELS[scorer], color=SCORER_COLORS[scorer])
+                     label=METHOD_LABELS.get(method, method),
+                     color=METHOD_COLORS.get(method))
     axes[0].set_xlabel("Dictionary size")
     axes[0].set_ylabel("Index build time (ms)")
     axes[0].set_title("Index construction")
@@ -211,27 +260,32 @@ def plot_thread_scaling(rows, output):
     for row in rows:
         if row["mode"] != "threads":
             continue
-        grouped.setdefault(row["thread_count"], []).append(
+        grouped.setdefault((row["scorer"], row["thread_count"]), []).append(
             row["query_runtime_ms"])
     if not grouped:
         return False
-    workers = sorted(grouped)
-    latency = [statistics.median(grouped[count]) for count in workers]
-    baseline = latency[workers.index(1)]
-    speedup = [baseline / value for value in latency]
+    workers = sorted({count for _scorer, count in grouped})
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    ax.plot(workers, latency, marker="o", color="#1f77b4",
-            label="Median query latency")
+    for scorer in ("default", "a-star"):
+        latency = [statistics.median(grouped[(scorer, count)]) for count in workers]
+        baseline = latency[workers.index(1)]
+        ax.plot(workers, latency, marker="o", color=SCORER_COLORS[scorer],
+                label=f"{SCORER_LABELS[scorer]} latency")
     ax.set_xlabel("Worker threads")
-    ax.set_ylabel("Median query latency (ms)", color="#1f77b4")
+    ax.set_ylabel("Median query latency (ms)")
     ax.set_yscale("log")
     ax.grid(True, which="both", linestyle=":", alpha=0.45)
     ax2 = ax.twinx()
-    ax2.plot(workers, speedup, marker="s", linestyle="--", color="#d62728",
-             label="Speedup vs 1 thread")
+    for scorer in ("default", "a-star"):
+        latency = [statistics.median(grouped[(scorer, count)]) for count in workers]
+        baseline = latency[workers.index(1)]
+        speedup = [baseline / value for value in latency]
+        ax2.plot(workers, speedup, marker="s", linestyle="--",
+                 color=SCORER_COLORS[scorer],
+                 label=f"{SCORER_LABELS[scorer]} speedup")
     ax2.set_ylabel("Speedup", color="#d62728")
     ax2.axhline(1.0, color="#777777", linewidth=0.8, linestyle=":")
-    ax.set_title("Thread scaling")
+    ax.set_title("A* vs default scorer across thread counts")
     lines, labels = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(lines + lines2, labels + labels2, loc="best")
@@ -276,8 +330,8 @@ def main():
         figures.append("query-latency-by-threshold")
     if plot_matches(rows, os.path.join(output_dir, "query-latency-by-matches"), mode):
         figures.append("query-latency-by-matches")
-    if plot_scorer_scatter(rows, os.path.join(output_dir, "scorer-comparison"), mode):
-        figures.append("scorer-comparison")
+    if plot_method_scatter(rows, os.path.join(output_dir, "method-comparison"), mode):
+        figures.append("method-comparison")
     if mode == "build" and plot_build_resources(rows, output_dir):
         figures.append("build-memory-by-size")
     if plot_thread_scaling(rows, os.path.join(output_dir, "thread-scaling")):
