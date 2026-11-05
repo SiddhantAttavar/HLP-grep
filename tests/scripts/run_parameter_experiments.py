@@ -5,11 +5,11 @@ Usage:
     python3 tests/scripts/run_parameter_experiments.py DATASET_DIR RESULTS_DIR
     python3 tests/scripts/run_parameter_experiments.py DATASET_DIR RESULTS_DIR --quick
 
-Each testcase compares HLP-grep with the selected baseline methods. When a
-sibling .hlpg exists, both fresh-build and prebuilt-index query runs are
-measured. Parameter runs use one worker. A separate scorer/thread experiment
-compares HLP-grep's default and A* scorers over increasing worker counts on a
-representative prebuilt index. Results are checked for identical query output.
+Each testcase compares HLP-Grep with the selected baseline methods, passing its
+saved sibling .hlpg index to bench. Parameter runs use one worker. A separate
+scorer/thread experiment compares HLP-Grep's default and A* scorers over
+increasing worker counts on a saved index. Results are checked for identical
+query output.
 """
 
 import argparse
@@ -139,33 +139,22 @@ def main():
     for testcase in testcase_paths:
         name = os.path.splitext(os.path.basename(testcase))[0]
         index = os.path.splitext(testcase)[0] + ".hlpg"
-        modes = [("build", None)]
-        if os.path.isfile(index):
-            modes.append(("prebuilt", index))
-        else:
-            print(f"note: no prebuilt index for {name}; skipping prebuilt mode",
-                  file=sys.stderr)
+        if not os.path.isfile(index):
+            parser.error(
+                f"missing saved index for {name}: {index}; generate it with "
+                "tests/scripts/generate_parameter_experiments.py first")
 
-        by_mode_repeat = {}
-        for mode, index_path in modes:
-            for repeat in range(1, repeats + 1):
-                signatures = execute(testcase, name, mode, repeat, 1,
-                                     methods, index_path)
-                hlp_signature = signatures["hlp_grep"]
-                mismatches = [method for method, signature in signatures.items()
-                              if signature != hlp_signature]
-                if mismatches:
-                    raise RuntimeError(
-                        f"result mismatch for {name}, {mode}, repeat {repeat}: "
-                        f"{', '.join(mismatches)} differ from hlp_grep")
-                by_mode_repeat[(mode, repeat)] = hlp_signature
-                if mode == "prebuilt":
-                    baseline_signatures[(name, repeat)] = hlp_signature
-
-        for mode, _index_path in modes:
-            for repeat in range(1, repeats + 1):
-                if by_mode_repeat[(mode, repeat)] != by_mode_repeat[("build", repeat)]:
-                    raise RuntimeError(f"result mismatch between build/prebuilt modes for {name}")
+        for repeat in range(1, repeats + 1):
+            signatures = execute(testcase, name, "prebuilt", repeat, 1,
+                                 methods, index)
+            hlp_signature = signatures["hlp_grep"]
+            mismatches = [method for method, signature in signatures.items()
+                          if signature != hlp_signature]
+            if mismatches:
+                raise RuntimeError(
+                    f"result mismatch for {name}, repeat {repeat}: "
+                    f"{', '.join(mismatches)} differ from hlp_grep")
+            baseline_signatures[(name, repeat)] = hlp_signature
 
     # Explicit thread-scaling experiment on a representative indexed workload.
     indexed = {

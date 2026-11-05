@@ -19,6 +19,12 @@ import random
 import subprocess
 import sys
 
+from generate_mitomap_mtdna_test import (
+    DEFAULT_CACHE_DIR as MITOMAP_CACHE_DIR,
+    load_accessions as load_mitomap_accessions,
+    select_records as select_mitomap_records,
+)
+
 DNA = "ACGT"
 SIZE_LEVELS = (100, 500, 1_000, 5_000, 10_000, 50_000, 100_000)
 MUTATION_RATES = (0.001, 0.005, 0.01, 0.02, 0.05)
@@ -160,7 +166,7 @@ def main():
 
     # Threshold sweep uses generated synthetic data only (never real-validation
     # records), with the same dictionary and queries at every threshold.
-    threshold_n = 1_000 if not args.quick else 50
+    threshold_n = 100_000 if not args.quick else 50
     threshold_base = random_sequence(rng, length)
     threshold_dict = [threshold_base] + [mutate(rng, threshold_base, 0.01)
                                          for _ in range(threshold_n - 1)]
@@ -203,7 +209,7 @@ def main():
     # Match-density cases keep n and L fixed; each query has the target number
     # of exact dictionary copies. Distinct random query sequences prevent
     # results from one query being altered while constructing the next.
-    match_n = 1_000 if not args.quick else 50
+    match_n = 100_000 if not args.quick else 50
     match_base = random_sequence(rng, length)
     add_match_cases(args.output_dir, manifest, rng, match_base, match_n,
                     length, query_count, args.overwrite)
@@ -229,6 +235,41 @@ def main():
         manifest.append(("real-validation-hla", "NOT GENERATED: add HLA FASTA under repository raw/hla/"))
         print("note: skipped real HLA validation (no usable raw HLA FASTA found)",
               file=sys.stderr)
+
+    # Large real-data workload sampled from the locally cached MITOMAP set.
+    mito_name = (f"mitomap_mtdna_d50000_q100_k1-3-5-10-15-20_"
+                 f"seed{args.seed}")
+    mito_accession_file = os.path.join(
+        MITOMAP_CACHE_DIR, "mitomap_full_length_accessions.txt")
+    mito_sequence_file = os.path.join(
+        MITOMAP_CACHE_DIR, "full_length_sequences.fasta")
+    if args.quick:
+        manifest.append((mito_name, "NOT GENERATED in --quick mode"))
+    elif not (os.path.isfile(mito_accession_file)
+              and os.path.isfile(mito_sequence_file)):
+        manifest.append((mito_name,
+                         "NOT GENERATED: run tests/scripts/download_mitomap_mtdna.py first"))
+        print("note: skipped 50k MITOMAP mtDNA experiment; full MITOMAP sequence "
+              "cache is missing", file=sys.stderr)
+    else:
+        try:
+            mito_accessions, _accession_path = load_mitomap_accessions(
+                MITOMAP_CACHE_DIR)
+            mito_records, _fetched = select_mitomap_records(
+                mito_accessions, 50_100, random.Random(args.seed),
+                MITOMAP_CACHE_DIR)
+        except (OSError, RuntimeError) as error:
+            print(f"cannot prepare MITOMAP mtDNA experiment: {error}",
+                  file=sys.stderr)
+            return 1
+        mito_dict = [sequence for _accession, sequence in mito_records[:50_000]]
+        mito_heldout = [sequence for _accession, sequence in mito_records[50_000:]]
+        mito_queries = [(k, sequence) for sequence in mito_heldout
+                        for k in (1, 3, 5, 10, 15, 20)]
+        add_case(args.output_dir, manifest, mito_name, mito_dict, mito_queries,
+                 "source=MITOMAP full-length human mtDNA; n=50000; "
+                 "q=100; k=1,3,5,10,15,20; natural sequence lengths",
+                 args.overwrite)
 
     # Every generated testcase receives its adjacent .hlpg index through save.
     # The real-data manifest entry is skipped when its FASTA source is absent.
