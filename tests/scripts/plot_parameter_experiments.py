@@ -137,6 +137,35 @@ def plot_threshold(rows, output, mode="prebuilt"):
     return True
 
 
+def plot_mtdna_threshold(rows, output, mode="prebuilt"):
+    prefix = "mitomap_mtdna_d10000_q100_k1-3-5-10-15-20_"
+    grouped = {}
+    for row in rows:
+        if row["mode"] != mode or not row["testcase"].startswith(prefix):
+            continue
+        grouped.setdefault((row["method"], row["scorer"], row["k"]), []).append(
+            row["query_runtime_ms"])
+    if not grouped:
+        return False
+    ks = sorted({key[2] for key in grouped})
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    for method in sorted({key[0] for key in grouped}):
+        scorer = "default" if method == "hlp_grep" else "n/a"
+        ax.plot(ks,
+                [statistics.median(grouped[(method, scorer, k)]) for k in ks],
+                marker="o", linewidth=1.8,
+                label=METHOD_LABELS.get(method, method),
+                color=METHOD_COLORS.get(method))
+    ax.set_title("MITOMAP mtDNA: latency by edit-distance threshold")
+    ax.set_xlabel("Threshold k")
+    ax.set_ylabel("Median query runtime (ms)")
+    ax.set_yscale("log")
+    ax.grid(True, which="both", linestyle=":", alpha=0.45)
+    ax.legend()
+    save(fig, output)
+    return True
+
+
 def plot_matches(rows, output, mode="prebuilt"):
     grouped = {}
     for row in rows:
@@ -300,11 +329,22 @@ def main():
                         help="plot output folder (default: RESULTS_DIR/plots)")
     parser.add_argument("--mode", choices=("prebuilt", "build"), default="prebuilt",
                         help="use query-only prebuilt results or fresh-build runs (default: prebuilt)")
+    parser.add_argument("--mtdna", action="store_true",
+                        help="include only the optional 10k MITOMAP result rows and plot")
     args = parser.parse_args()
     results_dir = os.path.abspath(args.results_dir)
     if not os.path.isdir(results_dir):
         parser.error(f"results folder does not exist: {results_dir}")
     rows, summaries = load_rows(results_dir)
+    mito_prefix = "mitomap_mtdna_d10000_q100_k1-3-5-10-15-20_"
+    mito_rows = [row for row in rows if row["testcase"].startswith("mitomap_mtdna_")]
+    if args.mtdna and not any(row["testcase"].startswith(mito_prefix)
+                              for row in mito_rows):
+        parser.error("--mtdna was passed, but no matching 10k MITOMAP benchmark "
+                     "rows were found")
+    rows = [row for row in rows
+            if not row["testcase"].startswith("mitomap_mtdna_")
+            or (args.mtdna and row["testcase"].startswith(mito_prefix))]
     if not rows:
         parser.error(f"no non-empty summary.csv files found under {results_dir}")
     output_dir = os.path.abspath(args.out_dir or os.path.join(results_dir, "plots"))
@@ -330,6 +370,9 @@ def main():
         figures.append("query-latency-by-threshold")
     if plot_matches(rows, os.path.join(output_dir, "query-latency-by-matches"), mode):
         figures.append("query-latency-by-matches")
+    if args.mtdna and plot_mtdna_threshold(
+            rows, os.path.join(output_dir, "mitomap-mtdna-latency-by-threshold"), mode):
+        figures.append("mitomap-mtdna-latency-by-threshold")
     if plot_method_scatter(rows, os.path.join(output_dir, "method-comparison"), mode):
         figures.append("method-comparison")
     if mode == "build" and plot_build_resources(rows, output_dir):
@@ -341,7 +384,7 @@ def main():
     with open(os.path.join(output_dir, "PLOTS.txt"), "w", encoding="utf-8") as output:
         output.write(f"Input summaries ({len(summaries)}):\n")
         output.writelines(f"- {path}\n" for path in summaries)
-        output.write(f"\nMode: {mode}\nFigures (PNG and SVG):\n")
+        output.write(f"\nMode: {mode}; mtdna={args.mtdna}\nFigures (PNG and SVG):\n")
         output.writelines(f"- {figure}\n" for figure in figures)
     print(f"Wrote {len(figures)} plots (PNG + SVG) to {output_dir}")
     return 0

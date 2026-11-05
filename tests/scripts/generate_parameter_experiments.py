@@ -5,6 +5,7 @@ Usage:
     python3 tests/scripts/generate_parameter_experiments.py OUTPUT_DIR
     python3 tests/scripts/generate_parameter_experiments.py OUTPUT_DIR --quick
     python3 tests/scripts/generate_parameter_experiments.py OUTPUT_DIR --overwrite
+    python3 tests/scripts/generate_parameter_experiments.py OUTPUT_DIR --mtdna
 
 The full profile follows the planned 1,000 bp synthetic experiments. ``--quick``
 reduces sizes for smoke testing. Existing HLA FASTA records under
@@ -113,6 +114,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--quick", action="store_true",
                         help="small profile for smoke tests; not the full planned matrix")
+    parser.add_argument("--mtdna", action="store_true",
+                        help="generate the optional 10k-dictionary MITOMAP mtDNA experiment")
     parser.add_argument("--overwrite", action="store_true",
                         help="replace existing testcase, index, and manifest files")
     parser.add_argument("--length", type=int, default=1_000,
@@ -236,38 +239,34 @@ def main():
         print("note: skipped real HLA validation (no usable raw HLA FASTA found)",
               file=sys.stderr)
 
-    # Large real-data workload sampled from the locally cached MITOMAP set.
-    mito_name = (f"mitomap_mtdna_d50000_q100_k1-3-5-10-15-20_"
+    # Optional real-data workload sampled from the locally cached MITOMAP set.
+    mito_name = (f"mitomap_mtdna_d10000_q100_k1-3-5-10-15-20_"
                  f"seed{args.seed}")
-    mito_accession_file = os.path.join(
-        MITOMAP_CACHE_DIR, "mitomap_full_length_accessions.txt")
-    mito_sequence_file = os.path.join(
-        MITOMAP_CACHE_DIR, "full_length_sequences.fasta")
-    if args.quick:
-        manifest.append((mito_name, "NOT GENERATED in --quick mode"))
-    elif not (os.path.isfile(mito_accession_file)
-              and os.path.isfile(mito_sequence_file)):
-        manifest.append((mito_name,
-                         "NOT GENERATED: run tests/scripts/download_mitomap_mtdna.py first"))
-        print("note: skipped 50k MITOMAP mtDNA experiment; full MITOMAP sequence "
-              "cache is missing", file=sys.stderr)
-    else:
+    if args.mtdna:
+        mito_accession_file = os.path.join(
+            MITOMAP_CACHE_DIR, "mitomap_full_length_accessions.txt")
+        mito_sequence_file = os.path.join(
+            MITOMAP_CACHE_DIR, "full_length_sequences.fasta")
+        if not (os.path.isfile(mito_accession_file)
+                and os.path.isfile(mito_sequence_file)):
+            parser.error("--mtdna requires the downloaded MITOMAP cache; run "
+                         "tests/scripts/download_mitomap_mtdna.py first")
         try:
             mito_accessions, _accession_path = load_mitomap_accessions(
                 MITOMAP_CACHE_DIR)
             mito_records, _fetched = select_mitomap_records(
-                mito_accessions, 50_100, random.Random(args.seed),
+                mito_accessions, 10_100, random.Random(args.seed),
                 MITOMAP_CACHE_DIR)
         except (OSError, RuntimeError) as error:
             print(f"cannot prepare MITOMAP mtDNA experiment: {error}",
                   file=sys.stderr)
             return 1
-        mito_dict = [sequence for _accession, sequence in mito_records[:50_000]]
-        mito_heldout = [sequence for _accession, sequence in mito_records[50_000:]]
+        mito_dict = [sequence for _accession, sequence in mito_records[:10_000]]
+        mito_heldout = [sequence for _accession, sequence in mito_records[10_000:]]
         mito_queries = [(k, sequence) for sequence in mito_heldout
                         for k in (1, 3, 5, 10, 15, 20)]
         add_case(args.output_dir, manifest, mito_name, mito_dict, mito_queries,
-                 "source=MITOMAP full-length human mtDNA; n=50000; "
+                 "source=MITOMAP full-length human mtDNA; n=10000; "
                  "q=100; k=1,3,5,10,15,20; natural sequence lengths",
                  args.overwrite)
 
@@ -304,6 +303,7 @@ def main():
         output.write("Algorithm comparisons use the same inputs; the direct A* vs default scorer comparison is isolated to the thread-count experiment.\n\n")
         output.write("Each generated `.txt` testcase has a sibling `.hlpg` index created by `save`.\n\n")
         output.write("Match-density cases contain one query each so the target cardinality is exact.\n\n")
+        output.write("The 10k MITOMAP mtDNA testcase is included only when `--mtdna` is passed.\n\n")
         output.write("| Dataset | Parameters |\n|---|---|\n")
         for name, details in manifest:
             if isinstance(name, str) and name not in ("", "# Parameter experiment datasets"):

@@ -41,6 +41,8 @@ def main():
                         help="path to bench executable (default: <repo>/build/tests/bench)")
     parser.add_argument("--methods", default="hlp_grep,wfa,hstree,dt_patricia,bed_tree,edlib,parasail",
                         help="comma-separated methods to compare (default: all supported methods)")
+    parser.add_argument("--mtdna", action="store_true",
+                        help="include the optional 10k MITOMAP mtDNA testcase")
     parser.add_argument("--repeats", type=int, default=3,
                         help="runs per testcase/method/mode (default: 3)")
     parser.add_argument("--quick", action="store_true",
@@ -63,12 +65,20 @@ def main():
         parser.error(f"bench executable not found or not executable: {bench_bin}; "
                      "build it with `cmake --build build --target bench` or pass --bench-bin")
 
+    mito_prefix = "mitomap_mtdna_d10000_q100_k1-3-5-10-15-20_"
     testcase_paths = sorted(
         os.path.join(dataset_dir, name)
         for name in os.listdir(dataset_dir)
-        if name.endswith(".txt") and os.path.isfile(os.path.join(dataset_dir, name)))
+        if name.endswith(".txt")
+        and os.path.isfile(os.path.join(dataset_dir, name))
+        and (not name.startswith("mitomap_mtdna_")
+             or (args.mtdna and name.startswith(mito_prefix))))
     if not testcase_paths:
         parser.error(f"no testcase .txt files found in {dataset_dir}")
+    if args.mtdna and not any(os.path.basename(path).startswith(mito_prefix)
+                              for path in testcase_paths):
+        parser.error("--mtdna was passed, but the 10k MITOMAP testcase is missing; "
+                     "generate it with generate_parameter_experiments.py --mtdna")
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(os.path.abspath(args.results_dir), f"run-{stamp}")
